@@ -1,5 +1,5 @@
-# Virtual environment junk
 .venv/
 venv/
 env/
-share/
+__pycache__/
+*.pyc
