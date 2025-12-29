@@ -6,7 +6,7 @@ from typing import List, Sequence, Tuple
 
 from TradingBot.v2.context import RiskContext
 from TradingBot.v2.intents import PmccIntentPayload, SelectedOption, TradeIntent
-from TradingBot.v2.strategy_interface_v2 import StrategyV2
+from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 
 
 @dataclass(frozen=True) #Frozen because strategy parameters should be immutable

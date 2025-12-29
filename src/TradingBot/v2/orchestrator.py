@@ -45,10 +45,10 @@ from TradingBot.v2.context import RiskContext
 from TradingBot.v2.decisions import RiskDecision
 
 # RiskEngineV2 contains the risk policy logic for V2.
-from TradingBot.v2.risk_engine import RiskEngineV2
+from TradingBot.v2.risk.risk_engine import RiskEngineV2
 
 # StrategyV2 defines the V2 strategy contract, which produces intents from a context.
-from TradingBot.v2.strategy_interface_v2 import StrategyV2
+from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 
 
 # The logger name helps you filter logs when multiple components write messages.
