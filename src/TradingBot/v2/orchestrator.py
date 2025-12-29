@@ -135,20 +135,17 @@ class OrchestratorV2:
         # Loop over each strategy in the list.
         # A for loop is explicit and easy to debug.
         for strat in self.strategies:
-            # Strategies may store the symbol on an attribute called "symbol".
-            # getattr provides safe access with a default of None if absent.
-            raw_symbol: Any = getattr(strat, "symbol", None)
+            # Ask the strategy which symbols it cares about.
+            # StrategyV2.symbols returns a Sequence[str], which may be empty.
+            symbols = strat.symbols
 
-            # We require a non-empty string symbol to fetch a price.
-            if not isinstance(raw_symbol, str):
-                continue
-            if not raw_symbol.strip():
-                continue
+            for raw_symbol in symbols:
+                if not isinstance(raw_symbol, str):
+                    continue
+                if not raw_symbol.strip():
+                    continue
 
-            # Normalise the symbol.
-            # strip removes surrounding whitespace.
-            # upper makes it uppercase for consistent keys.
-            sym: str = raw_symbol.strip().upper()
+                sym: str = raw_symbol.strip().upper()
 
             try:
                 # This is broker IO.
