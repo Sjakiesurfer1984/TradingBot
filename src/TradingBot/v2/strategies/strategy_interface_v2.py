@@ -31,6 +31,9 @@ from TradingBot.v2.context import RiskContext
 # Intents describe what the strategy wants to do, not what it is allowed to do.
 from TradingBot.v2.intents import TradeIntent
 
+from TradingBot.v2.logger import setup_logger
+logger = setup_logger("Strategy Interface")
+
 
 class StrategyV2(ABC):
     """

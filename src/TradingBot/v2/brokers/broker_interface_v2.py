@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
+from TradingBot.v2.logger import setup_logger
+logger = setup_logger("Broker Interface")
 
 
 class BrokerInterfaceV2(ABC):
@@ -9,41 +11,40 @@ class BrokerInterfaceV2(ABC):
     V2 broker interface.
 
     Why this exists
-    - V2 is a clean rewrite, so it must not import V1 broker code.
-    - The orchestrator is the only layer allowed to talk to the broker.
-    - A strict interface makes it easy to swap implementations:
-        - FakeBrokerV2 for dry-run and tests
-        - AlpacaBrokerV2 for real trading connectivity
+    - V2 is a clean rewrite, so it must not import any V1 broker code.
+    - Option C requires that ONLY the orchestrator performs broker IO.
+    - A strict interface allows:
+        - FakeBrokerV2 for dry-run and unit tests
+        - AlpacaBrokerV2 for real connectivity
 
-    Design rule
-    - Implementations must not perform network IO in __init__ or __post_init__.
-      Constructors must be cheap and side-effect free.
-      Network calls must happen inside explicit methods only.
+    Hard rule
+    - Implementations must NOT perform network IO in __init__ or __post_init__.
+      Construction must be cheap and deterministic.
+      Network calls must only happen inside explicit methods.
 
-    Data shape notes
-    - Positions and orders are left as Dict[str, Any] and List[Dict[str, Any]] for now because
-      broker payloads differ between providers.
-    - We will introduce typed V2 domain models for positions and orders later, once the system
-      flow is stable.
+    Data shape note
+    - For now, positions and orders use Dict[str, Any] and List[Dict[str, Any]] because
+      broker payloads differ and we are still stabilising V2.
+    - Later we will replace these with strongly typed V2 domain models.
     """
 
-    @abstractmethod # an abstract method decorator is used to indicate that this method must be overridden in subclasses 
+    @abstractmethod
     def get_option_buying_power(self) -> float:
         """
-        Return available option buying power.
+        Return available option buying power as a positive float.
 
         Why this matters
-        - Risk and allocation need a single source of truth for available capital.
+        - Risk and allocation need a single number that represents usable capital.
         """
         raise NotImplementedError
 
     @abstractmethod
     def get_equity(self) -> float:
         """
-        Return account equity.
+        Return account equity as a positive float.
 
         Why this matters
-        - Equity is used for drawdown rules, exposure limits, and reporting.
+        - Equity is used by drawdown rules and reporting.
         """
         raise NotImplementedError
 
@@ -53,7 +54,7 @@ class BrokerInterfaceV2(ABC):
         Return current positions.
 
         Why a dict
-        - Fast lookup by symbol is usually needed.
+        - Positions are typically keyed by symbol for fast lookup.
         """
         raise NotImplementedError
 
@@ -63,7 +64,8 @@ class BrokerInterfaceV2(ABC):
         Return currently open orders.
 
         Why a list
-        - Open orders are typically processed as a collection of records.
+        - Open orders are naturally represented as a list of records.
+        - Deduplication rules scan this list.
         """
         raise NotImplementedError
 
@@ -73,8 +75,8 @@ class BrokerInterfaceV2(ABC):
         Return the current market price for an underlying symbol.
 
         Why this matters
-        - Orchestrator uses this to populate RiskContext.prices.
-        - Strategies consume prices from RiskContext rather than calling the broker directly.
+        - Orchestrator fetches prices once per cycle and stores them in RiskContext.
+        - Strategies consume prices from RiskContext and never call the broker.
         """
         raise NotImplementedError
 
@@ -83,12 +85,11 @@ class BrokerInterfaceV2(ABC):
         """
         Submit an order request.
 
-        Why Any
+        Why Any for now
         - Order request types will be formalised in v2/domain/orders.py.
-        - This keeps the interface usable while V2 is being built.
+        - This keeps the broker usable while we stabilise the architecture.
 
-        Important safety rule
-        - Only the orchestrator is allowed to call submit_order.
-        - Strategies and risk engine must never call it.
+        Safety rule
+        - Only the orchestrator may call submit_order.
         """
         raise NotImplementedError

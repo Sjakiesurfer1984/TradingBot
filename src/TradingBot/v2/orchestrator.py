@@ -1,58 +1,58 @@
 # src/TradingBot/v2/orchestrator.py
 #
-# This module defines the V2 orchestrator for the Option C architecture.
+# This module defines the V2 orchestrator for Option C.
 #
-# Why this file exists
-# - In Option C, only one layer is allowed to talk to the broker (network and account IO).
-# - That layer is the orchestrator.
-# - Strategies and the risk engine must be pure with respect to broker IO, meaning they do not
-#   call the broker directly. They only consume data passed in.
+# Option C rule
+# - Only the orchestrator may talk to the broker (network IO and account IO).
+# - Strategies and the risk engine must be pure with respect to broker IO.
 #
-# Why this matters
-# - It prevents strategies from accidentally bypassing risk controls.
-# - It guarantees that a "cycle" uses a consistent snapshot of account state.
-# - It makes behaviour reproducible and testable, because we can build a RiskContext in tests
-#   without requiring a live broker connection.
+# Why this exists
+# - Ensures one coherent snapshot per cycle (RiskContext).
+# - Prevents strategies bypassing risk controls.
+# - Enables dry-run and unit testing with FakeBrokerV2.
 
 from __future__ import annotations
 
-# dataclass is used to reduce boilerplate in classes that mainly store data.
-# It automatically generates an __init__ method and other helpful methods.
+# dataclass removes boilerplate for small classes that mostly store dependencies.
 from dataclasses import dataclass
 
-# datetime and timezone are used to stamp snapshots with an explicit UTC time.
-# A timezone aware timestamp avoids ambiguity and makes logs easier to correlate.
+# datetime and timezone are used to create timezone-aware UTC timestamps.
 from datetime import datetime, timezone
 
-# Any, Dict, List are typing tools that describe the shapes of values.
-# These do not change runtime behaviour, but they make intentions explicit and help static checking.
-# - Any means "unknown type" or "broker specific shape".
-# - Dict[K, V] means a mapping from keys of type K to values of type V.
-# - List[T] means an ordered, mutable collection of items of type T.
-from typing import Any, Dict, List
+# Any describes broker payload fields we do not control.
+# Dict and List describe container shapes.
+# Set is used to deduplicate symbols so we only fetch each price once.
+from typing import Any, Dict, List, Set
 
-# The broker interface defines the operations the orchestrator is allowed to perform.
-# Importing the interface rather than a concrete broker keeps the orchestrator decoupled.
-from TradingBot.brokers.broker_interface import BrokerInterface
+# BrokerInterfaceV2 is the only thing the orchestrator needs from the broker layer.
+from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
 
-# The project logger factory provides consistent formatting and naming.
-from TradingBot.logger import setup_logger
-
-# RiskContext is the immutable snapshot built once per cycle and passed to strategies and risk.
+# RiskContext is the immutable snapshot passed to strategies and risk.
 from TradingBot.v2.context import RiskContext
 
-# RiskDecision is the output of the risk engine, containing an approval or rejection.
-from TradingBot.v2.decisions import RiskDecision
+# TradeIntent is what strategies produce.
+from TradingBot.v2.intents import TradeIntent
 
-# RiskEngineV2 contains the risk policy logic for V2.
+# RiskDecision is what the risk engine produces.
+from TradingBot.v2.risk.decisions import RiskDecision
+
+# RiskEngineV2 evaluates intents using rules.
 from TradingBot.v2.risk.risk_engine import RiskEngineV2
 
-# StrategyV2 defines the V2 strategy contract, which produces intents from a context.
+# StrategyV2 is the contract for V2 strategies.
 from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 
+# Symbol is a domain type (usually a str-like wrapper).
+# normalise_symbol canonicalises user-input symbols into a stable Symbol.
+from TradingBot.v2.domain.types import Symbol, normalise_symbol
 
-# The logger name helps you filter logs when multiple components write messages.
-logger = setup_logger("OrchestratorV2")
+# setup_logger provides consistent log formatting across V2 modules.
+from TradingBot.v2.logger import setup_logger
+
+
+# Create a module-level logger once.
+# The logger name appears in log output, so we do not prefix messages manually.
+logger = setup_logger("Orchestrator")
 
 
 @dataclass
@@ -60,169 +60,161 @@ class OrchestratorV2:
     """
     V2 orchestrator (Option C).
 
-    Design intent
-    - This class is the only component allowed to talk to the broker.
-    - It builds a consistent RiskContext snapshot once per cycle.
-    - It asks strategies for TradeIntents.
-    - It asks the risk engine for RiskDecisions.
-    - It logs the outcomes in a consistent format.
-    - It does not submit orders while dry_run is True.
+    Responsibilities
+    - Perform all broker IO in one place.
+    - Build exactly one RiskContext snapshot per cycle.
+    - Ask strategies for TradeIntent objects (pure computation).
+    - Ask risk engine for RiskDecision objects (pure computation).
+    - Log outcomes.
+    - Only submit orders when dry_run is False (submission not implemented yet).
 
-    A note on collections (List, Dict, Tuple)
-    - A List is an ordered collection that can be changed (items can be appended or removed).
-      We use lists when we are building up a collection during a cycle.
-    - A Dict is a mapping from keys to values. We use dicts when we want quick lookup by key,
-      such as mapping symbol -> price.
-    - A Tuple is an ordered collection that is typically treated as fixed size and immutable.
-      In this file we do not create tuples directly, but you will see tuples used elsewhere
-      (such as intent tags) when we want a stable, non-mutable set of values.
-
-    A note on comprehensions
-    - Python supports list comprehensions and dict comprehensions. They are compact ways of
-      creating a new list or dict from existing data.
-    - In this file we prefer explicit loops for clarity, because this orchestrator is a central
-      control layer and readability matters more than compactness.
+    Notes on collections used here
+    - List[T]: ordered, mutable sequence (useful for collecting items).
+    - Dict[K, V]: mapping for fast lookup (symbol -> price).
+    - Set[T]: unique collection (useful for deduplicating symbols).
     """
 
-    # The broker is the single gateway to account state and market data.
-    # This is why it belongs in the orchestrator rather than in strategies.
-    broker: BrokerInterface
+    # The broker adapter that provides account state and market data.
+    broker: BrokerInterfaceV2
 
-    # Strategies are stored in a list because:
-    # - We have a sequence of strategies to run each cycle.
-    # - The order can matter for logging and deterministic behaviour.
-    # - We may append or remove strategies as the system grows.
+    # The strategies we run each cycle.
     strategies: List[StrategyV2]
 
-    # The risk engine is the component that applies risk policy to intents.
-    # It produces decisions, which the orchestrator can later execute.
+    # The risk engine that evaluates intents.
     risk_engine: RiskEngineV2
 
-    # dry_run is a safety switch.
-    # When True, the orchestrator will not submit orders to the broker.
-    # This is essential while we are still building sizing and approval logic.
+    # Safety switch to prevent trading while architecture is still being validated.
     dry_run: bool = True
 
     def _now_utc(self) -> datetime:
         """
-        Return the current time as a timezone aware UTC datetime.
+        Return a timezone-aware UTC timestamp.
 
-        Why this exists
-        - We want every snapshot to be labelled with a precise time.
-        - Using UTC avoids confusion when running in different timezones.
-        - Using an aware datetime (with timezone) avoids ambiguous timestamps.
+        Why UTC
+        - Avoids confusion across machines and deployments with different local time zones.
+        - Makes logs comparable and consistent.
         """
-        # datetime.now(timezone.utc) returns an aware datetime with UTC timezone info.
+        # datetime.now(timezone.utc) returns an aware datetime (has timezone info).
         now_utc: datetime = datetime.now(timezone.utc)
         return now_utc
 
-    def _build_prices(self) -> Dict[str, float]:
+    def _strategy_symbols(self) -> Set[Symbol]:
         """
-        Fetch one underlying price per strategy symbol for this cycle.
+        Collect the set of unique symbols required by all strategies.
 
-        Why this exists
-        - Market data fetching is broker IO, so it must live here.
-        - Strategies should not call the broker, they should consume ctx.prices instead.
-        - A dict allows fast lookup by symbol when strategies need the price.
+        Why Set
+        - Multiple strategies may request the same underlying.
+        - A set removes duplicates automatically, so we only fetch each price once.
 
         Return value
-        - A dict mapping uppercase symbols to a positive float price.
-        - Symbols with missing or invalid prices are omitted.
+        - A set of canonical Symbol values.
         """
-        # Initialise an empty dict. It will be filled during the loop.
-        prices: Dict[str, float] = {}
+        # Start with an empty set.
+        # Sets store unique values by definition.
+        unique: Set[Symbol] = set()
 
-        # Loop over each strategy in the list.
-        # A for loop is explicit and easy to debug.
+        # Loop over each strategy instance.
         for strat in self.strategies:
-            # Ask the strategy which symbols it cares about.
-            # StrategyV2.symbols returns a Sequence[str], which may be empty.
-            symbols = strat.symbols
+            # strat.symbols is a strategy-provided sequence of required symbols.
+            # It must be broker-free and side-effect free.
+            for raw_symbol in strat.symbols:
+                # Convert to string defensively because raw_symbol may be Symbol or str.
+                raw_text: str = str(raw_symbol)
 
-            for raw_symbol in symbols:
-                if not isinstance(raw_symbol, str):
+                # Skip empty or whitespace-only values so we never normalise junk.
+                if not raw_text.strip():
                     continue
-                if not raw_symbol.strip():
-                    continue
 
-                sym: str = raw_symbol.strip().upper()
+                # Normalise into a canonical Symbol (trim + uppercase rules live in one place).
+                sym: Symbol = normalise_symbol(raw_text)
 
+                # Add the canonical symbol to the set.
+                unique.add(sym)
+
+        return unique
+
+    def _build_prices(self) -> Dict[Symbol, float]:
+        """
+        Fetch one price per unique underlying symbol.
+
+        Why this exists
+        - Price fetching is broker IO and must happen in the orchestrator.
+        - Strategies must use RiskContext.get_price rather than broker calls.
+
+        Return value
+        - Dict[Symbol, float] mapping canonical symbols to positive float prices.
+        - Missing or invalid prices are omitted.
+        """
+        # Initialise an empty mapping to fill.
+        prices: Dict[Symbol, float] = {}
+
+        # Deduplicate requested symbols first.
+        # This avoids repeated broker calls for the same symbol.
+        symbols: Set[Symbol] = self._strategy_symbols()
+
+        # Fetch prices for each symbol.
+        for sym in symbols:
             try:
-                # This is broker IO.
-                # The broker should return a numeric price or raise an exception.
-                raw_price: Any = self.broker.get_asset_price(sym)
+                # Broker call: fetch the current price for this symbol.
+                # BrokerInterfaceV2 expects a str symbol identifier.
+                raw_price: Any = self.broker.get_asset_price(str(sym))
             except Exception as exc:
-                # If a broker call fails, we log and skip the symbol.
-                # We do not raise here because one missing price should not crash the cycle.
-                logger.warning(f"Failed to fetch price for {sym}: {exc}")
+                # Do not crash the whole cycle if one price fetch fails.
+                # We log a warning with context for diagnosis.
+                logger.warning("Failed to fetch price for %s: %s", sym, exc)
                 continue
 
-            # Validate that the broker returned a number and that it is positive.
+            # Validate the returned price is numeric and positive.
             if isinstance(raw_price, (int, float)) and float(raw_price) > 0.0:
-                # Store as float to normalise int and float values consistently.
+                # Store as float for consistency across int and float inputs.
                 prices[sym] = float(raw_price)
             else:
-                # Log invalid price shape to help diagnose broker adapter issues.
-                logger.warning(f"Broker returned invalid price for {sym}: {raw_price}")
+                # Invalid price shapes are logged so broker adapters can be fixed.
+                logger.warning("Invalid price for %s: %r", sym, raw_price)
 
         return prices
 
     def _build_context(self) -> RiskContext:
         """
-        Build a single immutable RiskContext snapshot for this cycle.
+        Build one immutable RiskContext snapshot for this cycle.
 
-        Why this exists
-        - Option C requires one coherent snapshot for all strategy evaluation.
-        - If we queried the broker separately inside each strategy, the data could drift
-          within the same cycle, leading to inconsistent risk decisions.
-
-        What is included
-        - Timestamp for the snapshot.
-        - Option buying power and equity for risk policy.
-        - Open orders and positions for deduplication and exposure checks.
-        - Underlying prices for strategies and later sizing.
+        What goes into the snapshot
+        - Timestamp (UTC)
+        - Option buying power and equity (floats)
+        - Positions and open orders (broker payload snapshots)
+        - Prices (Dict[Symbol, float]) for strategy evaluation
         """
-        # Record the time at which the snapshot is taken.
+        # Capture the timestamp first so the snapshot has a clear "as-of" time.
         as_of_utc: datetime = self._now_utc()
 
-        # Fetch account level values from the broker.
-        # These methods should be implemented by the broker adapter.
+        # Broker IO: read account numeric values.
         option_buying_power_raw: Any = self.broker.get_option_buying_power()
         equity_raw: Any = self.broker.get_equity()
 
-        # Fetch open orders and positions.
+        # Broker IO: read open orders and positions.
         open_orders_raw: Any = self.broker.get_open_orders()
         positions_raw: Any = self.broker.get_positions()
 
-        # Convert buying power to float if possible.
-        # If it is missing or invalid, fall back to 0.0 so the system fails safe.
+        # Convert buying power to float when possible, else fail safe to 0.0.
         option_buying_power: float = (
             float(option_buying_power_raw)
             if isinstance(option_buying_power_raw, (int, float))
             else 0.0
         )
 
-        # Convert equity to float if possible.
-        # This supports later rules such as max daily loss or drawdown limits.
+        # Convert equity to float when possible, else fail safe to 0.0.
         equity: float = float(equity_raw) if isinstance(equity_raw, (int, float)) else 0.0
 
-        # Open orders are expected to be a list of dicts, but broker payloads can vary.
-        # If invalid, we use an empty list.
-        # An empty list means "no open orders known", which is safe when combined with
-        # conservative risk rules.
+        # Enforce safe defaults if broker returns unexpected shapes.
         open_orders: List[Dict[str, Any]] = (
             open_orders_raw if isinstance(open_orders_raw, list) else []
         )
-
-        # Positions are expected to be a dict keyed by symbol.
-        # If invalid, we use an empty dict.
         positions: Dict[str, Any] = positions_raw if isinstance(positions_raw, dict) else {}
 
-        # Build the price mapping once per cycle.
-        prices: Dict[str, float] = self._build_prices()
+        # Broker IO: fetch prices once for all strategies.
+        prices: Dict[Symbol, float] = self._build_prices()
 
-        # Construct the immutable RiskContext dataclass.
-        # This object is passed to strategies and risk rules.
+        # Build the immutable context object.
         ctx: RiskContext = RiskContext(
             as_of_utc=as_of_utc,
             option_buying_power=option_buying_power,
@@ -234,129 +226,102 @@ class OrchestratorV2:
 
         return ctx
 
-    def _collect_intents(self, ctx: RiskContext) -> List[Any]:
+    def _collect_intents(self, ctx: RiskContext) -> List[TradeIntent]:
         """
-        Ask all strategies for intents using the same RiskContext.
+        Ask each strategy to generate TradeIntent objects.
 
         Why this exists
-        - Strategies in Option C are intent only.
-        - They must not place orders or size positions.
-        - They should be able to be run in any order without side effects.
-
-        Return value
-        - A list of intents produced by all strategies.
-        - The element type is Any here to avoid coupling this orchestrator to a specific
-          intent class during early iterations. As V2 stabilises, you can replace Any
-          with TradeIntent explicitly.
+        - Strategies propose trades (intents).
+        - They must not size, approve, or submit.
         """
-        # Initialise an empty list because we will append items.
-        # A list is appropriate because order is useful for debugging and replay.
-        all_intents: List[Any] = []
+        # Start with an empty list because we will extend it.
+        all_intents: List[TradeIntent] = []
 
-        # Iterate over each strategy.
+        # Loop over strategies in a deterministic order (the list order).
         for strat in self.strategies:
             try:
-                # generate_intents is a strategy interface method.
-                # It consumes RiskContext and returns either a list of intents or a single intent.
-                intents: Any = strat.generate_intents(ctx)
+                # Strategy computation: no broker IO should happen inside this call.
+                intents: List[TradeIntent] = strat.generate_intents(ctx)
             except Exception as exc:
-                # A strategy failure should not crash the entire bot.
-                # We log the exception with stack trace for diagnosis.
-                strategy_id: Any = getattr(strat, "strategy_id", "UNKNOWN")
-                logger.exception(f"Strategy {strategy_id} failed: {exc}")
+                # Keep the cycle alive even if one strategy fails.
+                # We log stack trace to make debugging possible.
+                logger.exception("Strategy %s failed to generate intents: %s", strat.strategy_id, exc)
                 continue
 
-            # If the strategy returns None or an empty collection, there are no intents.
-            if not intents:
-                continue
-
-            # If the strategy returns a list, extend our list.
-            # extend adds each element individually.
-            if isinstance(intents, list):
-                all_intents.extend(intents)
-            else:
-                # If the strategy returns a single intent, append it as one item.
-                all_intents.append(intents)
+            # Extend the list with the returned intents.
+            # extend adds each element of the list individually.
+            all_intents.extend(intents)
 
         return all_intents
 
     def _log_decisions(self, decisions: List[RiskDecision]) -> None:
         """
-        Log risk decisions in a consistent, human-readable format.
+        Log risk decisions in a consistent way.
 
         Why this exists
-        - In dry run mode, logs are the primary output.
-        - This logging becomes an audit trail and debugging tool.
-        - A consistent format enables grepping and later log parsing.
+        - Decisions are the visible output of the dry-run pipeline.
+        - This creates an audit trail and makes debugging deterministic.
         """
-        # Iterate over each decision.
         for decision in decisions:
-            # A rejected decision contains a RejectedIntent instance.
             if decision.rejected is not None:
-                intent_id: str = decision.rejected.intent_id
-                reason: str = decision.rejected.reason
-                logger.info(f"REJECTED intent_id={intent_id} reason={reason}")
+                logger.info(
+                    "REJECTED intent_id=%s reason=%s",
+                    decision.rejected.intent_id,
+                    decision.rejected.reason,
+                )
                 continue
 
-            # An approved decision contains an ApprovedOrder instance.
             if decision.approved is not None:
-                intent_id = decision.approved.intent_id
-                client_order_id = decision.approved.client_order_id
-                logger.info(f"APPROVED intent_id={intent_id} client_order_id={client_order_id}")
+                logger.info(
+                    "APPROVED intent_id=%s client_order_id=%s",
+                    decision.approved.intent_id,
+                    decision.approved.client_order_id,
+                )
                 continue
 
-            # If neither is present, the decision object violates its invariant.
-            # This indicates a programming error in the risk engine.
-            logger.warning("RiskDecision has neither approved nor rejected populated (invalid state).")
+            # If we get here, the decision object is malformed.
+            logger.warning("RiskDecision invalid (no approved or rejected).")
 
     def run_cycle(self) -> None:
         """
-        Execute one full Option C orchestration cycle.
+        Execute one full Option C cycle.
 
-        Cycle stages
-        - Build RiskContext snapshot
-        - Collect intents from strategies
-        - Evaluate risk decisions
-        - Log results
-        - Do not submit orders while dry_run is True
-
-        Why this should not submit orders yet
-        - We are still building the risk engine rules and sizing logic.
-        - Any premature submission would be unsafe and difficult to diagnose.
+        Flow
+        - Build RiskContext snapshot (broker IO occurs here, once).
+        - Ask strategies for intents (pure computation).
+        - Evaluate intents via risk engine (pure computation).
+        - Log decisions.
+        - Stop if dry_run is True (no submission).
         """
-        # Build a single snapshot for this cycle.
+        # Build the snapshot first.
         ctx: RiskContext = self._build_context()
 
-        # Log a summary of the snapshot.
-        # len(open_orders) counts the number of open order records.
-        # len(positions) counts the number of keys in the positions dict.
+        # Log a one-line snapshot summary.
         logger.info(
-            f"Cycle snapshot as_of_utc={ctx.as_of_utc.isoformat()} "
-            f"option_buying_power={ctx.option_buying_power} "
-            f"equity={ctx.equity} "
-            f"open_orders={len(ctx.open_orders)} "
-            f"positions={len(ctx.positions)}"
+            "Snapshot as_of_utc=%s option_buying_power=%s equity=%s open_orders=%s positions=%s prices=%s",
+            ctx.as_of_utc.isoformat(),
+            ctx.option_buying_power,
+            ctx.equity,
+            len(ctx.open_orders),
+            len(ctx.positions),
+            len(ctx.prices),
         )
 
-        # Ask strategies to produce intents from this snapshot.
-        intents: List[Any] = self._collect_intents(ctx)
-        logger.info(f"Collected {len(intents)} intents.")
+        # Strategy pass: collect intents.
+        intents: List[TradeIntent] = self._collect_intents(ctx)
+        logger.info("Collected %s intents.", len(intents))
 
-        # Ask the risk engine to evaluate the intents.
-        # The risk engine must use ctx, not broker IO.
+        # Risk pass: evaluate intents.
         decisions: List[RiskDecision] = self.risk_engine.evaluate(ctx, intents)
-        logger.info(f"Risk engine produced {len(decisions)} decisions.")
+        logger.info("Risk engine produced %s decisions.", len(decisions))
 
-        # Log each decision outcome.
+        # Log each decision.
         self._log_decisions(decisions)
 
-        # If dry_run is enabled, we stop here.
-        # This ensures there are no broker write actions.
+        # Hard safety stop for dry run.
         if self.dry_run:
             logger.info("Dry run enabled: no orders will be submitted.")
             return
 
-        # If dry_run is disabled, we would submit approved orders here.
         # Submission is intentionally not implemented yet.
-        # When we implement submission, it must be done in this orchestrator only.
-        logger.warning("Dry run disabled, but order submission is not implemented yet.")
+        logger.warning("Dry run disabled, but submission is not implemented yet.")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
+from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
+
 
 @dataclass(frozen=True)
 class SelectedOption:
@@ -61,7 +63,7 @@ class PmccIntentPayload:
     """
 
     # Underlying equity symbol (e.g. SPY).
-    underlying_symbol: str
+    underlying_symbol: Symbol
 
     # Selected long-dated call (LEAPS leg).
     leap: SelectedOption
@@ -76,7 +78,7 @@ class TradeIntent:
     A request from a strategy to the risk engine.
 
     Design intent
-    - This object expresses *desire*, not permission.
+    - This object expresses desire, not permission.
     - It is the only thing a strategy is allowed to produce.
 
     Explicit exclusions
@@ -89,16 +91,16 @@ class TradeIntent:
     """
 
     # Unique identifier for this intent instance.
-    # Allows end-to-end traceability across logs and decisions.
-    intent_id: str
+    # Deterministically generated using domain.ids.make_intent_id.
+    intent_id: IntentId
 
     # Stable identifier of the originating strategy.
-    # Used by the risk layer for per-strategy allocation and limits.
-    strategy_id: str
+    # Used by the risk layer for per-strategy limits and allocation.
+    strategy_id: StrategyId
 
     # Primary symbol the intent relates to (usually the underlying).
     # Used for deduplication and symbol-level exposure checks.
-    symbol: str
+    symbol: Symbol
 
     # Strategy-specific payload describing the desired trade structure.
     payload: PmccIntentPayload
@@ -108,4 +110,5 @@ class TradeIntent:
     time_in_force: str = "day"
 
     # Optional free-form tags for logging, analytics, or future routing.
+    # Tuple is used to discourage mutation after creation.
     tags: Tuple[str, ...] = ()

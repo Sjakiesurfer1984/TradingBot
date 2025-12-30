@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from TradingBot.domain.orders import MultiLegLimitOrder
+from TradingBot.v2.domain.orders import MultiLegLimitOrder
+from TradingBot.v2.domain.types import ClientOrderId, IntentId
 
+from TradingBot.v2.logger import setup_logger
+logger = setup_logger("Decisions")
 
 @dataclass(frozen=True)
 class ApprovedOrder:
@@ -12,28 +15,29 @@ class ApprovedOrder:
     A fully approved and sized order, ready for broker submission.
 
     Design intent
-    - This object represents the final output of the risk engine
-      when an intent has passed all risk checks.
-    - It is deliberately concrete and execution-ready.
-    - Once created, it should be safe for the orchestrator to submit
-      without further modification.
+    - This is the final output of the risk engine when an intent has passed all checks.
+    - This object must be execution-ready, meaning:
+        - quantity is final
+        - legs are final
+        - limit price and time in force are final
+    - The orchestrator can submit it without modifying it.
 
     Why this exists
-    - Separates "approval" from "submission".
-    - Allows dry-run logging and audit trails without touching the broker.
-    - Makes the approval decision explicit and inspectable.
+    - Keeps "approval" separate from "submission".
+    - Supports dry-run mode by logging approved orders without touching the broker.
+    - Preserves an audit trail for strategy -> intent -> decision -> order.
     """
 
     # Identifier of the originating trade intent.
-    # This allows traceability from strategy -> intent -> risk decision -> order.
-    intent_id: str
+    # We use IntentId (a NewType over str) to avoid mixing IDs accidentally.
+    intent_id: IntentId
 
     # Deterministic client-side order identifier.
-    # Used for deduplication, reconciliation, and post-trade analysis.
-    client_order_id: str
+    # This is how we dedupe and later reconcile what we submitted.
+    client_order_id: ClientOrderId
 
-    # Fully constructed broker order object.
-    # At this point, quantity, legs, and time-in-force are final.
+    # The final broker-agnostic order description.
+    # Broker adapters translate this into actual API calls.
     order: MultiLegLimitOrder
 
 
@@ -43,21 +47,19 @@ class RejectedIntent:
     Representation of a rejected trade intent.
 
     Design intent
-    - Every rejected intent must carry a clear, human-readable reason.
-    - Rejections are first-class outcomes, not errors or exceptions.
+    - Rejections are normal outcomes, not exceptions.
+    - Every rejection must contain a human-readable reason.
 
     Why this exists
-    - Enables transparent logging and debugging.
-    - Allows post-mortem analysis of why trades did not occur.
-    - Prevents silent failures or implicit rejections.
+    - Makes debugging transparent.
+    - Enables post-mortem analysis: "why did we not trade?"
+    - Avoids silent failures.
     """
 
     # Identifier of the rejected trade intent.
-    intent_id: str
+    intent_id: IntentId
 
-    # Human-readable explanation for the rejection.
-    # This should be explicit enough that a human can understand
-    # what risk rule blocked the intent.
+    # Human-readable explanation for why the intent was rejected.
     reason: str
 
 
@@ -66,18 +68,30 @@ class RiskDecision:
     """
     Result of evaluating a single trade intent.
 
-    Invariant
-    - Exactly one of `approved` or `rejected` should be populated.
-    - Both being None or both being set indicates a programming error.
+    Invariant (required behaviour)
+    - Exactly one of `approved` or `rejected` must be populated.
+    - If both are None, the risk engine failed to decide.
+    - If both are set, the risk engine produced an invalid outcome.
 
     Why this wrapper exists
-    - Makes the outcome of risk evaluation explicit.
-    - Allows the orchestrator to handle approvals and rejections uniformly.
-    - Keeps the risk engine interface stable as more decision types are added.
+    - Gives the orchestrator a single uniform output type to handle.
+    - Keeps the risk engine interface stable as we add more decision categories later.
     """
 
     # Populated when the intent is approved and converted into an executable order.
     approved: Optional[ApprovedOrder] = None
 
-    # Populated when the intent is rejected by any risk rule.
+    # Populated when the intent is rejected.
     rejected: Optional[RejectedIntent] = None
+
+    def is_valid(self) -> bool:
+        """
+        Return True if this decision satisfies the invariant.
+
+        Why this exists
+        - Lets the orchestrator and tests assert correctness explicitly.
+        - Keeps invariant checking local to the type.
+        """
+        approved_set: bool = self.approved is not None
+        rejected_set: bool = self.rejected is not None
+        return approved_set != rejected_set

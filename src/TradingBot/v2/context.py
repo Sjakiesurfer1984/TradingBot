@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from TradingBot.v2.domain.types import Symbol
 
 @dataclass(frozen=True)
 class RiskContext:
@@ -52,9 +53,9 @@ class RiskContext:
     # Mapping of underlying symbol -> latest known price.
     # Prices are fetched once per cycle to avoid repeated broker calls.
     # This supports strike selection, sizing, and sanity checks.
-    prices: Dict[str, float]
+    prices: Dict[Symbol, float]
 
-    def get_price(self, symbol: str) -> Optional[float]:
+    def get_price(self, symbol: Symbol) -> Optional[float]:
         """
         Retrieve the cached price for a given symbol.
 
@@ -67,4 +68,7 @@ class RiskContext:
         - Avoids scattered `.upper()` calls across strategies and risk code.
         - Makes missing-price handling explicit.
         """
-        return self.prices.get(symbol.strip().upper())
+        return self.prices.get(symbol)
+
+
+

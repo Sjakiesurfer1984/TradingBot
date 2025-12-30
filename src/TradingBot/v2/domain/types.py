@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import NewType
+
+from TradingBot.v2.logger import setup_logger
+logger = setup_logger("Types")
+
+
+# NewType creates a distinct type at type-check time, while remaining a str at runtime.
+# This helps static checkers catch mistakes like passing a StrategyId where an IntentId is expected.
+IntentId = NewType("IntentId", str)
+StrategyId = NewType("StrategyId", str)
+ClientOrderId = NewType("ClientOrderId", str)
+Symbol = NewType("Symbol", str)
+
+
+def normalise_symbol(value: str) -> Symbol:
+    """
+    Convert an arbitrary string into a normalised Symbol.
+
+    Why this exists
+    - Symbols come from config files, user input, or strategy code.
+    - Normalising once prevents subtle bugs caused by whitespace or casing differences.
+
+    What we enforce
+    - Must be a non-empty string after stripping whitespace.
+    - Stored as uppercase for consistent dictionary keys and logging.
+    """
+    if not isinstance(value, str):
+        raise TypeError("Symbol must be a string.")
+    cleaned: str = value.strip().upper()
+    if not cleaned:
+        raise ValueError("Symbol must be a non-empty string.")
+    return Symbol(cleaned)
+
+
+@dataclass(frozen=True)
+class AllocationFraction:
+    """
+    A fractional allocation in the closed interval [0.0, 1.0].
+
+    Why this exists
+    - Risk and orchestration frequently allocate capital by percentage or fraction.
+    - Using a dedicated type prevents ambiguity between:
+        - 0.08 meaning "8 percent"
+        - 8.0 meaning "8 percent"
+    - This forces you to represent allocations consistently as fractions.
+
+    Example
+    - AllocationFraction(0.08) means 8 percent of a budget.
+    """
+
+    value: float
+
+    def __post_init__(self) -> None:
+        # dataclass(frozen=True) makes the instance immutable after creation,
+        # but __post_init__ still runs during construction, so we can validate here.
+        if not isinstance(self.value, (int, float)):
+            raise TypeError("AllocationFraction.value must be numeric.")
+        if float(self.value) < 0.0 or float(self.value) > 1.0:
+            raise ValueError("AllocationFraction.value must be in [0.0, 1.0].")
+
+    def as_float(self) -> float:
+        """
+        Return the allocation fraction as a float.
+
+        Why this exists
+        - Keeps a simple and explicit conversion point for arithmetic.
+        """
+        return float(self.value)
+
+
+@dataclass(frozen=True)
+class Money:
+    """
+    A minimal money value represented in a single currency.
+
+    Why this exists
+    - Many parts of a trading system manipulate cash amounts:
+        - equity
+        - buying power
+        - risk budgets
+    - Representing money explicitly reduces confusion when passing values around.
+
+    What this does NOT do
+    - It does not implement multi-currency conversion.
+    - It does not implement decimal precision rules yet.
+      For now, floats are acceptable for the early architecture stage.
+
+    Later
+    - If you want strict accounting, we can switch value to Decimal.
+    """
+
+    value: float
+    currency: str = "USD"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, (int, float)):
+            raise TypeError("Money.value must be numeric.")
+        if not isinstance(self.currency, str) or not self.currency.strip():
+            raise ValueError("Money.currency must be a non-empty string.")
+
+    def as_float(self) -> float:
+        """
+        Return the money value as a float.
+
+        Why this exists
+        - Keeps arithmetic usage explicit rather than relying on implicit float casting.
+        """
+        return float(self.value)

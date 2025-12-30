@@ -1,34 +1,38 @@
-# ================================
-# FILE: src/TradingBot/v2/brokers/fake_broker.py
-# ================================
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from TradingBot.brokers.broker_interface import BrokerInterface
+from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.logger import setup_logger
+logger = setup_logger("Fake Broker")
 
 
 @dataclass
-class FakeBroker(BrokerInterface):
+class FakeBrokerV2(BrokerInterfaceV2):
     """
-    Fake broker for V2 dry-run.
+    Fake broker implementation for V2.
 
     Why this exists
-    - Option C needs the orchestrator, strategies, and risk engine to be testable without network IO.
-    - The real Alpaca broker can hang on SSL calls.
-    - A fake broker provides deterministic data for fast, safe iteration.
+    - We need a broker that never performs network IO so we can test Option C safely.
+    - The orchestrator must be able to build a RiskContext snapshot without calling a real API.
+    - Unit tests should run fast, deterministically, and without credentials.
 
-    What this broker does
-    - Returns fixed account values (equity, option buying power).
-    - Returns fixed prices for symbols.
-    - Returns empty positions and empty open orders by default.
+    What this broker models
+    - Account values such as equity and option buying power.
+    - Open orders and positions as simple in-memory collections.
+    - Underlying prices as a symbol -> float mapping.
 
-    What this broker does not do
-    - It does not talk to any API.
-    - It does not place orders.
-    - It does not attempt to model fills or market microstructure.
+    What this broker does not model (by design)
+    - Real market latency, fills, partial fills, or order routing.
+    - Option chain fetching.
+    - Any exchange rules.
+
+    Design choices
+    - We store data in normal Python collections:
+        - dict for prices and positions, because we want fast lookup by symbol.
+        - list for open orders, because dedupe rules scan order records.
+    - We normalise symbols to uppercase consistently so lookups behave predictably.
     """
 
     option_buying_power: float = 100_000.0
@@ -41,74 +45,77 @@ class FakeBroker(BrokerInterface):
 
     def get_option_buying_power(self) -> float:
         """
-        Return a fixed option buying power.
+        Return the option buying power.
 
-        Why a float
-        - Monetary quantities should be represented as numeric types.
-        - The orchestrator and risk layer depend on this to apply limits and sizing later.
+        Why this returns float
+        - Risk sizing uses arithmetic, so we want numeric types.
+        - Converting to float makes downstream code consistent.
         """
         return float(self.option_buying_power)
 
     def get_equity(self) -> float:
         """
-        Return a fixed account equity.
+        Return account equity.
 
         Why this exists
-        - Later risk rules will use equity for drawdown and exposure limits.
+        - Equity is used for risk controls such as drawdown and exposure limits.
         """
         return float(self.equity)
 
     def get_positions(self) -> Dict[str, Any]:
         """
-        Return a snapshot of positions.
+        Return positions as a dictionary.
 
-        Why we return a dict
-        - Positions are typically keyed by symbol for quick lookup.
+        Why we return a new dict
+        - Returning a copy prevents callers from mutating internal state accidentally.
+        - This mimics the idea of a snapshot for the current cycle.
         """
         return dict(self.positions)
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """
-        Return a snapshot of open orders.
+        Return open orders as a list.
 
-        Why we return a list
-        - Orders are naturally represented as a collection of records.
-        - Deduplication rules scan this list for matching orders.
+        Why we return a new list
+        - Returning a copy prevents accidental mutation of internal state.
+        - Risk rules should treat orders as read-only snapshot data.
         """
         return list(self.open_orders)
 
     def get_asset_price(self, symbol: str) -> float:
         """
-        Return a deterministic price for a symbol.
+        Return an underlying price for a symbol.
 
-        Behaviour
-        - Normalises the symbol to uppercase and strips whitespace.
-        - Returns the configured price if present.
-        - Raises if missing, so missing price problems are visible.
-        """
-        key: str = symbol.strip().upper()
-        if key not in self.prices:
-            raise KeyError(f"FakeBroker has no price configured for symbol: {key}")
-        return float(self.prices[key])
+        Why this method raises KeyError if missing
+        - If a strategy requests a symbol we did not configure, we want the failure to be obvious.
+        - Silent defaults hide problems and lead to "the bot does nothing" behaviour.
 
-    def get_option_chain(self, symbol: str, tipo: str, strike: Any, expiration: Any) -> Any:
+        Normalisation
+        - strip() removes leading/trailing whitespace.
+        - upper() makes the key consistent.
         """
-        Placeholder for compatibility with the broader interface.
+        sym: str = symbol.strip().upper()
 
-        Why this is here
-        - Some V1 code may assume this exists.
-        - In V2 Option C, option chain fetching should be orchestrator-owned and explicit.
-        """
-        raise NotImplementedError("FakeBroker does not implement option chain fetching.")
+        if sym not in self.prices:
+            raise KeyError(f"FakeBrokerV2 has no configured price for symbol: {sym}")
+
+        price: float = float(self.prices[sym])
+
+        if price <= 0.0:
+            raise ValueError(f"FakeBrokerV2 price for {sym} must be positive, got {price}")
+
+        return price
 
     def submit_order(self, order: Any) -> Any:
         """
-        Placeholder for compatibility.
+        Submit an order request.
 
         Why this raises
-        - In V2 dry-run, no submission should occur.
-        - If something tries to submit, that is a design violation.
+        - In early Option C development, we default to dry-run.
+        - If this method is called, it means some code path attempted real submission.
+        - That is unsafe until approval and sizing are implemented.
+
+        Later
+        - When the orchestrator supports submission, tests can swap this behaviour.
         """
-        raise RuntimeError("FakeBroker.submit_order called. Dry-run should not submit orders.")
-
-
+        raise RuntimeError("FakeBrokerV2.submit_order was called. Dry-run should not submit orders.")
