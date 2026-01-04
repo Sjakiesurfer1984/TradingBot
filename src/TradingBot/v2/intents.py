@@ -5,7 +5,6 @@ from typing import Tuple
 
 from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
 
-
 @dataclass(frozen=True)
 class SelectedOption:
     """

@@ -10,7 +10,10 @@ from TradingBot.v2.intents import PmccIntentPayload, SelectedOption, TradeIntent
 from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 
 from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+
 logger = setup_logger("PMCC Strategy")
+
 
 @dataclass(frozen=True)
 class PmccStrategyV2(StrategyV2):
@@ -24,52 +27,69 @@ class PmccStrategyV2(StrategyV2):
     @property
     def symbols(self) -> Sequence[Symbol]:
         # Orchestrator will prefetch these.
-        return (normalise_symbol(self.underlying_symbol),)
+        with log_scope("pmcc.symbols", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
+            syms: Sequence[Symbol] = (normalise_symbol(self.underlying_symbol),)
+            logger.info("Symbols declared | symbols=%s", [str(s) for s in syms])
+            return syms
 
     def generate_intents(self, ctx: RiskContext) -> List[TradeIntent]:
-        underlying: Symbol = normalise_symbol(self.underlying_symbol)
+        with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
+            underlying: Symbol = normalise_symbol(self.underlying_symbol)
+            logger.info("Normalised underlying | underlying=%s", str(underlying))
 
-        price = ctx.get_price(underlying)
-        if price is None:
-            return []
+            price = ctx.get_price(underlying)
+            if price is None:
+                logger.warning("Missing price in context | underlying=%s. No intents produced.", str(underlying))
+                return []
 
-        intent_id: IntentId = make_intent_id(
-            strategy_id=self.strategy_id,
-            underlying=underlying,
-            as_of_utc=ctx.as_of_utc,
-        )
+            logger.info("Underlying price from context | underlying=%s price=%.6f", str(underlying), float(price))
 
-        placeholder_leap: SelectedOption = SelectedOption(
-            option_symbol=f"{underlying}_LEAP_PLACEHOLDER",
-            ask_price=0.0,
-            bid_price=0.0,
-            delta=0.0,
-            dte=0,
-        )
+            intent_id: IntentId = make_intent_id(
+                strategy_id=self.strategy_id,
+                underlying=underlying,
+                as_of_utc=ctx.as_of_utc,
+            )
+            logger.info("Intent id created | intent_id=%s as_of_utc=%s", str(intent_id), ctx.as_of_utc.isoformat())
 
-        placeholder_near: SelectedOption = SelectedOption(
-            option_symbol=f"{underlying}_NEAR_PLACEHOLDER",
-            ask_price=0.0,
-            bid_price=0.0,
-            delta=0.0,
-            dte=0,
-        )
+            placeholder_leap: SelectedOption = SelectedOption(
+                option_symbol=f"{underlying}_LEAP_PLACEHOLDER",
+                ask_price=0.0,
+                bid_price=0.0,
+                delta=0.0,
+                dte=0,
+            )
 
-        payload: PmccIntentPayload = PmccIntentPayload(
-            underlying_symbol=underlying,
-            leap=placeholder_leap,
-            near=placeholder_near,
-        )
+            placeholder_near: SelectedOption = SelectedOption(
+                option_symbol=f"{underlying}_NEAR_PLACEHOLDER",
+                ask_price=0.0,
+                bid_price=0.0,
+                delta=0.0,
+                dte=0,
+            )
 
-        tags: Tuple[str, ...] = ("v2", "pmcc", "placeholder")
+            payload: PmccIntentPayload = PmccIntentPayload(
+                underlying_symbol=underlying,
+                leap=placeholder_leap,
+                near=placeholder_near,
+            )
 
-        intent: TradeIntent = TradeIntent(
-            intent_id=intent_id,
-            strategy_id=self.strategy_id,
-            symbol=underlying,
-            payload=payload,
-            time_in_force="day",
-            tags=tags,
-        )
+            tags: Tuple[str, ...] = ("v2", "pmcc", "placeholder")
 
-        return [intent]
+            intent: TradeIntent = TradeIntent(
+                intent_id=intent_id,
+                strategy_id=self.strategy_id,
+                symbol=underlying,
+                payload=payload,
+                time_in_force="day",
+                tags=tags,
+            )
+
+            logger.info(
+                "PMCC intent produced | intent_id=%s strategy_id=%s symbol=%s tags=%s",
+                str(intent.intent_id),
+                str(intent.strategy_id),
+                str(intent.symbol),
+                list(intent.tags),
+            )
+
+            return [intent]

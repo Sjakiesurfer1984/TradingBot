@@ -3,296 +3,392 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import time
 
+import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
 from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.brokers.errors import BrokerConnectionError
 from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+
 logger = setup_logger("AlpacaBroker")
 
 
 @dataclass
 class AlpacaBrokerV2(BrokerInterfaceV2):
     """
-    Alpaca broker adapter for V2 Option C.
+    Alpaca broker adapter for TradingBot V2.
 
-    Core rule
-    - No network IO in __init__ or __post_init__.
-      The broker object must be cheap to construct.
-      All API calls happen inside explicit methods called by the orchestrator.
+    What this file optimises for
+    - Strictly bounded network IO where possible using timeouts.
+    - Connection reuse via requests.Session to reduce repeated TLS handshakes.
+    - High visibility logs for diagnosing stalls, timeouts, and intermittent network issues.
 
-    Why this exists
-    - V2 must not import V1 code.
-    - V2 must be testable by swapping in FakeBrokerV2.
-    - The orchestrator must be the only component that performs broker IO.
-
-    Implementation notes
-    - This uses the official alpaca-py SDK.
-    - We lazily instantiate SDK clients the first time they are needed.
+    Important reality
+    - If the OS networking stack or a security product stalls the TCP connect,
+      Python can appear to hang until the socket layer times out or the process is interrupted.
+      Logging makes the stall location obvious.
     """
 
-    api_key: str
-    api_secret: str
-    paper: bool = True
+    api_key: str = field(repr=False)
+    api_secret: str = field(repr=False)
 
-    # A conservative timeout protects you against hanging sockets.
+    paper: bool = True
     request_timeout_seconds: float = 10.0
 
-    # Cached SDK clients. These are created lazily on first use.
-    _trading_client: Optional[Any] = field(default=None, init=False)
+    # Connect timeout is kept smaller to fail fast when connect stalls.
+    connect_timeout_seconds: float = 3.0
+
+    # When True, logs include more detail per request.
+    debug_http: bool = True
+
+    _session: Optional[Session] = field(default=None, init=False)
+
+    # ---------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------
 
     def _base_url(self) -> str:
-        """
-        Decide which Alpaca endpoint to use.
-
-        Why this exists
-        - Alpaca has separate endpoints for paper and live trading.
-        - We keep this logic in one place so it is hard to misconfigure.
-        """
         return "https://paper-api.alpaca.markets" if self.paper else "https://api.alpaca.markets"
 
-    def _ensure_trading_client(self) -> Any:
+    def _base_url_v2(self) -> str:
+        return f"{self._base_url()}/v2"
+    
+    def _market_data_base_url(self) -> str:
         """
-        Lazily create the alpaca-py TradingClient.
+        Base URL for Alpaca Market Data API.
 
-        Why lazy creation matters
-        - Creating a client object is cheap and should not call the network.
-        - We avoid importing alpaca-py at module import time if you are running tests
-          without Alpaca installed.
+        Why this exists
+        - Keeps market data host centralised.
+        - Allows changing host/version in one place if Alpaca updates it.
         """
-        if self._trading_client is None:
-            # Local import reduces import side effects and keeps tests flexible.
-            from alpaca.trading.client import TradingClient
+        return "https://data.alpaca.markets"
 
-            # TradingClient construction should not perform network IO.
-            self._trading_client = TradingClient(
-                api_key=self.api_key,
-                secret_key=self.api_secret,
-                paper=self.paper,
-            )
-        return self._trading_client
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "APCA-API-KEY-ID": self.api_key,
+            "APCA-API-SECRET-KEY": self.api_secret,
+        }
+
+    def _ensure_session(self) -> Session:
+        """
+        Create and cache a requests.Session for connection pooling.
+
+        Why this matters
+        - Reusing a session reduces repeated TCP and TLS setup.
+        - Reduces probability of intermittent stalls during connection establishment.
+        """
+        if self._session is None:
+            with log_scope(
+                "alpaca_broker._ensure_session",
+                logger,
+                extra=f"paper={self.paper} connect_timeout={self.connect_timeout_seconds:.2f}s read_timeout={self.request_timeout_seconds:.2f}s",
+            ):
+                session = requests.Session()
+
+                adapter = HTTPAdapter(
+                    pool_connections=4,
+                    pool_maxsize=4,
+                    max_retries=0,  # Do not hide issues behind retries.
+                )
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+
+                self._session = session
+
+                logger.info(
+                    "Created HTTP session for Alpaca. paper=%s connect_timeout=%.2fs read_timeout=%.2fs",
+                    self.paper,
+                    float(self.connect_timeout_seconds),
+                    float(self.request_timeout_seconds),
+                )
+
+        return self._session
+
+    def _log_request_start(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict[str, Any]],
+        timeout: tuple[float, float],
+    ) -> None:
+        if not self.debug_http:
+            return
+
+        safe_params: Dict[str, Any] = params or {}
+        logger.info(
+            "HTTP start method=%s url=%s params=%s timeout(connect=%.2fs, read=%.2fs)",
+            method.upper(),
+            url,
+            safe_params,
+            float(timeout[0]),
+            float(timeout[1]),
+        )
+
+    def _log_request_end(self, url: str, status_code: int, elapsed_s: float) -> None:
+        if not self.debug_http:
+            return
+
+        logger.info(
+            "HTTP end url=%s status=%s elapsed=%.3fs",
+            url,
+            int(status_code),
+            float(elapsed_s),
+        )
+
+    def _request_json_url(
+        self,
+        method: str,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        Perform an HTTP request to a fully-qualified URL and return JSON.
+
+        Why this exists
+        - Trading endpoints use base_url_v2 + path.
+        - Market data endpoints use a different host (data.alpaca.markets) and are easiest as full URLs.
+        - One shared request implementation keeps behaviour consistent and reduces bugs.
+        """
+        session: Session = self._ensure_session()
+        timeout: tuple[float, float] = (float(self.connect_timeout_seconds), float(self.request_timeout_seconds))
+
+        extra: str = f"method={method.upper()} url={url} timeout=({timeout[0]:.2f}s,{timeout[1]:.2f}s)"
+        if params:
+            extra = f"{extra} params={params}"
+
+        with log_scope("alpaca_broker._request_json_url", logger, extra=extra):
+            self._log_request_start(method=method, url=url, params=params, timeout=timeout)
+            t0: float = time.monotonic()
+
+            try:
+                response = session.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=self._headers(),
+                    params=params,
+                    timeout=timeout,
+                )
+                elapsed: float = time.monotonic() - t0
+                self._log_request_end(url=url, status_code=int(response.status_code), elapsed_s=elapsed)
+
+                response.raise_for_status()
+
+                try:
+                    return response.json()
+                except ValueError:
+                    logger.error(
+                        "HTTP JSON decode failed url=%s status=%s body_prefix=%s",
+                        url,
+                        response.status_code,
+                        response.text[:250],
+                    )
+                    raise
+
+            except requests.exceptions.Timeout as exc:
+                elapsed: float = time.monotonic() - t0
+                logger.exception(
+                    "HTTP timeout url=%s elapsed=%.3fs timeout(connect=%.2fs, read=%.2fs)",
+                    url,
+                    float(elapsed),
+                    float(timeout[0]),
+                    float(timeout[1]),
+                )
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=(
+                        f"Timeout calling {url}. "
+                        f"Connect timeout={timeout[0]:.2f}s, read timeout={timeout[1]:.2f}s."
+                    ),
+                ) from exc
+
+            except requests.exceptions.RequestException as exc:
+                elapsed: float = time.monotonic() - t0
+                logger.exception("HTTP request error url=%s elapsed=%.3fs", url, float(elapsed))
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"HTTP error calling {url}: {exc}",
+                ) from exc
+
+            except ValueError as exc:
+                elapsed: float = time.monotonic() - t0
+                logger.exception("HTTP non-JSON response url=%s elapsed=%.3fs", url, float(elapsed))
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"Non-JSON response from {url}.",
+                ) from exc
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        Perform a REST call to Alpaca trading endpoint with strict timeout handling.
+
+        This method is a thin wrapper around _request_json_url for trading endpoints.
+        """
+        url: str = f"{self._base_url_v2()}{path}"
+        return self._request_json_url(method=method, url=url, params=params)
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
-        """
-        Convert a value to float safely.
-
-        Why this exists
-        - Alpaca SDK objects may provide values as strings or decimals.
-        - The rest of the system expects floats for arithmetic.
-        """
         try:
             return float(value)
         except Exception:
             return float(default)
 
-    def get_option_buying_power(self) -> float:
-        """
-        Return option buying power from Alpaca.
-
-        What this calls
-        - GET /account via TradingClient.get_account()
-
-        Important
-        - This is network IO.
-        - Only the orchestrator should call this during a cycle.
-        """
-        client: Any = self._ensure_trading_client()
-
-        # Network IO occurs here.
-        account: Any = client.get_account()
-
-        # Alpaca exposes buying power fields on the account object.
-        # Options buying power availability can differ by account and permissions.
-        # We attempt a few common fields in a safe order.
-        candidates: List[Any] = [
-            getattr(account, "options_buying_power", None),
-            getattr(account, "buying_power", None),
-            getattr(account, "cash", None),
-        ]
-
-        for c in candidates:
-            if c is None:
-                continue
-            val: float = self._safe_float(c, default=0.0)
-            if val > 0.0:
-                return val
-
-        return 0.0
+    # ---------------------------------------------------------------------
+    # BrokerInterfaceV2 implementation
+    # ---------------------------------------------------------------------
 
     def get_equity(self) -> float:
-        """
-        Return account equity from Alpaca.
+        self._log_io_boundary("get_equity")
+        with log_scope("broker.get_equity", logger):
+            logger.info("Broker call get_equity")
+            data: Dict[str, Any] = self._request_json("GET", "/account")
+            equity: float = self._safe_float(data.get("equity"), default=0.0)
+            logger.info("Broker result get_equity equity=%.2f", float(equity))
+            return max(equity, 0.0)
 
-        What this calls
-        - GET /account via TradingClient.get_account()
-
-        Why this matters
-        - Equity is used for risk controls and reporting.
-        """
-        client: Any = self._ensure_trading_client()
-
-        # Network IO occurs here.
-        account: Any = client.get_account()
-
-        equity_raw: Any = getattr(account, "equity", None)
-        equity: float = self._safe_float(equity_raw, default=0.0)
-
-        return max(equity, 0.0)
+    def get_option_buying_power(self) -> float:
+        self._log_io_boundary("get_option_buying_power")
+        with log_scope("broker.get_option_buying_power", logger):
+            logger.info("Broker call get_option_buying_power")
+            data: Dict[str, Any] = self._request_json("GET", "/account")
+            raw: Any = data.get("options_buying_power")
+            obp: float = self._safe_float(raw, default=0.0)
+            logger.info("Broker result get_option_buying_power options_buying_power=%.2f", float(obp))
+            return obp
 
     def get_positions(self) -> Dict[str, Any]:
-        """
-        Return positions from Alpaca.
+        self._log_io_boundary("get_positions")
+        with log_scope("broker.get_positions", logger):
+            logger.info("Broker call get_positions")
+            positions: Any = self._request_json("GET", "/positions")
 
-        What this calls
-        - GET /positions via TradingClient.get_all_positions()
+            result: Dict[str, Any] = {}
+            if not isinstance(positions, list):
+                logger.warning("Broker result get_positions unexpected_type=%s", type(positions).__name__)
+                return result
 
-        Return shape
-        - A dict keyed by symbol, values are raw Alpaca position objects converted to dict-like payloads
-          where possible.
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    continue
+                symbol: str = str(pos.get("symbol", "")).strip().upper()
+                if symbol:
+                    result[symbol] = pos
 
-        Why we keep Any
-        - We will later define typed V2 position models.
-        - For now, RiskContext stores a broker snapshot and rules can inspect it defensively.
-        """
-        client: Any = self._ensure_trading_client()
-
-        # Network IO occurs here.
-        positions: Any = client.get_all_positions()
-
-        result: Dict[str, Any] = {}
-
-        if not positions:
+            logger.info("Broker result get_positions count=%d", int(len(result)))
             return result
 
-        for pos in positions:
-            sym: str = str(getattr(pos, "symbol", "")).strip().upper()
-            if not sym:
-                continue
-
-            # Keep raw object, but also try to provide a plain dict if the SDK supports it.
-            payload: Any = pos
-            if hasattr(pos, "model_dump"):
-                try:
-                    payload = pos.model_dump()
-                except Exception:
-                    payload = pos
-
-            result[sym] = payload
-
-        return result
-
     def get_open_orders(self) -> List[Dict[str, Any]]:
-        """
-        Return open orders from Alpaca.
+        self._log_io_boundary("get_open_orders")
+        with log_scope("broker.get_open_orders", logger):
+            logger.info("Broker call get_open_orders")
+            orders: Any = self._request_json("GET", "/orders", params={"status": "open"})
 
-        What this calls
-        - GET /orders via TradingClient.get_orders()
+            if not isinstance(orders, list):
+                logger.warning("Broker result get_open_orders unexpected_type=%s", type(orders).__name__)
+                return []
 
-        Why this matters
-        - Open-order deduplication is one of the first risk controls in Option C.
-        """
-        client: Any = self._ensure_trading_client()
+            filtered: List[Dict[str, Any]] = [o for o in orders if isinstance(o, dict)]
+            logger.info("Broker result get_open_orders count=%d", int(len(filtered)))
+            return filtered
 
-        # Local import to avoid importing request models when running tests that do not need Alpaca.
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-
-        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-
-        # Network IO occurs here.
-        orders: Any = client.get_orders(request)
-
-        results: List[Dict[str, Any]] = []
-
-        if not orders:
-            return results
-
-        for o in orders:
-            if hasattr(o, "model_dump"):
-                try:
-                    results.append(o.model_dump())
-                    continue
-                except Exception:
-                    pass
-
-            # Minimal fallback representation.
-            results.append(
-                {
-                    "id": getattr(o, "id", None),
-                    "client_order_id": getattr(o, "client_order_id", None),
-                    "symbol": getattr(o, "symbol", None),
-                    "status": getattr(o, "status", None),
-                    "legs": getattr(o, "legs", None),
-                }
-            )
-
-        return results
+    def submit_order(self, order: Any) -> Any:
+        self._log_io_boundary("submit_order")
+        raise NotImplementedError(
+            "Order submission not implemented yet. "
+            "Define v2/domain/orders.py request types first."
+        )
 
     def get_asset_price(self, symbol: str) -> float:
         """
-        Return the current market price for an underlying.
+        Return a mid price for a stock using Alpaca Market Data.
 
-        Important
-        - Alpaca's trading client does not always provide last-trade prices.
-        - Quote/market-data access depends on your subscription and environment.
-        - For V2, this method must work reliably, so we implement it via requests to Alpaca's data API.
-
-        If your account lacks data permissions
-        - This may fail.
-        - In that case, the orchestrator should handle exceptions and omit the price.
-
-        Why we use requests here
-        - alpaca-py has data clients, but they have changed between versions.
-        - A direct REST call keeps behaviour explicit and debuggable.
+        Why this is implemented this way
+        - We reuse the same HTTP plumbing as trading calls (session reuse, strict timeouts, consistent logs).
+        - We explicitly request the IEX feed, which is the normal feed for paper accounts.
+        - We compute a mid when both bid and ask exist, with sensible fallbacks.
         """
-        import requests
+        self._log_io_boundary("get_asset_price")
 
         sym: str = symbol.strip().upper()
         if not sym:
             raise ValueError("symbol must be a non-empty string")
 
         url: str = f"https://data.alpaca.markets/v2/stocks/{sym}/quotes/latest"
-        headers: Dict[str, str] = {
-            "APCA-API-KEY-ID": self.api_key,
-            "APCA-API-SECRET-KEY": self.api_secret,
-        }
+        params: Dict[str, Any] = {"feed": "iex"}
 
-        # Network IO occurs here.
-        resp = requests.get(url, headers=headers, timeout=self.request_timeout_seconds)
-        resp.raise_for_status()
+        with log_scope("broker.get_asset_price", logger, extra=f"symbol={sym} url={url} params={params}"):
+            logger.info("Broker call get_asset_price symbol=%s", sym)
 
-        data: Dict[str, Any] = resp.json()
+            data_any: Any = self._request_json_url("GET", url, params=params)
 
-        # Alpaca latest quote returns {"quote": {"ap": ask_price, "bp": bid_price, ...}}
-        quote: Any = data.get("quote", {})
-        ask: float = self._safe_float(quote.get("ap"), default=0.0)
-        bid: float = self._safe_float(quote.get("bp"), default=0.0)
+            if not isinstance(data_any, dict):
+                logger.error("Market data unexpected_type symbol=%s type=%s", sym, type(data_any).__name__)
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"Unexpected market data response type for {sym}: {type(data_any).__name__}",
+                )
 
-        # Mid price is a reasonable approximation for strategy selection.
-        if ask > 0.0 and bid > 0.0:
-            return (ask + bid) / 2.0
+            quote_any: Any = data_any.get("quote")
+            if not isinstance(quote_any, dict):
+                logger.error("Market data missing_quote symbol=%s payload=%s", sym, data_any)
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"Market data response missing 'quote' for {sym}.",
+                )
 
-        # Fallback: if only one side exists, return it.
-        if ask > 0.0:
-            return ask
-        if bid > 0.0:
-            return bid
+            ask: float = self._safe_float(quote_any.get("ap"), default=0.0)
+            bid: float = self._safe_float(quote_any.get("bp"), default=0.0)
 
-        raise RuntimeError(f"Alpaca returned no usable quote for {sym}: {data}")
+            if ask > 0.0 and bid > 0.0:
+                mid: float = (ask + bid) / 2.0
+                logger.info(
+                    "Broker result get_asset_price symbol=%s bid=%.4f ask=%.4f mid=%.4f",
+                    sym,
+                    float(bid),
+                    float(ask),
+                    float(mid),
+                )
+                return mid
 
-    def submit_order(self, order: Any) -> Any:
-        """
-        Submit an order to Alpaca.
+            if ask > 0.0:
+                logger.info("Broker result get_asset_price symbol=%s ask_only=%.4f", sym, float(ask))
+                return ask
 
-        Important
-        - This is network IO.
-        - Only the orchestrator is allowed to call this.
-        - In Option C, the orchestrator will submit only ApprovedOrder objects.
+            if bid > 0.0:
+                logger.info("Broker result get_asset_price symbol=%s bid_only=%.4f", sym, float(bid))
+                return bid
 
-        For now
-        - We raise because V2 order models are still being finalised in v2/domain/orders.py.
-        - Once your V2 order request type is defined, this method will translate it into Alpaca order requests.
-        """
-        raise NotImplementedError(
-            "Order submission not implemented yet. "
-            "Define v2/domain/orders.py request types first, then map them here."
-        )
+            logger.error("Broker result get_asset_price no_usable_quote symbol=%s quote=%s", sym, quote_any)
+            raise BrokerConnectionError(
+                broker_name="alpaca",
+                message=f"No usable quote returned for {sym}.",
+            )
+    
+    def get_account_snapshot(self) -> AccountSnapshot:
+        self._log_io_boundary("get_account_snapshot")
+        with log_scope("broker.get_account_snapshot", logger):
+            data: Dict[str, Any] = self._request_json("GET", "/account")
+
+            equity: float = self._safe_float(data.get("equity"), default=0.0)
+            options_buying_power: float = self._safe_float(data.get("options_buying_power"), default=0.0)
+            raw_cash: Any = data.get("cash")
+            cash: Optional[float] = float(raw_cash) if raw_cash is not None else None
+
+
+            return AccountSnapshot(
+                equity=equity,
+                options_buying_power=options_buying_power,
+                cash=cash,
+                raw=data,
+            )

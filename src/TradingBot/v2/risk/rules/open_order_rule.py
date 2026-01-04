@@ -18,7 +18,10 @@ from TradingBot.v2.domain.types import Symbol
 from TradingBot.v2.intents import TradeIntent
 
 from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+
 logger = setup_logger("Open Order Rule")
+
 
 @dataclass(frozen=True)
 class OpenOrderDedupeRule:
@@ -67,7 +70,8 @@ class OpenOrderDedupeRule:
         - underlying = Symbol("SPY")
         - result = "PMCC:SPY"
         """
-        return f"{self.client_order_prefix}:{str(underlying).strip().upper()}"
+        expected: str = f"{self.client_order_prefix}:{str(underlying).strip().upper()}"
+        return expected
 
     def _mentions_underlying(self, underlying: Symbol, order: Dict[str, Any]) -> bool:
         """
@@ -84,28 +88,36 @@ class OpenOrderDedupeRule:
           - order["symbol"]
           - each leg["symbol"] if legs are present
         """
-        # Normalise the underlying symbol for string comparison.
-        ul: str = str(underlying).strip().upper()
+        with log_scope("open_order_rule._mentions_underlying", logger, extra=f"underlying={underlying}"):
+            # Normalise the underlying symbol for string comparison.
+            ul: str = str(underlying).strip().upper()
 
-        # Check top-level order symbol field.
-        symbol_field: str = self._safe_str(order.get("symbol")).upper()
-        if symbol_field.startswith(ul):
-            return True
+            # Check top-level order symbol field.
+            symbol_field: str = self._safe_str(order.get("symbol")).upper()
+            if symbol_field.startswith(ul):
+                logger.info("Underlying mentioned in order.symbol | underlying=%s order_symbol=%s", ul, symbol_field)
+                return True
 
-        # Check individual legs if present.
-        legs = order.get("legs")
-        if isinstance(legs, list):
-            for leg in legs:
-                # Defensive validation: legs should be dict-like.
-                if not isinstance(leg, dict):
-                    continue
+            # Check individual legs if present.
+            legs = order.get("legs")
+            if isinstance(legs, list):
+                for leg in legs:
+                    # Defensive validation: legs should be dict-like.
+                    if not isinstance(leg, dict):
+                        continue
 
-                leg_symbol: str = self._safe_str(leg.get("symbol")).upper()
-                if leg_symbol.startswith(ul):
-                    return True
+                    leg_symbol: str = self._safe_str(leg.get("symbol")).upper()
+                    if leg_symbol.startswith(ul):
+                        logger.info(
+                            "Underlying mentioned in order.legs | underlying=%s leg_symbol=%s",
+                            ul,
+                            leg_symbol,
+                        )
+                        return True
 
-        # No mention of the underlying was found.
-        return False
+            # No mention of the underlying was found.
+            logger.info("Underlying not mentioned in order payload | underlying=%s", ul)
+            return False
 
     def _intent_underlying(self, intent: TradeIntent) -> Symbol:
         """
@@ -119,7 +131,8 @@ class OpenOrderDedupeRule:
         Current behaviour
         - For PMCC intents, the underlying is stored in payload.underlying_symbol.
         """
-        return intent.payload.underlying_symbol
+        underlying: Symbol = intent.payload.underlying_symbol
+        return underlying
 
     def check(self, ctx: RiskContext, intent: TradeIntent) -> Optional[str]:
         """
@@ -133,38 +146,47 @@ class OpenOrderDedupeRule:
         - Keeps rules simple and composable.
         - RiskEngineV2 can apply many rules and collect rejection reasons.
         """
+        with log_scope(
+            "open_order_rule.check",
+            logger,
+            extra=f"intent_id={intent.intent_id} strategy_id={intent.strategy_id} symbol={intent.symbol}",
+        ):
+            # Determine the canonical underlying symbol for this intent.
+            underlying: Symbol = self._intent_underlying(intent)
+            logger.info("Checking open-order dedupe | underlying=%s open_orders=%d", str(underlying), int(len(ctx.open_orders)))
 
-        # Determine the canonical underlying symbol for this intent.
-        underlying: Symbol = self._intent_underlying(intent)
+            # Build the deterministic expected client_order_id for this underlying.
+            expected_id: str = self._expected_client_order_id(underlying)
+            logger.info("Expected client_order_id computed | expected_id=%s", expected_id)
 
-        # Build the deterministic expected client_order_id for this underlying.
-        expected_id: str = self._expected_client_order_id(underlying)
+            # Iterate through the broker-provided open orders snapshot.
+            for i, order in enumerate(ctx.open_orders):
+                # Defensive check: broker payloads should be dict-like.
+                if not isinstance(order, dict):
+                    logger.warning("Skipping non-dict open order payload | index=%d type=%s", int(i), type(order).__name__)
+                    continue
 
-        # Iterate through the broker-provided open orders snapshot.
-        for order in ctx.open_orders:
-            # Defensive check: broker payloads should be dict-like.
-            if not isinstance(order, dict):
-                continue
+                # Primary dedupe path:
+                # Exact match on client_order_id.
+                client_order_id: str = self._safe_str(
+                    order.get("client_order_id")
+                ).strip()
 
-            # Primary dedupe path:
-            # Exact match on client_order_id.
-            client_order_id: str = self._safe_str(
-                order.get("client_order_id")
-            ).strip()
+                if client_order_id:
+                    logger.info("Open order client_order_id observed | index=%d client_order_id=%s", int(i), client_order_id)
 
-            if client_order_id == expected_id:
-                return (
-                    f"Open order exists for {underlying} "
-                    f"(client_order_id match)."
-                )
+                if client_order_id == expected_id:
+                    reason: str = f"Open order exists for {underlying} (client_order_id match)."
+                    logger.info("Dedupe hit | index=%d reason=%s", int(i), reason)
+                    return reason
 
-            # Secondary dedupe path:
-            # Heuristic inspection of symbol fields.
-            if self._mentions_underlying(underlying, order):
-                return (
-                    f"Open order exists for {underlying} "
-                    f"(symbol match)."
-                )
+                # Secondary dedupe path:
+                # Heuristic inspection of symbol fields.
+                if self._mentions_underlying(underlying, order):
+                    reason = f"Open order exists for {underlying} (symbol match)."
+                    logger.info("Dedupe hit | index=%d reason=%s", int(i), reason)
+                    return reason
 
-        # No open order was found that conflicts with this intent.
-        return None
+            # No open order was found that conflicts with this intent.
+            logger.info("No conflicting open orders found | underlying=%s", str(underlying))
+            return None

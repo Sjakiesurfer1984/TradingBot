@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
+
 from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
 logger = setup_logger("Broker Interface")
 
 
@@ -27,6 +30,17 @@ class BrokerInterfaceV2(ABC):
       broker payloads differ and we are still stabilising V2.
     - Later we will replace these with strongly typed V2 domain models.
     """
+
+    @abstractmethod
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """
+        Return a point-in-time snapshot of account state.
+
+        Why this exists
+        - Avoids calling /v2/account multiple times per orchestration cycle.
+        - Gives orchestrator one object containing the account values it needs.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def get_option_buying_power(self) -> float:
@@ -93,3 +107,19 @@ class BrokerInterfaceV2(ABC):
         - Only the orchestrator may call submit_order.
         """
         raise NotImplementedError
+
+    def _log_io_boundary(self, method_name: str) -> None:
+        """
+        Log an explicit IO-boundary marker for broker calls.
+
+        Why this exists
+        - Broker methods are the only allowed place for network IO.
+        - When debugging hangs, it helps to see the exact transition point
+          between pure code and IO calls.
+
+        Notes
+        - Implementations may call this at the start of their public methods.
+        - This default implementation is optional and does not change behaviour.
+        """
+        with log_scope("broker_interface.io_boundary", logger, extra=f"method={method_name}"):
+            logger.info("Broker IO boundary entered | method=%s", method_name)

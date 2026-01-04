@@ -5,6 +5,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from TradingBot.v2.domain.types import Symbol
+from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+
+logger = setup_logger("RiskContext")
+
 
 @dataclass(frozen=True)
 class RiskContext:
@@ -68,7 +73,15 @@ class RiskContext:
         - Avoids scattered `.upper()` calls across strategies and risk code.
         - Makes missing-price handling explicit.
         """
-        return self.prices.get(symbol)
+        with log_scope("risk_context.get_price", logger, extra=f"symbol={symbol}"):
+            price: Optional[float] = self.prices.get(symbol)
+            if price is None:
+                logger.warning(
+                    "Price missing in snapshot | symbol=%s available_symbols=%d",
+                    symbol,
+                    int(len(self.prices)),
+                )
+                return None
 
-
-
+            logger.info("Price hit | symbol=%s price=%.6f", symbol, float(price))
+            return float(price)

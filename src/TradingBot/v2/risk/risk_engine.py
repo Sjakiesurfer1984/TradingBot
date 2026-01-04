@@ -37,6 +37,8 @@ from TradingBot.v2.intents import TradeIntent
 from TradingBot.v2.risk.rules.open_order_rule import OpenOrderDedupeRule
 
 from TradingBot.v2.logger import setup_logger
+from TradingBot.v2.logging_utils import log_scope
+
 logger = setup_logger("Risk Engine")
 
 
@@ -68,15 +70,25 @@ class RiskEngineV2:
         - It prevents copy-paste of the same object construction.
         - It ensures rejection formatting is consistent across rules.
         """
-        # RejectedIntent stores the intent_id and a human-readable reason.
-        rejected: RejectedIntent = RejectedIntent(
-            intent_id=intent.intent_id,
-            reason=reason,
-        )
+        with log_scope("risk_engine._reject", logger, extra=f"intent_id={intent.intent_id}"):
+            # RejectedIntent stores the intent_id and a human-readable reason.
+            rejected: RejectedIntent = RejectedIntent(
+                intent_id=intent.intent_id,
+                reason=reason,
+            )
 
-        # RiskDecision wraps the outcome so orchestrator can handle it uniformly.
-        decision: RiskDecision = RiskDecision(rejected=rejected)
-        return decision
+            # RiskDecision wraps the outcome so orchestrator can handle it uniformly.
+            decision: RiskDecision = RiskDecision(rejected=rejected)
+
+            logger.info(
+                "Rejected intent | intent_id=%s strategy_id=%s symbol=%s reason=%s",
+                str(intent.intent_id),
+                str(intent.strategy_id),
+                str(intent.symbol),
+                reason,
+            )
+
+            return decision
 
     def evaluate(self, ctx: RiskContext, intents: List[TradeIntent]) -> List[RiskDecision]:
         """
@@ -99,33 +111,43 @@ class RiskEngineV2:
         - It lets you correlate input -> output by index during debugging.
         - It keeps logs deterministic.
         """
-        # Initialise an empty list that we will fill.
-        # Lists are mutable, which is useful when building up results incrementally.
-        decisions: List[RiskDecision] = []
+        with log_scope("risk_engine.evaluate", logger, extra=f"intents={len(intents)} as_of_utc={ctx.as_of_utc.isoformat()}"):
+            # Initialise an empty list that we will fill.
+            # Lists are mutable, which is useful when building up results incrementally.
+            decisions: List[RiskDecision] = []
 
-        # Iterate over each intent in the order it was produced.
-        for intent in intents:
-            # Ask the dedupe rule whether this intent should be rejected.
-            # The rule returns:
-            # - None if it does not reject
-            # - A string reason if it rejects
-            reason: Optional[str] = self.dedupe_rule.check(ctx, intent)
+            # Iterate over each intent in the order it was produced.
+            for idx, intent in enumerate(intents):
+                with log_scope(
+                    "risk_engine.evaluate_intent",
+                    logger,
+                    extra=f"index={idx} intent_id={intent.intent_id} strategy_id={intent.strategy_id} symbol={intent.symbol}",
+                ):
+                    # Ask the dedupe rule whether this intent should be rejected.
+                    # The rule returns:
+                    # - None if it does not reject
+                    # - A string reason if it rejects
+                    reason: Optional[str] = self.dedupe_rule.check(ctx, intent)
 
-            # If the rule produced a reason, we reject immediately.
-            if reason is not None:
-                decisions.append(self._reject(intent=intent, reason=reason))
-                continue
+                    # If the rule produced a reason, we reject immediately.
+                    if reason is not None:
+                        logger.info("Dedupe rule rejected intent | intent_id=%s reason=%s", str(intent.intent_id), reason)
+                        decisions.append(self._reject(intent=intent, reason=reason))
+                        continue
 
-            # If we get here, dedupe did not reject the intent.
-            #
-            # We still reject because "approval/sizing" is not implemented.
-            # This is the deliberate safety rail that prevents accidental trading.
-            decisions.append(
-                self._reject(
-                    intent=intent,
-                    reason="Not yet approved (sizing not implemented).",
-                )
-            )
+                    # If we get here, dedupe did not reject the intent.
+                    #
+                    # We still reject because "approval/sizing" is not implemented.
+                    # This is the deliberate safety rail that prevents accidental trading.
+                    logger.info("Dedupe passed. Applying default safety rejection | intent_id=%s", str(intent.intent_id))
+                    decisions.append(
+                        self._reject(
+                            intent=intent,
+                            reason="Not yet approved (sizing not implemented).",
+                        )
+                    )
 
-        # Return the decisions list, preserving intent order.
-        return decisions
+            logger.info("Risk evaluation complete | decisions=%d", int(len(decisions)))
+
+            # Return the decisions list, preserving intent order.
+            return decisions
