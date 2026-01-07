@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NewType
+from typing import NewType, Optional
+from datetime import date, datetime
 
 from TradingBot.v2.logger import setup_logger
 logger = setup_logger("Types")
@@ -109,3 +110,58 @@ class Money:
         - Keeps arithmetic usage explicit rather than relying on implicit float casting.
         """
         return float(self.value)
+
+@dataclass(frozen=True, slots=True)
+class AssetQuote:
+    symbol: str
+    bid: Optional[float]
+    ask: Optional[float]
+    mid: Optional[float]
+    timestamp_utc: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class OptionChainRequest:
+    """
+    Request for an option chain snapshot for a single underlying.
+
+    Why this exists
+    - Strategies are not allowed to call the broker.
+    - Strategies can express what data they need (constraints + filters).
+    - The orchestrator collects these requests and performs broker IO once per cycle.
+
+    Field groups
+    - Routing: underlying
+    - Instrument scope: include_calls/include_puts
+    - Data freshness: feed, max_age_seconds
+    - Payload size: limit
+    - API filters: strike and expiration filters, root_symbol, updated_since
+    """
+
+    # Required
+    underlying: str
+    request_id: str
+    
+    # Call/put selection (at least one must be True)
+    include_calls: bool = True
+    include_puts: bool = False
+
+    # Data feed selection (broker validates supported values)
+    feed: str = "indicative"
+
+    # Optional client-side cap after pagination (0 means "no limit")
+    limit: int = 0
+
+    # Alpaca option chain filters (all optional)
+    strike_price_gte: Optional[float] = None
+    strike_price_lte: Optional[float] = None
+
+    expiration_date: Optional[date] = None
+    expiration_date_gte: Optional[date] = None
+    expiration_date_lte: Optional[date] = None
+
+    root_symbol: Optional[str] = None
+
+    # Fetch only contracts updated since a point in time (UTC recommended)
+    updated_since: Optional[datetime] = None
+

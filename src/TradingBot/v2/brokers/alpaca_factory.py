@@ -42,7 +42,8 @@ def _alpaca_env_vars_for_mode(mode: str) -> Tuple[str, str]:
     mode_norm: str = mode.strip().lower()
     if mode_norm == "live":
         return ("ALPACA_LIVE_API_KEY", "ALPACA_LIVE_API_SECRET")
-    return ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
+    elif mode_norm == "paper":
+        return ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
 
 
 def build_alpaca_broker(request_timeout_seconds: float = 10.0) -> AlpacaBrokerV2:

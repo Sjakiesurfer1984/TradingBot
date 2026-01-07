@@ -31,7 +31,12 @@ from TradingBot.v2.context import RiskContext
 # Intents describe what the strategy wants to do, not what it is allowed to do.
 from TradingBot.v2.intents import TradeIntent
 
+# StrategyId and Symbol are core domain identifiers.
+# OptionChainRequest expresses what the orchestrator should fetch for option chain snapshots.
+from TradingBot.v2.domain.types import StrategyId, Symbol, OptionChainRequest, normalise_symbol
+
 from TradingBot.v2.logger import setup_logger
+
 logger = setup_logger("Strategy Interface")
 
 
@@ -63,7 +68,7 @@ class StrategyV2(ABC):
 
     @property
     @abstractmethod
-    def strategy_id(self) -> str:
+    def strategy_id(self) -> StrategyId:
         """
         Return a stable identifier for this strategy.
 
@@ -79,7 +84,7 @@ class StrategyV2(ABC):
         raise NotImplementedError
 
     @property
-    def symbols(self) -> Sequence[str]:
+    def symbols(self) -> Sequence[Symbol]:
         """
         Return the primary symbols this strategy cares about.
 
@@ -94,7 +99,39 @@ class StrategyV2(ABC):
         - A "sequence" is a general interface that includes list and tuple.
           We use Sequence rather than List to allow strategies to return tuples for immutability.
         """
+        # IMPORTANT
+        # - The interface must not assume any strategy-specific attributes exist (eg underlying_symbol).
+        # - Concrete strategies must override this property and return their required symbols.
         return ()
+
+    @property
+    def requires_option_chain(self) -> bool:
+        """
+        Return True if this strategy requires option-chain data.
+
+        Why this exists
+        - Keeps broker IO centralised in the orchestrator.
+        - Allows orchestrator to fetch option chains only when needed.
+
+        Default
+        - False for most strategies.
+        """
+        return False
+
+    @property
+    def option_chain_symbols(self) -> Sequence[Symbol]:  # Sequence is a more general type than List. The difference is that Sequence includes tuples and other ordered collections, not just lists.
+        """
+        Declare the set of underlyings for which the orchestrator should fetch option chains.
+
+        Default behaviour
+        - Uses the same symbols declared by symbols.
+
+        Strategies with special needs may override this property.
+        """
+        # NOTE
+        # - This must return actual symbols, not a property or a method object.
+        # - Because symbols is a @property, self.symbols evaluates to a Sequence[Symbol].
+        return self.symbols
 
     @abstractmethod
     def generate_intents(self, ctx: RiskContext) -> List[TradeIntent]:
@@ -122,3 +159,9 @@ class StrategyV2(ABC):
           The orchestrator is responsible for catching and logging strategy failures.
         """
         raise NotImplementedError
+
+    def option_chain_requests(self) -> List[OptionChainRequest]:
+        # Default behaviour
+        # - No option chain requests from the base interface.
+        # - Concrete strategies can override this to request specific expiries, types, etc.
+        return []

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from TradingBot.v2.domain.types import Symbol
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-
-logger = setup_logger("RiskContext")
+from TradingBot.v2.domain.types import AssetQuote, Symbol
+from TradingBot.v2.risk.price_policy import PriceSelectionPolicy, PriceSide
 
 
 @dataclass(frozen=True)
@@ -17,71 +14,129 @@ class RiskContext:
     Immutable snapshot of account and market state for a single orchestration cycle.
 
     Design intent
-    - This object represents a consistent, point-in-time view of the world.
-    - It is constructed once per cycle by the orchestrator.
-    - It is passed read-only to strategies and the risk engine.
+    - Constructed once per cycle by the orchestrator.
+    - Passed read-only to strategies and the risk engine.
+    - Contains a consistent, point-in-time view of:
+        - account state (equity, buying power, open orders, positions),
+        - underlying quotes (stocks/ETFs),
+        - option quotes (option contracts).
 
-    Why this exists
-    - Strategies must not query the broker directly for account state.
-    - Risk decisions must be made against a stable snapshot, not moving data.
-    - Freezing this dataclass prevents accidental mutation during evaluation.
-
-    What this is NOT
-    - It is not a cache that updates itself.
-    - It is not a live view of the account.
-    - It should never contain broker methods or side effects.
+    Important terminology note
+    - In our code, "snapshot" refers to this whole RiskContext object.
+    - In Alpaca docs, "snapshot" can also refer to a market-data endpoint that
+      returns bundled data (quote/trade/bar) for a symbol or option contract.
+      We keep these concepts separate by naming our fields explicitly.
     """
 
     # Timestamp marking when this snapshot was taken.
-    # Useful for logging, debugging, and correlating decisions with market events.
     as_of_utc: datetime
 
     # Available option buying power at the time of snapshot.
-    # Used by the risk engine to enforce allocation and sizing rules.
     option_buying_power: float
 
-    # Total account equity or portfolio value.
-    # This allows future risk rules such as max drawdown, daily loss limits,
-    # or equity-based scaling.
+    # Total account equity at the time of snapshot.
     equity: float
 
-    # Current open positions, keyed by symbol.
-    # The exact structure is broker-dependent, so we keep values as Any.
-    # Risk rules may inspect this to prevent duplicate positions or enforce caps.
-    positions: Dict[str, Any]
-
-    # List of open orders at the time of snapshot.
-    # Used primarily for deduplication and order throttling.
-    # This is intentionally a raw structure to avoid premature abstraction.
+    # Open orders at the time of snapshot (raw broker payloads).
     open_orders: List[Dict[str, Any]]
 
-    # Mapping of underlying symbol -> latest known price.
-    # Prices are fetched once per cycle to avoid repeated broker calls.
-    # This supports strike selection, sizing, and sanity checks.
-    prices: Dict[Symbol, float]
+    # Positions at the time of snapshot (raw broker payloads).
+    positions: List[Any]
 
-    def get_price(self, symbol: Symbol) -> Optional[float]:
+    # Underlying symbol -> latest quote (bid/ask/mid).
+    # Populated by orchestrator using broker market-data IO once per cycle.
+    asset_quotes: Dict[Symbol, AssetQuote]
+
+    price_policy: PriceSelectionPolicy
+
+    # optional, because not all strategies need it
+    option_quotes: Dict[str, Any] = field(default_factory=dict)
+
+    option_chains: Dict[tuple[Symbol, str], List[Dict[str, Any]]] = field(default_factory=dict)
+
+    def get_asset_quote(self, symbol: Symbol) -> AssetQuote:
         """
-        Retrieve the cached price for a given symbol.
+        Retrieve the cached underlying quote for a given symbol.
 
         Behaviour
-        - Symbol lookup is normalised to uppercase.
-        - Returns None if the symbol was not included in the snapshot.
+        - Raises KeyError if missing, because that indicates orchestrator wiring
+          or symbol declaration errors.
 
-        Why this helper exists
-        - Centralises symbol normalisation.
-        - Avoids scattered `.upper()` calls across strategies and risk code.
-        - Makes missing-price handling explicit.
+        Why this exists
+        - Strategies must not call the broker directly.
+        - Centralises access to underlying quote data.
         """
-        with log_scope("risk_context.get_price", logger, extra=f"symbol={symbol}"):
-            price: Optional[float] = self.prices.get(symbol)
-            if price is None:
-                logger.warning(
-                    "Price missing in snapshot | symbol=%s available_symbols=%d",
-                    symbol,
-                    int(len(self.prices)),
-                )
-                return None
+        if symbol not in self.asset_quotes:
+            raise KeyError(f"Missing quote for symbol={symbol}")
+        return self.asset_quotes[symbol]
 
-            logger.info("Price hit | symbol=%s price=%.6f", symbol, float(price))
-            return float(price)
+    def get_execution_price(self, symbol: Symbol, side: PriceSide) -> float:
+        """
+        Retrieve an execution-aware price for an underlying symbol and trade side.
+
+        Behaviour
+        - Delegates bid/ask/mid selection to the injected PriceSelectionPolicy.
+        - Raises ValueError if no safe execution price can be determined.
+
+        Why this exists
+        - Strategies must not hardcode bid/ask logic.
+        - Pricing rules must be explicit, testable, and replaceable.
+        """
+        quote: AssetQuote = self.get_asset_quote(symbol)
+        selected: Optional[float] = self.price_policy.select(quote, side=side)
+
+        if selected is None or selected <= 0.0:
+            raise ValueError(f"No usable execution price for symbol={symbol} side={side}")
+
+        return float(selected)
+
+    @staticmethod
+    def _normalise_option_symbol(option_symbol: str) -> str:
+        """
+        Normalise an option symbol key for dictionary lookup.
+
+        Note
+        - Underlying symbols use the Symbol domain type and normalise_symbol().
+        - Option symbols are broker-specific strings, so we normalise minimally.
+        """
+        return option_symbol.strip().upper()
+
+    def get_option_quote(self, option_symbol: str) -> AssetQuote:
+        """
+        Retrieve the cached option quote for a broker-specific option symbol.
+
+        Behaviour
+        - Raises KeyError if missing.
+        - Missing option quotes usually means the orchestrator did not fetch
+          option quotes for the selected legs this cycle.
+
+        Why this exists
+        - Strategies and risk rules need leg pricing without broker IO.
+        """
+        key: str = self._normalise_option_symbol(option_symbol)
+
+        if key not in self.option_quotes:
+            raise KeyError(f"Missing option quote for option_symbol={key}")
+
+        return self.option_quotes[key]
+
+    def get_option_execution_price(self, option_symbol: str, side: PriceSide) -> float:
+        """
+        Retrieve an execution-aware price for an option contract and trade side.
+
+        Behaviour
+        - BUY uses ask (or conservative fallbacks) via PriceSelectionPolicy.
+        - SELL uses bid (or conservative fallbacks) via PriceSelectionPolicy.
+
+        Why this exists
+        - PMCC sizing needs conservative pricing for both legs:
+            - LEAP leg is typically a BUY (debit, prefer ask).
+            - Near leg is typically a SELL (credit, prefer bid).
+        """
+        quote: AssetQuote = self.get_option_quote(option_symbol)
+        selected: Optional[float] = self.price_policy.select(quote, side=side)
+
+        if selected is None or selected <= 0.0:
+            raise ValueError(f"No usable execution price for option_symbol={option_symbol} side={side}")
+
+        return float(selected)

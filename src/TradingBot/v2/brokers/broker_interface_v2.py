@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
-
+from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from TradingBot.v2.domain.types import AssetQuote
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
+
 logger = setup_logger("Broker Interface")
 
-
+# ------------------------------------------------------------------------------------------
+# BrokerInterface, abstract base class
+# Defines the interface that all brokers must implement.
+# That is, AlpacaBrokerV2, FakeBrokerV2, etc. must all implement this interface.
+# meaning they must implement all the abstract methods defined here as concrete methods.
+# ------------------------------------------------------------------------------------------
 class BrokerInterfaceV2(ABC):
     """
     V2 broker interface.
@@ -31,6 +38,9 @@ class BrokerInterfaceV2(ABC):
     - Later we will replace these with strongly typed V2 domain models.
     """
 
+# ------------------------------------------------------------------------------------------
+# get account snapshot
+# ------------------------------------------------------------------------------------------
     @abstractmethod
     def get_account_snapshot(self) -> AccountSnapshot:
         """
@@ -41,7 +51,9 @@ class BrokerInterfaceV2(ABC):
         - Gives orchestrator one object containing the account values it needs.
         """
         raise NotImplementedError
-
+# ------------------------------------------------------------------------------------------
+# get option buying power, equity, positions, open orders, asset quote, option chain, submit order
+# ------------------------------------------------------------------------------------------
     @abstractmethod
     def get_option_buying_power(self) -> float:
         """
@@ -84,13 +96,45 @@ class BrokerInterfaceV2(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_asset_price(self, symbol: str) -> float:
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
         """
-        Return the current market price for an underlying symbol.
+        Return the latest bid/ask quote for the given symbol.
 
         Why this matters
         - Orchestrator fetches prices once per cycle and stores them in RiskContext.
         - Strategies consume prices from RiskContext and never call the broker.
+        """
+        raise NotImplementedError  # could also use "pass" instead
+
+    @abstractmethod
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls: bool = True,
+        include_puts: bool = False,
+        feed: str = "indicative",
+        max_age_seconds: int = 5, # 5 seconds old Option data is no longer acceptable. This is to ensure we get fresh data. Noting that for testing purposes, we are passing in a default of 3 days to bypass the stale data checker  
+        limit: int = 0,
+        strike_price_gte: Optional[float] = None,
+        strike_price_lte: Optional[float] = None,
+        expiration_date: Optional[date] = None,
+        expiration_date_gte: Optional[date] = None,
+        expiration_date_lte: Optional[date] = None,
+        root_symbol: Optional[str] = None,
+        updated_since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch the option chain snapshot for a single underlying.
+
+        Contract
+        - Broker IO only.
+        - One underlying in, flat list of contracts out.
+        - No strategy logic, no orchestration logic.
+
+        Notes
+        - Implementations should log whether data is delayed (eg indicative feed).
+        - Implementations may stamp metadata such as _feed, _newest_ts, _is_stale.
         """
         raise NotImplementedError
 
@@ -107,6 +151,7 @@ class BrokerInterfaceV2(ABC):
         - Only the orchestrator may call submit_order.
         """
         raise NotImplementedError
+    
 
     def _log_io_boundary(self, method_name: str) -> None:
         """

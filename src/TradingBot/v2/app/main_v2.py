@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import signal
-import threading
-import traceback
+import time
+from threading import Event
 from typing import List, Optional  # Optional is used in _get_env function.
 # It is used to annotate variables and function return types that may either hold a value of a specified type or be None.
 # In other words, it is optional to provide a value for that variable or return type.
@@ -21,10 +21,13 @@ from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 
 from TradingBot.v2.logging_utils import log_scope
 
+from threading import Event
+from types import FrameType
+
 # Module-level logger.
 logger = setup_logger("Main")
 
-
+# Function to read environment variables safely from the .env file or system environment.
 def _get_env(name: str) -> Optional[str]:
     """
     Read an environment variable safely.
@@ -43,7 +46,7 @@ def _get_env(name: str) -> Optional[str]:
     stripped: str = value.strip()
     return stripped if stripped else None
 
-
+# function to read environment variables as booleans.
 def _get_env_bool(name: str, default: bool) -> bool:
     """
     Read an environment variable as a boolean.
@@ -59,7 +62,7 @@ def _get_env_bool(name: str, default: bool) -> bool:
         return default
     return raw.lower() in {"1", "true", "yes", "y"}
 
-
+# function to mask secrets (Keys, passwords) for logging.
 def _mask_secret(value: Optional[str], show_prefix: int = 4) -> str:
     """
     Mask secrets in logs.
@@ -77,7 +80,8 @@ def _mask_secret(value: Optional[str], show_prefix: int = 4) -> str:
         return "*" * len(v)
     return f"{v[:show_prefix]}{'*' * (len(v) - show_prefix)}"
 
-
+# function to log a snapshot of environment variables safely. This function collects all relevant environment variables,
+# masks sensitive information, and logs the configuration snapshot for debugging purposes.
 def _log_env_snapshot() -> None:
     """
     Log a safe snapshot of configuration and critical env vars.
@@ -111,33 +115,27 @@ def _log_env_snapshot() -> None:
     logger.info("Config snapshot end")
 
 
+_STOP_REQUESTED = Event()
+_LAST_SIGINT_TS: float = 0.0
+
 def _install_interrupt_tracer() -> None:
-    """
-    Install a SIGINT/SIGBREAK handler that logs when an interrupt arrives.
-
-    Why this exists
-    - KeyboardInterrupt is not a network error.
-    - It happens only when the process receives an interrupt control event.
-    - Logging the stack here proves exactly where execution was interrupted.
-    """
-
     def _handler(signum: int, frame) -> None:
-        stack: str = "".join(traceback.format_stack(frame))
-        logger.error(
-            "Interrupt received | signum=%s pid=%s thread=%s\nStack:\n%s",
-            signum,
-            os.getpid(),
-            threading.current_thread().name,
-            stack,
-        )
-        raise KeyboardInterrupt
+        global _LAST_SIGINT_TS
+        now: float = time.time()
+
+        logger.error("Interrupt received | signum=%s time=%s", signum, now)
+
+        if _STOP_REQUESTED.is_set() and (now - _LAST_SIGINT_TS) < 2.0:
+            logger.critical("Second interrupt received quickly; exiting immediately.")
+            raise KeyboardInterrupt  # ok as a deliberate "force quit"
+
+        _LAST_SIGINT_TS = now
+        _STOP_REQUESTED.set()
+        logger.warning("Stop requested. Press Ctrl+C again to force quit.")
 
     signal.signal(signal.SIGINT, _handler)
-
-    # Windows supports SIGBREAK (Ctrl+Break), which can also trigger interruptions.
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _handler)
-
 
 def _build_risk_engine() -> RiskEngineV2:
     with log_scope("build_risk_engine", logger):
@@ -150,7 +148,12 @@ def _build_risk_engine() -> RiskEngineV2:
         logger.info("Risk engine constructed | type=%s", type(risk_engine).__name__)
         return risk_engine
 
-
+# This function defines and builds the list of strategies to be used by the trading bot.
+# If we want or need more or different strategies, we can modify this function accordingly.
+# This is a bit inconvenient, but it keeps strategy construction isolated in one place.
+# Perhaps we can later add dynamic loading of strategies from a config file or plugin system.
+# or we add a list of strategies to instantiate based on environment variables.
+# For now, we keep it simple and explicit.
 def _build_strategies() -> List[StrategyV2]:
     with log_scope("build_strategies", logger):
         logger.info("Constructing strategies list")
@@ -160,9 +163,9 @@ def _build_strategies() -> List[StrategyV2]:
         logger.info("Strategies constructed count=%d types=%s", len(strategies), [type(s).__name__ for s in strategies])
         return strategies
 
-
 def _build_orchestrator(
-    broker: BrokerInterfaceV2, # Why are we giving it a broker ABC, not a concrete broker?
+    # an orchestrator object is a collection of strategies, a broker, and a risk engine objects.
+    broker: BrokerInterfaceV2, # here we pass the broker object to the orchestrator. 
     strategies: List[StrategyV2],
     risk_engine: RiskEngineV2,
     dry_run: bool,
@@ -173,7 +176,7 @@ def _build_orchestrator(
             broker=broker,
             strategies=strategies,
             risk_engine=risk_engine,
-            dry_run=dry_run,
+            dry_run=dry_run, # this raises an error IF the dry
         )
         logger.info("Orchestrator constructed | type=%s", type(orchestrator).__name__)
         return orchestrator
@@ -189,31 +192,47 @@ def main() -> None:
     - dry_run True: never submit orders
     - broker defaults to "fake" unless TRADINGBOT_BROKER says otherwise
     """
-    print("RUNNING FILE:", __file__)
+    logger.warning("SIGINT handler at start of main: %r", signal.getsignal(signal.SIGINT))
+
     with log_scope("main", logger):
         logger.info("Loading .env via python-dotenv")
+        # We load the .env file here to ensure all environment variables are set before we read them.
+        # the .env file contains sensitive information like API keys, so we must load it before we read any environment variables.
         load_dotenv()
 
-        # This must happen after the logger is set up so we can log stack traces.
-        _install_interrupt_tracer()
+        # _install_interrupt_tracer() must happen after the logger is set up so we can log stack traces.
+        # Commented out because we do not need it right now. We used it to track a Ctrl+C issue, which
+        # came from signal handling in VSCode. By running the main_v2.py directly from the command terminal, we avoided the problem.
+        # _install_interrupt_tracer()
 
+        # we log the environment snapshot for debugging purposes. This snapshot contains all relevant environment variables,
+        # with sensitive information masked.
         _log_env_snapshot()
-
+        # retreive the broker we wish to use from the environment variable TRADINGBOT_BROKER.
         broker_name: str = os.getenv("TRADINGBOT_BROKER", "fake")
         logger.info("Building broker | name=%s", broker_name)
 
         with log_scope("build_broker", logger, extra=f"name={broker_name}"):
+            # Here we build the broker using the factory.py "build_broker" function and passing in the broker name (Alpaca, Fake, etc.)
             broker: BrokerInterfaceV2 = build_broker(broker_name)
-
+        # Dry_run is set in the environment variable TBOT_DRY_RUN.
+        # If missing, we default to True for safety.
         dry_run: bool = _get_env_bool("TBOT_DRY_RUN", default=True)
         logger.info("Dry run resolved | dry_run=%s", dry_run)
-
+        # The risk engine is responsible for managing risks such as order deduplication, position sizing, etc.
+        # We build it using the _build_risk_engine function defined in this file, which in turn calls the RiskEngineV2 constructor.
         risk_engine: RiskEngineV2 = _build_risk_engine()
         logger.info("Risk engine built | type=%s", type(risk_engine).__name__)
-
+        # Build strategies list. Build_strategies function defines which strategies to use, and is defined in this file.
+        # build_strategies function in turn calls the constructors of each strategy we wish to use (e.g., PmccStrategyV2).
         strategies: List[StrategyV2] = _build_strategies()
         logger.info("Strategies built | count=%d types=%s", len(strategies), [type(s).__name__ for s in strategies])
-
+        #build_orchestrator function builds the orchestrator with the given broker, strategies, risk engine, and dry run flag. it is defined in this file.
+        # The _build_orchestrator function in turn calls the OrchestratorV2 constructor, and injects the following dependencies:
+        # - broker: BrokerInterfaceV2
+        # - strategies: List[StrategyV2]
+        # - risk_engine: RiskEngineV2
+        # - dry_run: bool NOTE: this flag tells the orchestrator whether to actually submit orders or not. However, 
         orchestrator: OrchestratorV2 = _build_orchestrator(
             broker=broker,
             strategies=strategies,
@@ -226,17 +245,19 @@ def main() -> None:
         try:
             with log_scope("orchestrator.run_cycle", logger):
                 orchestrator.run_cycle()
+            if _STOP_REQUESTED.is_set():
+                logger.warning("Stop requested, exiting cleanly")
+                return
             logger.info("orchestrator.run_cycle completed successfully")
-        except KeyboardInterrupt:
-            logger.exception("KeyboardInterrupt reached main")
-            raise
+        # except KeyboardInterrupt:
+        #     logger.exception("KeyboardInterrupt reached main")
+        #     raise
         except Exception:
             logger.exception("orchestrator.run_cycle raised an exception")
             raise
                 
         logger.info("End main")
     
-
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import time
+from datetime import date, datetime, timezone
 
 import requests
 from requests import Session
@@ -12,6 +13,7 @@ from requests.adapters import HTTPAdapter
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
 from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
 from TradingBot.v2.brokers.errors import BrokerConnectionError
+from TradingBot.v2.domain.types import AssetQuote, Symbol
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
 
@@ -58,17 +60,18 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
     def _base_url_v2(self) -> str:
         return f"{self._base_url()}/v2"
     
-    def _market_data_base_url(self) -> str:
+    def _option_data_base_url(self) -> str:
         """
-        Base URL for Alpaca Market Data API.
+        Base URL for Alpaca option market data.
 
         Why this exists
-        - Keeps market data host centralised.
-        - Allows changing host/version in one place if Alpaca updates it.
+        - Alpaca option data is served from data.alpaca.markets,
+          but under different paths and versioning than equity data.
+        - Prevents accidental coupling between stock and option endpoints.
+        - Allows fast migration if Alpaca moves option data again.
         """
         return "https://data.alpaca.markets"
-
-
+    
     def _headers(self) -> Dict[str, str]:
         return {
             "APCA-API-KEY-ID": self.api_key,
@@ -247,16 +250,24 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
     # ---------------------------------------------------------------------
     # BrokerInterfaceV2 implementation
     # ---------------------------------------------------------------------
-
-    def get_equity(self) -> float:
-        self._log_io_boundary("get_equity")
-        with log_scope("broker.get_equity", logger):
-            logger.info("Broker call get_equity")
+    def get_account_snapshot(self) -> AccountSnapshot:
+        self._log_io_boundary("get_account_snapshot")
+        with log_scope("broker.get_account_snapshot", logger):
             data: Dict[str, Any] = self._request_json("GET", "/account")
-            equity: float = self._safe_float(data.get("equity"), default=0.0)
-            logger.info("Broker result get_equity equity=%.2f", float(equity))
-            return max(equity, 0.0)
 
+            equity: float = self._safe_float(data.get("equity"), default=0.0)
+            options_buying_power: float = self._safe_float(data.get("options_buying_power"), default=0.0)
+            raw_cash: Any = data.get("cash")
+            cash: Optional[float] = float(raw_cash) if raw_cash is not None else None
+
+
+            return AccountSnapshot(
+                equity=equity,
+                options_buying_power=options_buying_power,
+                cash=cash,
+                raw=data,
+            )
+        
     def get_option_buying_power(self) -> float:
         self._log_io_boundary("get_option_buying_power")
         with log_scope("broker.get_option_buying_power", logger):
@@ -266,6 +277,15 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
             obp: float = self._safe_float(raw, default=0.0)
             logger.info("Broker result get_option_buying_power options_buying_power=%.2f", float(obp))
             return obp
+        
+    def get_equity(self) -> float:
+        self._log_io_boundary("get_equity")
+        with log_scope("broker.get_equity", logger):
+            logger.info("Broker call get_equity")
+            data: Dict[str, Any] = self._request_json("GET", "/account")
+            equity: float = self._safe_float(data.get("equity"), default=0.0)
+            logger.info("Broker result get_equity equity=%.2f", float(equity))
+            return max(equity, 0.0)
 
     def get_positions(self) -> Dict[str, Any]:
         self._log_io_boundary("get_positions")
@@ -302,23 +322,17 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
             logger.info("Broker result get_open_orders count=%d", int(len(filtered)))
             return filtered
 
-    def submit_order(self, order: Any) -> Any:
-        self._log_io_boundary("submit_order")
-        raise NotImplementedError(
-            "Order submission not implemented yet. "
-            "Define v2/domain/orders.py request types first."
-        )
-
-    def get_asset_price(self, symbol: str) -> float:
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
         """
-        Return a mid price for a stock using Alpaca Market Data.
+        Fetch the latest quote (bid/ask) for a stock symbol.
 
         Why this is implemented this way
         - We reuse the same HTTP plumbing as trading calls (session reuse, strict timeouts, consistent logs).
         - We explicitly request the IEX feed, which is the normal feed for paper accounts.
-        - We compute a mid when both bid and ask exist, with sensible fallbacks.
+        - We validate payload shape aggressively.
+        - We compute a mid only when both bid and ask are usable.
         """
-        self._log_io_boundary("get_asset_price")
+        self._log_io_boundary("get_asset_quote")
 
         sym: str = symbol.strip().upper()
         if not sym:
@@ -327,13 +341,21 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
         url: str = f"https://data.alpaca.markets/v2/stocks/{sym}/quotes/latest"
         params: Dict[str, Any] = {"feed": "iex"}
 
-        with log_scope("broker.get_asset_price", logger, extra=f"symbol={sym} url={url} params={params}"):
-            logger.info("Broker call get_asset_price symbol=%s", sym)
+        with log_scope(
+            "broker.get_asset_quote",
+            logger,
+            extra=f"symbol={sym} url={url} params={params}",
+        ):
+            logger.info("Broker call get_asset_quote symbol=%s", sym)
 
             data_any: Any = self._request_json_url("GET", url, params=params)
 
             if not isinstance(data_any, dict):
-                logger.error("Market data unexpected_type symbol=%s type=%s", sym, type(data_any).__name__)
+                logger.error(
+                    "Market data unexpected_type symbol=%s type=%s",
+                    sym,
+                    type(data_any).__name__,
+                )
                 raise BrokerConnectionError(
                     broker_name="alpaca",
                     message=f"Unexpected market data response type for {sym}: {type(data_any).__name__}",
@@ -341,7 +363,11 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
 
             quote_any: Any = data_any.get("quote")
             if not isinstance(quote_any, dict):
-                logger.error("Market data missing_quote symbol=%s payload=%s", sym, data_any)
+                logger.error(
+                    "Market data missing_quote symbol=%s payload=%s",
+                    sym,
+                    data_any,
+                )
                 raise BrokerConnectionError(
                     broker_name="alpaca",
                     message=f"Market data response missing 'quote' for {sym}.",
@@ -350,45 +376,274 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
             ask: float = self._safe_float(quote_any.get("ap"), default=0.0)
             bid: float = self._safe_float(quote_any.get("bp"), default=0.0)
 
+            mid: Optional[float] = None
+
             if ask > 0.0 and bid > 0.0:
-                mid: float = (ask + bid) / 2.0
+                mid = (ask + bid) / 2.0
                 logger.info(
-                    "Broker result get_asset_price symbol=%s bid=%.4f ask=%.4f mid=%.4f",
+                    "Broker result get_asset_quote symbol=%s bid=%.4f ask=%.4f mid=%.4f",
                     sym,
-                    float(bid),
-                    float(ask),
-                    float(mid),
+                    bid,
+                    ask,
+                    mid,
                 )
-                return mid
 
-            if ask > 0.0:
-                logger.info("Broker result get_asset_price symbol=%s ask_only=%.4f", sym, float(ask))
-                return ask
+            elif ask > 0.0:
+                logger.info(
+                    "Broker result get_asset_quote symbol=%s ask_only=%.4f",
+                    sym,
+                    ask,
+                )
 
-            if bid > 0.0:
-                logger.info("Broker result get_asset_price symbol=%s bid_only=%.4f", sym, float(bid))
-                return bid
+            elif bid > 0.0:
+                logger.info(
+                    "Broker result get_asset_quote symbol=%s bid_only=%.4f",
+                    sym,
+                    bid,
+                )
 
-            logger.error("Broker result get_asset_price no_usable_quote symbol=%s quote=%s", sym, quote_any)
-            raise BrokerConnectionError(
-                broker_name="alpaca",
-                message=f"No usable quote returned for {sym}.",
+            else:
+                logger.error(
+                    "Broker result get_asset_quote no_usable_quote symbol=%s quote=%s",
+                    sym,
+                    quote_any,
+                )
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"No usable quote returned for {sym}.",
+                )
+
+            return AssetQuote(
+                symbol=sym,
+                bid=bid if bid > 0.0 else None,
+                ask=ask if ask > 0.0 else None,
+                mid=mid,
+                timestamp_utc=None,  # Alpaca quote timestamp can be added later if desired
             )
-    
-    def get_account_snapshot(self) -> AccountSnapshot:
-        self._log_io_boundary("get_account_snapshot")
-        with log_scope("broker.get_account_snapshot", logger):
-            data: Dict[str, Any] = self._request_json("GET", "/account")
 
-            equity: float = self._safe_float(data.get("equity"), default=0.0)
-            options_buying_power: float = self._safe_float(data.get("options_buying_power"), default=0.0)
-            raw_cash: Any = data.get("cash")
-            cash: Optional[float] = float(raw_cash) if raw_cash is not None else None
+    # Get option chain
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls: bool = True,
+        include_puts: bool = False,
+        feed: str = "indicative",
+        max_age_seconds: int = 30,
+        limit: int = 0,
+        strike_price_gte: Optional[float] = None,
+        strike_price_lte: Optional[float] = None,
+        expiration_date: Optional[date] = None,
+        expiration_date_gte: Optional[date] = None,
+        expiration_date_lte: Optional[date] = None,
+        root_symbol: Optional[str] = None,
+        updated_since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch the option chain snapshot for a single underlying.
 
+        Contract
+        - Broker IO only.
+        - One underlying in, flat list of contracts out.
+        - No strategy logic, no orchestration logic.
 
-            return AccountSnapshot(
-                equity=equity,
-                options_buying_power=options_buying_power,
-                cash=cash,
-                raw=data,
+        Data source
+        - GET /v1beta1/options/snapshots/{underlying}
+
+        Notes
+        - OPRA may be forbidden on paper accounts.
+        - Indicative feed is delayed and must be logged loudly.
+        """
+
+        self._log_io_boundary("get_option_chain")
+
+        sym: str = str(underlying).strip().upper()
+        if not sym:
+            raise ValueError("underlying must be a non-empty string")
+
+        if not include_calls and not include_puts:
+            raise ValueError("At least one of include_calls or include_puts must be True")
+
+        feed_norm: str = str(feed).strip().lower()
+        if feed_norm not in {"opra", "indicative"}:
+            raise ValueError("feed must be 'opra' or 'indicative'")
+
+        if max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be > 0")
+
+        if limit < 0:
+            raise ValueError("limit must be >= 0")
+
+        base: str = self._option_data_base_url()
+        url: str = f"{base}/v1beta1/options/snapshots/{sym}"
+
+        params: Dict[str, Any] = {"feed": feed_norm}
+
+        # Filter: calls/puts
+        if include_calls and not include_puts:
+            params["type"] = "call"
+        elif include_puts and not include_calls:
+            params["type"] = "put"
+        # else: both, do not set "type" and let the API return both
+
+        # Filters: strikes
+        if strike_price_gte is not None:
+            params["strike_price_gte"] = float(strike_price_gte)
+        if strike_price_lte is not None:
+            params["strike_price_lte"] = float(strike_price_lte)
+
+        # Filters: expirations
+        def _date_to_str(d: date) -> str:
+            return d.isoformat()
+
+        if expiration_date is not None:
+            params["expiration_date"] = _date_to_str(expiration_date)
+        if expiration_date_gte is not None:
+            params["expiration_date_gte"] = _date_to_str(expiration_date_gte)
+        if expiration_date_lte is not None:
+            params["expiration_date_lte"] = _date_to_str(expiration_date_lte)
+
+        # Filter: root symbol
+        if root_symbol is not None and str(root_symbol).strip():
+            params["root_symbol"] = str(root_symbol).strip().upper()
+
+        # Filter: updated_since (UTC ISO8601)
+        if updated_since is not None:
+            params["updated_since"] = (
+                updated_since.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
             )
+
+        with log_scope(
+            "broker.get_option_chain",
+            logger,
+            extra=f"underlying={sym} url={url} params={params}",
+        ):
+            logger.info(
+                "Broker call get_option_chain | underlying=%s include_calls=%s include_puts=%s feed=%s params=%s",
+                sym,
+                bool(include_calls),
+                bool(include_puts),
+                feed_norm,
+                dict(params),
+            )
+
+            chain: List[Dict[str, Any]] = []
+            newest_ts: Optional[datetime] = None
+
+            next_page_token: Optional[str] = None
+            page_index: int = 0
+
+            while True:
+                page_params: Dict[str, Any] = dict(params)
+                if next_page_token:
+                    page_params["page_token"] = next_page_token
+
+                data_any: Any = self._request_json_url("GET", url, params=page_params)
+
+                if not isinstance(data_any, dict):
+                    raise BrokerConnectionError(
+                        broker_name="alpaca",
+                        message=f"Unexpected option chain response type for {sym}",
+                    )
+
+                snapshots_any: Any = data_any.get("snapshots")
+                if not isinstance(snapshots_any, dict):
+                    raise BrokerConnectionError(
+                        broker_name="alpaca",
+                        message=f"Missing snapshots in option chain response for {sym}",
+                    )
+
+                for contract_symbol, snap_any in snapshots_any.items():
+                    if not isinstance(snap_any, dict):
+                        continue
+
+                    row: Dict[str, Any] = dict(snap_any)
+                    row["contract_symbol"] = str(contract_symbol)
+
+                    # Track the newest timestamp we can find (for staleness detection).
+                    for key in ("latestQuote", "latestTrade"):
+                        block: Any = row.get(key)
+                        if isinstance(block, dict):
+                            ts_any: Any = block.get("t")
+                            if isinstance(ts_any, str):
+                                try:
+                                    ts_dt: datetime = datetime.fromisoformat(
+                                        ts_any.replace("Z", "+00:00")
+                                    )
+                                    if newest_ts is None or ts_dt > newest_ts:
+                                        newest_ts = ts_dt
+                                except Exception:
+                                    pass
+
+                    chain.append(row)
+
+                    if limit > 0 and len(chain) >= limit:
+                        break
+
+                if limit > 0 and len(chain) >= limit:
+                    break
+
+                next_any: Any = data_any.get("next_page_token")
+                next_page_token = (
+                    str(next_any).strip() if isinstance(next_any, str) and next_any.strip() else None
+                )
+
+                logger.info(
+                    "Option chain page | underlying=%s page=%d page_contracts=%d total=%d next=%s",
+                    sym,
+                    page_index,
+                    int(len(snapshots_any)),
+                    int(len(chain)),
+                    "yes" if next_page_token else "no",
+                )
+
+                if not next_page_token:
+                    break
+
+                page_index += 1
+
+            logger.info(
+                "Option chain fetched | underlying=%s contracts=%d feed=%s",
+                sym,
+                int(len(chain)),
+                feed_norm,
+            )
+
+            if feed_norm == "indicative":
+                logger.warning(
+                    "Option chain feed is indicative | underlying=%s quotes_delayed=true",
+                    sym,
+                )
+
+            # Compute staleness once, stamp onto every row so the orchestrator can check row[0].
+            newest_ts_str: str = newest_ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if newest_ts else ""
+            is_stale: bool = False
+
+            if newest_ts is not None:
+                now_utc: datetime = datetime.now(timezone.utc)
+                age_seconds: float = float((now_utc - newest_ts).total_seconds())
+                if age_seconds > float(max_age_seconds):
+                    is_stale = True
+                    logger.warning(
+                        "Option chain stale | underlying=%s age_seconds=%.1f threshold=%d newest_ts=%s",
+                        sym,
+                        float(age_seconds),
+                        int(max_age_seconds),
+                        newest_ts_str,
+                    )
+
+            for row in chain:
+                row["_feed"] = feed_norm
+                row["_newest_ts"] = newest_ts_str
+                row["_is_stale"] = bool(is_stale)
+
+            return chain
+
+
+        
+    def submit_order(self, order: Any) -> Any:
+        self._log_io_boundary("submit_order")
+        raise NotImplementedError(
+            "Order submission not implemented yet. "
+            "Define v2/domain/orders.py request types first."
+        )
