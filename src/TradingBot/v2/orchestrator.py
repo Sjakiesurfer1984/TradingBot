@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 # - Optional: a value that may be missing (None).
 # - Callable: something that can be called like a function.
 # - Tuple: fixed-length or immutable sequences (often used for tags).
-from typing import Any, Dict, List, Set, Optional, Callable, Tuple
+from typing import Any, Dict, List, Set, Optional, Tuple
 
 # AccountSnapshot is our internal type that represents the broker’s account state.
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
@@ -46,7 +46,6 @@ from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
 # RiskContext is the immutable snapshot passed into strategies and the risk engine.
 # Strategies and risk must read only from RiskContext and must not do broker IO.
 from TradingBot.v2.context import RiskContext
-
 # TradeIntent is the output produced by strategies.
 # An intent describes “what the strategy wants to do”, not what gets executed.
 from TradingBot.v2.intents import TradeIntent

@@ -22,7 +22,8 @@ from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
 from TradingBot.v2.logging_utils import log_scope
 
 from threading import Event
-from types import FrameType
+# PMCC sizing imports
+from TradingBot.v2.pmcc_sizer import PmccSizingConfig, PmccSizer
 
 # Module-level logger.
 logger = setup_logger("Main")
@@ -142,18 +143,27 @@ def _build_risk_engine() -> RiskEngineV2:
         logger.info("Constructing risk rule OpenOrderDedupeRule")
         dedupe_rule: OpenOrderDedupeRule = OpenOrderDedupeRule()
 
-        logger.info("Constructing RiskEngineV2")
-        risk_engine: RiskEngineV2 = RiskEngineV2(dedupe_rule=dedupe_rule)
+        # Load PMCC sizing configuration from environment variables (defaults to zero / safe fallback).
+        cfg = PmccSizingConfig(
+            equity_budget_pct=float(os.getenv("TBOT_PMCC_EQUITY_BUDGET_PCT", "0")),
+            max_option_bp_fraction=float(os.getenv("TBOT_PMCC_MAX_OPTION_BP_FRACTION", "0")),
+            max_debit_per_spread_usd=float(os.getenv("TBOT_PMCC_MAX_DEBIT_PER_SPREAD_USD", "0")),
+            max_contracts_per_intent=int(os.getenv("TBOT_PMCC_MAX_CONTRACTS_PER_INTENT", "0")),
+            slippage_factor=float(os.getenv("TBOT_PMCC_SLIPPAGE_FACTOR", "1.0")),
+            max_leap_spread_pct=float(os.getenv("TBOT_PMCC_MAX_LEAP_SPREAD_PCT", "0")),
+            max_near_spread_pct=float(os.getenv("TBOT_PMCC_MAX_NEAR_SPREAD_PCT", "0")),
+        )
+        pmcc_sizer = PmccSizer(cfg)
+
+        logger.info("Constructing RiskEngineV2 with PMCC sizer")
+        risk_engine: RiskEngineV2 = RiskEngineV2(
+            dedupe_rule=dedupe_rule,
+            pmcc_sizer=pmcc_sizer,
+        )
 
         logger.info("Risk engine constructed | type=%s", type(risk_engine).__name__)
         return risk_engine
-
-# This function defines and builds the list of strategies to be used by the trading bot.
-# If we want or need more or different strategies, we can modify this function accordingly.
-# This is a bit inconvenient, but it keeps strategy construction isolated in one place.
-# Perhaps we can later add dynamic loading of strategies from a config file or plugin system.
-# or we add a list of strategies to instantiate based on environment variables.
-# For now, we keep it simple and explicit.
+    
 def _build_strategies() -> List[StrategyV2]:
     with log_scope("build_strategies", logger):
         logger.info("Constructing strategies list")
