@@ -18,7 +18,9 @@
 # - Strategies declare the shape they want (targets), but remain IO-free.
 # - RiskContext becomes the single container for “all data needed this cycle”.
 
-from __future__ import annotations
+from __future__ import annotations # this line enables postponed evaluation of type annotations, allowing the use of types that are not yet defined at the time of annotation.
+# We use this to avoid circular imports and to allow forward references in type hints. For example, we used it at dataclass MultiLegLimitOrder (orders.py) where we referenced OptionLeg before it was defined.
+# as such, it is recommended to always include this line in modern Python codebases that heavily use type hints.
 
 # dataclass is used to create small dependency-holding classes without boilerplate __init__ code.
 from dataclasses import dataclass
@@ -96,7 +98,7 @@ class OrchestratorV2:
     - ask strategies for intents (no IO)
     - ask risk engine for decisions (no IO)
     - log results
-    - optionally submit orders (not implemented yet)
+    - optionally submit orders
 
     Responsibilities
     - Perform all broker IO in one place.
@@ -104,7 +106,7 @@ class OrchestratorV2:
     - Ask strategies for TradeIntent objects (pure computation).
     - Ask risk engine for RiskDecision objects (pure computation).
     - Log outcomes.
-    - Only submit orders when dry_run is False (submission not implemented yet).
+    - Only submit orders when dry_run is False.
     """
 
     # broker is the adapter that knows how to talk to Alpaca (or a fake broker in tests).
@@ -360,14 +362,15 @@ class OrchestratorV2:
 
         # Development mode: allow older snapshots so the pipeline continues to run.
         if bool(self.dry_run):
-            return 259200  # 3 days
+            return 259200  # 3 days, so we can also test on Monday with Friday's data.
 
         # Paper mode: still allow some slack because indicative can lag.
         # If you have self.paper / broker mode accessible, use it here.
         # If not, keep it conservative.
         if feed_norm == "indicative":
-            return 3600  # 1 hour
-
+            return 259200  # 3 days, so we can also test on Monday with Friday's data.
+        
+        # if none of the above is true, then return 10 seconds. 
         # Live or high quality feeds: require genuinely fresh data.
         return 10
 
@@ -768,6 +771,15 @@ class OrchestratorV2:
             if self.dry_run:
                 logger.info("Dry run enabled: no orders will be submitted.")
                 return
+            # after self._log_decisions(decisions)
+            if not self.dry_run:
+                for decision in decisions:
+                    if decision.approved is not None:
+                        order = decision.approved.order
+                        try:
+                            response = self.broker.submit_order(order)
+                        except Exception as e:
+                            logger.error("Failed to submit order %s: %s", order, e)
 
             # Submission is not implemented yet.
             logger.warning("Dry run disabled, but submission is not implemented yet.")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Any
 
 # Context and decision imports
 from TradingBot.v2.context import RiskContext
@@ -12,19 +12,28 @@ from TradingBot.v2.intents import TradeIntent, PmccIntentPayload
 from TradingBot.v2.risk.rules.open_order_rule import OpenOrderDedupeRule
 
 # PMCC sizing and symbol parsing
-from TradingBot.v2.pmcc_sizer import PmccSizer, parse_opra
+from TradingBot.v2.pmcc_sizer import PmccSizer
 
 # Domain types and order builders
+
 from TradingBot.v2.domain.orders import (
-    OptionLeg as DomainOptionLeg,
-    OrderSide as DomainOrderSide,
     MultiLegLimitOrder,
+    OptionContract,
+    OptionLeg as DomainOptionLeg,
+    OptionRight,
+    OrderSide as DomainOrderSide,
+    TimeInForce,
 )
 from TradingBot.v2.domain.types import ClientOrderId, normalise_symbol
 from decimal import Decimal
 
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
+
+from TradingBot.v2.pmcc_sizer import parse_osi
+
+from decimal import Decimal
+
 
 logger = setup_logger("Risk Engine")
 
@@ -43,7 +52,7 @@ class RiskEngineV2:
     - "Reject by default" is intentional.
     """
 
-    dedupe_rule: OpenOrderDedupeRule
+    dedupe_rule: OpenOrderDedupeRule # Injected deduplication rule
     pmcc_sizer: PmccSizer  # Injected PMCC sizing component
 
     def _reject(self, intent: TradeIntent, reason: str) -> RiskDecision:
@@ -60,7 +69,20 @@ class RiskEngineV2:
                 str(intent.symbol),
                 reason,
             )
+
             return decision
+    def _approve(self, *, intent: TradeIntent, order: Any) -> RiskDecision:
+        with log_scope("risk_engine._approved", logger, extra=f"intent_id={intent.intent_id}"):
+
+            return RiskDecision(
+                intent_id=intent.intent_id,
+                strategy_id=intent.strategy_id,
+                symbol=intent.symbol,
+                approved=True,
+                reason=None,
+                client_order_id=str(getattr(order, "client_order_id", "")),
+                order=order,
+            )
 
     def evaluate(self, ctx: RiskContext, intents: List[TradeIntent]) -> List[RiskDecision]:
         with log_scope("risk_engine.evaluate", logger, extra=f"intents={len(intents)} as_of_utc={ctx.as_of_utc.isoformat()}"):
@@ -98,48 +120,55 @@ class RiskEngineV2:
                             decisions.append(self._reject(intent=intent, reason=str(ex)))
                             continue
 
-                        # Parse option symbols and build domain legs
-                        leap_contract = parse_opra(payload.leap_leg.contract.option_symbol)
-                        near_contract = parse_opra(payload.near_leg.contract.option_symbol)
+                        # Parse option symbols (variable-length OSI root supported)
+                        leap_parsed = parse_osi(payload.leap_leg.contract.option_symbol)
+                        near_parsed = parse_osi(payload.near_leg.contract.option_symbol)
+
+                        # Build domain contracts from parsed OSI
+                        leap_contract = OptionContract(
+                            underlying=payload.underlying_symbol,
+                            expiry=leap_parsed.expiry_utc.replace(tzinfo=None),
+                            strike=leap_parsed.strike.quantize(Decimal("0.01")),
+                            right=OptionRight.CALL if leap_parsed.right == "call" else OptionRight.PUT,
+                            option_symbol=leap_parsed.option_symbol,
+                        )
+
+                        near_contract = OptionContract(
+                            underlying=payload.underlying_symbol,
+                            expiry=near_parsed.expiry_utc.replace(tzinfo=None),
+                            strike=near_parsed.strike.quantize(Decimal("0.01")),
+                            right=OptionRight.CALL if near_parsed.right == "call" else OptionRight.PUT,
+                            option_symbol=near_parsed.option_symbol,
+                        )
 
                         long_leg = DomainOptionLeg(
                             contract=leap_contract,
                             side=DomainOrderSide.BUY,
-                            ratio=int(payload.leap_leg.ratio),
+                            ratio=1,
                         )
+
                         short_leg = DomainOptionLeg(
                             contract=near_contract,
                             side=DomainOrderSide.SELL,
-                            ratio=int(payload.near_leg.ratio),
+                            ratio=1,
                         )
 
-                        underlying_sym = normalise_symbol(payload.underlying_symbol)
-                        client_order_id: ClientOrderId = ClientOrderId(f"PMCC:{underlying_sym}")
+                        # Deterministic client order id, do not pull it off RiskDecision
+                        underlying_sym = normalise_symbol(str(payload.underlying_symbol))
+                        client_order_id = f"PMCC:{str(underlying_sym)}"
 
                         order = MultiLegLimitOrder(
                             client_order_id=client_order_id,
                             underlying=underlying_sym,
                             legs=(long_leg, short_leg),
-                            quantity=sizing.qty,
-                            limit_price=Decimal(str(sizing.limit_price)),
+                            quantity=int(sizing.qty),
+                            limit_price=Decimal(str(sizing.limit_price)).quantize(Decimal("0.0001")),
+                            time_in_force=TimeInForce.DAY,
                         )
 
-                        approved = ApprovedOrder(
-                            intent_id=intent.intent_id,
-                            client_order_id=client_order_id,
-                            order=order,
-                        )
-                        decisions.append(RiskDecision(approved=approved))
+                        decisions.append(self._approve(intent=intent, order=order))
                         continue
 
-                    # All other intent types are rejected by default
-                    logger.info("Dedupe passed. Applying default safety rejection | intent_id=%s", str(intent.intent_id))
-                    decisions.append(
-                        self._reject(
-                            intent=intent,
-                            reason="Not yet approved (sizing not implemented).",
-                        )
-                    )
 
             logger.info("Risk evaluation complete | decisions=%d", int(len(decisions)))
             return decisions

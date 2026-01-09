@@ -638,12 +638,39 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
                 row["_is_stale"] = bool(is_stale)
 
             return chain
-
-
         
     def submit_order(self, order: Any) -> Any:
+        """
+        Submit an order to the broker.
+
+        Intent
+        - This is the *only* method in the system that should talk to broker order placement APIs.
+        - Everything upstream (strategy, sizing, risk) must produce a fully-formed order request object.
+
+        Expectations on `order`
+        - Must contain everything required to place an order: symbol(s), legs, qty, order type,
+        limit/debit price, time-in-force, and a client_order_id for dedupe.
+        - Must be validated upstream. The broker adapter should treat invalid order objects as a bug.
+
+        Implementation notes
+        - Keep network IO bounded (timeouts) and heavily logged, like the other broker methods.
+        - Return the broker's raw response payload so the orchestrator can log/store it.
+        - If you support dry-run, that should live in orchestrator, not here. This should do one job only.
+
+        Why this is NotImplemented
+        - The V2 order request types (v2/domain/orders.py) must be defined first so this method can
+        be type-safe and stable.
+        - Once those types exist, this method becomes a thin adapter: order -> broker payload -> HTTP call.
+
+        """
         self._log_io_boundary("submit_order")
-        raise NotImplementedError(
-            "Order submission not implemented yet. "
-            "Define v2/domain/orders.py request types first."
-        )
+        with log_scope("broker.submit_order", logger):  
+            logger.info("Broker call submit_order order=%s", order)
+            try:
+                print("je moeder")
+                # Placeholder for future implementation.
+            except Exception as e:
+                raise NotImplementedError(
+                    "Order submission not implemented yet. "
+                    "Next: Unsure what to do. But the Order has already been given"
+                )

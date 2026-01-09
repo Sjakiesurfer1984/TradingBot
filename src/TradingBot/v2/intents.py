@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Union
-
+from typing import Tuple, Union, Optional
+from datetime import datetime
 from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
-
 
 class OrderSide(Enum):
     """
@@ -19,29 +18,17 @@ class OrderSide(Enum):
     BUY = "BUY"
     SELL = "SELL"
 
-
 @dataclass(frozen=True)
 class SelectedOption:
-    """
-    A concrete option contract selected by a strategy.
-
-    Design intent
-    - Output of option selection logic only.
-    - Contains enough information for the risk layer to estimate cost/exposure
-      without re-querying the broker immediately.
-
-    Notes
-    - Prices are estimates observed at selection time.
-    - Risk and execution must assume slippage and partial fills exist.
-    """
-
     option_symbol: str
     ask_price: float
     bid_price: float
     delta: float
     dte: int
 
-
+    # Option chain metadata (broker-agnostic)
+    feed: str = "indicative"  # "opra" or "indicative"
+    chain_newest_ts_utc: Optional[datetime] = None
 @dataclass(frozen=True)
 class OptionLeg:
     """
@@ -112,8 +99,6 @@ IntentPayload = Union[
     EquityIntentPayload,
     SingleOptionIntentPayload,
 ]
-
-
 @dataclass(frozen=True)
 class TradeIntent:
     """
