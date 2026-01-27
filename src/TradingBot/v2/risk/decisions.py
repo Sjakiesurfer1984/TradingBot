@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Generic, TypeVar
+TOrder = TypeVar("TOrder")
 
 from TradingBot.v2.domain.orders import MultiLegLimitOrder
-from TradingBot.v2.domain.types import ClientOrderId, IntentId
+from TradingBot.v2.domain.types import ClientOrderId, IntentId, StrategyId, ClientOrderId
 
 from TradingBot.v2.logger import setup_logger
 logger = setup_logger("Decisions")
 
 @dataclass(frozen=True)
-class ApprovedOrder:
+class ApprovedOrder(Generic[TOrder]):
     """
     A fully approved and sized order, ready for broker submission.
 
@@ -32,13 +33,17 @@ class ApprovedOrder:
     # We use IntentId (a NewType over str) to avoid mixing IDs accidentally.
     intent_id: IntentId
 
+    strategy_id: StrategyId
+
+    symbol: str
+
     # Deterministic client-side order identifier.
     # This is how we dedupe and later reconcile what we submitted.
     client_order_id: ClientOrderId
 
     # The final broker-agnostic order description.
     # Broker adapters translate this into actual API calls.
-    order: MultiLegLimitOrder
+    order: TOrder
 
 
 @dataclass(frozen=True)
@@ -57,9 +62,9 @@ class RejectedIntent:
     """
 
     # Identifier of the rejected trade intent.
-    intent_id: IntentId
-
-    # Human-readable explanation for why the intent was rejected.
+    intent_id: str
+    strategy_id: str
+    symbol: str
     reason: str
 
 

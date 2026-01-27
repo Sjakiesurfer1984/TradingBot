@@ -8,9 +8,9 @@
 # - This interface is the contract that prevents V2 from drifting back into V1-style coupling.
 #
 # Key idea
-# - StrategyV2 consumes a RiskContext snapshot (built by the orchestrator).
-# - StrategyV2 produces TradeIntent objects (requests).
-# - StrategyV2 never sizes positions and never submits orders.
+# - Strategy consumes a RiskContext snapshot (built by the orchestrator).
+# - Strategy produces TradeIntent objects (requests).
+# - Strategy never sizes positions and never submits orders.
 
 from __future__ import annotations
 
@@ -40,12 +40,12 @@ from TradingBot.v2.logger import setup_logger
 logger = setup_logger("Strategy Interface")
 
 
-class StrategyV2(ABC):
+class Strategy(ABC):
     """
     Interface for V2 strategies (Option C).
 
     Design intent
-    - A StrategyV2 analyses a RiskContext snapshot and proposes one or more TradeIntents.
+    - A Strategy analyses a RiskContext snapshot and proposes one or more TradeIntents.
     - It does not execute trades.
     - It does not decide risk.
     - It does not allocate capital.

@@ -1,11 +1,11 @@
-# src/TradingBot/v2/brokers/fake_broker_v2.py
+# src/TradingBot/v2/brokers/fake_broker.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.brokers.broker_interface import BrokerInterface
 from TradingBot.v2.domain.types import AssetQuote
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
@@ -14,7 +14,7 @@ logger = setup_logger("FakeBroker")
 
 
 @dataclass
-class FakeBrokerV2(BrokerInterfaceV2):
+class FakeBroker(BrokerInterface):
     """
     Deterministic, in-memory broker implementation for TradingBot V2.
 
@@ -49,7 +49,7 @@ class FakeBrokerV2(BrokerInterfaceV2):
     submitted_orders: List[Any] = field(default_factory=list)
 
     # ---------------------------------------------------------------------
-    # BrokerInterfaceV2 implementation
+    # BrokerInterface implementation
     # ---------------------------------------------------------------------
 
     def get_account_snapshot(self) -> AccountSnapshot:

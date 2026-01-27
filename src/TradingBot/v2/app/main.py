@@ -10,23 +10,28 @@ from typing import List, Optional  # Optional is used in _get_env function.
 
 from dotenv import load_dotenv
 
-from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.brokers.broker_interface import BrokerInterface
 from TradingBot.v2.brokers.factory import build_broker
 from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.orchestrator import OrchestratorV2
-from TradingBot.v2.risk.risk_engine import RiskEngineV2
+from TradingBot.v2.orchestrator import Orchestrator
+from TradingBot.v2.risk.risk_engine import RiskEngine
 from TradingBot.v2.risk.rules.open_order_rule import OpenOrderDedupeRule
-from TradingBot.v2.strategies.pmcc_strategy_v2 import PmccStrategyV2
-from TradingBot.v2.strategies.strategy_interface_v2 import StrategyV2
-
+from TradingBot.v2.strategies.pmcc_strategy import PmccStrategyV2
+from TradingBot.v2.strategies.strategy_interface import Strategy
+from TradingBot.v2.app.scheduler import SchedulerV2, SchedulerConfig
 from TradingBot.v2.logging_utils import log_scope
 
-from threading import Event
 # PMCC sizing imports
 from TradingBot.v2.pmcc_sizer import PmccSizingConfig, PmccSizer
 
 # Module-level logger.
 logger = setup_logger("Main")
+'''
+The .env files contain strategy parameters.
+
+the Underlying asset is set in pmcc_strategy_v2.py
+
+'''
 
 # Function to read environment variables safely from the .env file or system environment.
 def _get_env(name: str) -> Optional[str]:
@@ -138,7 +143,7 @@ def _install_interrupt_tracer() -> None:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _handler)
 
-def _build_risk_engine() -> RiskEngineV2:
+def _build_risk_engine() -> RiskEngine:
     with log_scope("build_risk_engine", logger):
         logger.info("Constructing risk rule OpenOrderDedupeRule")
         dedupe_rule: OpenOrderDedupeRule = OpenOrderDedupeRule()
@@ -152,11 +157,13 @@ def _build_risk_engine() -> RiskEngineV2:
             slippage_factor=float(os.getenv("TBOT_PMCC_SLIPPAGE_FACTOR", "1.0")),
             max_leap_spread_pct=float(os.getenv("TBOT_PMCC_MAX_LEAP_SPREAD_PCT", "0")),
             max_near_spread_pct=float(os.getenv("TBOT_PMCC_MAX_NEAR_SPREAD_PCT", "0")),
+            ignore_spread_checks=_get_env_bool("TBOT_PMCC_IGNORE_SPREAD_CHECKS", default=False),
         )
+
         pmcc_sizer = PmccSizer(cfg)
 
-        logger.info("Constructing RiskEngineV2 with PMCC sizer")
-        risk_engine: RiskEngineV2 = RiskEngineV2(
+        logger.info("Constructing RiskEngine with PMCC sizer")
+        risk_engine: RiskEngine = RiskEngine(
             dedupe_rule=dedupe_rule,
             pmcc_sizer=pmcc_sizer,
         )
@@ -164,10 +171,10 @@ def _build_risk_engine() -> RiskEngineV2:
         logger.info("Risk engine constructed | type=%s", type(risk_engine).__name__)
         return risk_engine
     
-def _build_strategies() -> List[StrategyV2]:
+def _build_strategies() -> List[Strategy]:
     with log_scope("build_strategies", logger):
         logger.info("Constructing strategies list")
-        strategies: List[StrategyV2] = [
+        strategies: List[Strategy] = [
             PmccStrategyV2(underlying_symbol="SPY"),
         ]
         logger.info("Strategies constructed count=%d types=%s", len(strategies), [type(s).__name__ for s in strategies])
@@ -175,14 +182,14 @@ def _build_strategies() -> List[StrategyV2]:
 
 def _build_orchestrator(
     # an orchestrator object is a collection of strategies, a broker, and a risk engine objects.
-    broker: BrokerInterfaceV2, # here we pass the broker object to the orchestrator. 
-    strategies: List[StrategyV2],
-    risk_engine: RiskEngineV2,
+    broker: BrokerInterface, # here we pass the broker object to the orchestrator. 
+    strategies: List[Strategy],
+    risk_engine: RiskEngine,
     dry_run: bool,
-) -> OrchestratorV2:
+) -> Orchestrator:
     with log_scope("build_orchestrator", logger):
-        logger.info("Constructing OrchestratorV2")
-        orchestrator: OrchestratorV2 = OrchestratorV2(
+        logger.info("Constructing Orchestrator")
+        orchestrator: Orchestrator = Orchestrator(
             broker=broker,
             strategies=strategies,
             risk_engine=risk_engine,
@@ -224,26 +231,26 @@ def main() -> None:
 
         with log_scope("build_broker", logger, extra=f"name={broker_name}"):
             # Here we build the broker using the factory.py "build_broker" function and passing in the broker name (Alpaca, Fake, etc.)
-            broker: BrokerInterfaceV2 = build_broker(broker_name)
+            broker: BrokerInterface = build_broker(broker_name)
         # Dry_run is set in the environment variable TBOT_DRY_RUN.
         # If missing, we default to True for safety.
         dry_run: bool = _get_env_bool("TBOT_DRY_RUN", default=True)
         logger.info("Dry run resolved | dry_run=%s", dry_run)
         # The risk engine is responsible for managing risks such as order deduplication, position sizing, etc.
-        # We build it using the _build_risk_engine function defined in this file, which in turn calls the RiskEngineV2 constructor.
-        risk_engine: RiskEngineV2 = _build_risk_engine()
+        # We build it using the _build_risk_engine function defined in this file, which in turn calls the RiskEngine constructor.
+        risk_engine: RiskEngine = _build_risk_engine()
         logger.info("Risk engine built | type=%s", type(risk_engine).__name__)
         # Build strategies list. Build_strategies function defines which strategies to use, and is defined in this file.
         # build_strategies function in turn calls the constructors of each strategy we wish to use (e.g., PmccStrategyV2).
-        strategies: List[StrategyV2] = _build_strategies()
+        strategies: List[Strategy] = _build_strategies()
         logger.info("Strategies built | count=%d types=%s", len(strategies), [type(s).__name__ for s in strategies])
         #build_orchestrator function builds the orchestrator with the given broker, strategies, risk engine, and dry run flag. it is defined in this file.
-        # The _build_orchestrator function in turn calls the OrchestratorV2 constructor, and injects the following dependencies:
-        # - broker: BrokerInterfaceV2
-        # - strategies: List[StrategyV2]
-        # - risk_engine: RiskEngineV2
+        # The _build_orchestrator function in turn calls the Orchestrator constructor, and injects the following dependencies:
+        # - broker: BrokerInterface
+        # - strategies: List[Strategy]
+        # - risk_engine: RiskEngine
         # - dry_run: bool NOTE: this flag tells the orchestrator whether to actually submit orders or not. However, 
-        orchestrator: OrchestratorV2 = _build_orchestrator(
+        orchestrator: Orchestrator = _build_orchestrator(
             broker=broker,
             strategies=strategies,
             risk_engine=risk_engine,
@@ -251,23 +258,19 @@ def main() -> None:
         )
         logger.info("Orchestrator built | type=%s", type(orchestrator).__name__)
 
-        logger.info("Start orchestrator.run_cycle")
+        cycle_seconds: float = float(os.getenv("TBOT_CYCLE_SECONDS", "60")) # default set to run cycle every 60 seconds. 
+
+        scheduler: SchedulerV2 = SchedulerV2(
+            orchestrator=orchestrator,
+            config=SchedulerConfig(cycle_seconds=cycle_seconds),
+        )
+
+        logger.info("Start scheduler.run_forever | cycle_seconds=%s", cycle_seconds)
         try:
-            with log_scope("orchestrator.run_cycle", logger):
-                orchestrator.run_cycle()
-            if _STOP_REQUESTED.is_set():
-                logger.warning("Stop requested, exiting cleanly")
-                return
-            logger.info("orchestrator.run_cycle completed successfully")
-        # except KeyboardInterrupt:
-        #     logger.exception("KeyboardInterrupt reached main")
-        #     raise
+            scheduler.run_forever()
         except Exception:
-            logger.exception("orchestrator.run_cycle raised an exception")
+            logger.exception("scheduler.run_forever raised an exception")
             raise
-                
-        logger.info("End main")
-    
 
 if __name__ == "__main__":
     main()

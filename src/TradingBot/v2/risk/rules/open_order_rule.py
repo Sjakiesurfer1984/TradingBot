@@ -12,10 +12,10 @@ from typing import Any, Dict, Optional
 from TradingBot.v2.context import RiskContext
 
 # Symbol is the canonical domain type for asset identifiers.
-from TradingBot.v2.domain.types import Symbol
+from TradingBot.v2.domain.types import Symbol, ClientOrderId
 
 # TradeIntent is the object produced by strategies and consumed by risk rules.
-from TradingBot.v2.intents import TradeIntent
+from TradingBot.v2.intents import TradeIntent, PmccIntentPayload
 
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
@@ -57,21 +57,10 @@ class OpenOrderDedupeRule:
         """
         return "" if value is None else str(value)
 
-    def _expected_client_order_id(self, underlying: Symbol) -> str:
-        """
-        Build the deterministic client_order_id used for deduplication.
+    def _expected_client_order_id(self, underlying: Symbol) -> ClientOrderId:
+        expected_raw: str = f"{self.client_order_prefix}:{str(underlying).strip().upper()}"
+        return ClientOrderId(expected_raw)
 
-        Why this exists
-        - client_order_id is the strongest dedupe signal when available.
-        - It is broker-facing, so it must be a string.
-        - Symbol -> str conversion is done here and nowhere else.
-
-        Example
-        - underlying = Symbol("SPY")
-        - result = "PMCC:SPY"
-        """
-        expected: str = f"{self.client_order_prefix}:{str(underlying).strip().upper()}"
-        return expected
 
     def _mentions_underlying(self, underlying: Symbol, order: Dict[str, Any]) -> bool:
         """
@@ -120,19 +109,15 @@ class OpenOrderDedupeRule:
             return False
 
     def _intent_underlying(self, intent: TradeIntent) -> Symbol:
-        """
-        Extract the canonical underlying Symbol from a TradeIntent.
+        payload = intent.payload
 
-        Why this exists
-        - Different strategies may encode underlying information differently.
-        - This method centralises how we determine "what symbol this intent is about".
-        - If new intent payload types are added later, branching happens here.
+        if isinstance(payload, PmccIntentPayload):
+            return payload.underlying_symbol
 
-        Current behaviour
-        - For PMCC intents, the underlying is stored in payload.underlying_symbol.
-        """
-        underlying: Symbol = intent.payload.underlying_symbol
-        return underlying
+        raise TypeError(
+            f"Unsupported intent payload type for underlying extraction: {type(payload).__name__}"
+        )
+
 
     def check(self, ctx: RiskContext, intent: TradeIntent) -> Optional[str]:
         """
@@ -141,52 +126,60 @@ class OpenOrderDedupeRule:
         Return value
         - None: the rule does not reject the intent.
         - str: the rule rejects the intent, and the string explains why.
-
-        Why this signature
-        - Keeps rules simple and composable.
-        - RiskEngineV2 can apply many rules and collect rejection reasons.
         """
         with log_scope(
             "open_order_rule.check",
             logger,
             extra=f"intent_id={intent.intent_id} strategy_id={intent.strategy_id} symbol={intent.symbol}",
         ):
-            # Determine the canonical underlying symbol for this intent.
             underlying: Symbol = self._intent_underlying(intent)
-            logger.info("Checking open-order dedupe | underlying=%s open_orders=%d", str(underlying), int(len(ctx.open_orders)))
+            logger.info(
+                "Checking open-order dedupe | underlying=%s open_orders=%d",
+                str(underlying),
+                int(len(ctx.open_orders)),
+            )
 
-            # Build the deterministic expected client_order_id for this underlying.
-            expected_id: str = self._expected_client_order_id(underlying)
-            logger.info("Expected client_order_id computed | expected_id=%s", expected_id)
+            expected_id: ClientOrderId = self._expected_client_order_id(underlying)
+            expected_id_str: str = str(expected_id)
+            logger.info("Expected client_order_id computed | expected_id=%s", expected_id_str)
 
-            # Iterate through the broker-provided open orders snapshot.
-            for i, order in enumerate(ctx.open_orders):
-                # Defensive check: broker payloads should be dict-like.
-                if not isinstance(order, dict):
-                    logger.warning("Skipping non-dict open order payload | index=%d type=%s", int(i), type(order).__name__)
+            for i, order_any in enumerate(ctx.open_orders):
+                if not isinstance(order_any, dict):
+                    logger.warning(
+                        "Skipping non-dict open order payload | index=%d type=%s",
+                        int(i),
+                        type(order_any).__name__,
+                    )
                     continue
 
-                # Primary dedupe path:
-                # Exact match on client_order_id.
-                client_order_id: str = self._safe_str(
-                    order.get("client_order_id")
-                ).strip()
+                order: Dict[str, Any] = order_any
+                
+                client_order_id_str: str = self._safe_str(order.get("client_order_id")).strip()
+                if client_order_id_str:
+                    logger.info(
+                        "Open order client_order_id observed | index=%d client_order_id=%s",
+                        int(i),
+                        client_order_id_str,
+                    )
 
-                if client_order_id:
-                    logger.info("Open order client_order_id observed | index=%d client_order_id=%s", int(i), client_order_id)
-
-                if client_order_id == expected_id:
-                    reason: str = f"Open order exists for {underlying} (client_order_id match)."
-                    logger.info("Dedupe hit | index=%d reason=%s", int(i), reason)
+                expected_prefix: str = f"{self.client_order_prefix}:{str(underlying).strip().upper()}:"
+                
+                if client_order_id_str.startswith(expected_prefix):
+                    reason: str = f"Open order exists for {underlying} (client_order_id prefix match)."
+                    logger.info(
+                        "Dedupe hit | index=%d reason=%s client_order_id=%s expected_prefix=%s",
+                        int(i),
+                        reason,
+                        client_order_id_str,
+                        expected_prefix,
+                    )
                     return reason
 
-                # Secondary dedupe path:
-                # Heuristic inspection of symbol fields.
                 if self._mentions_underlying(underlying, order):
                     reason = f"Open order exists for {underlying} (symbol match)."
                     logger.info("Dedupe hit | index=%d reason=%s", int(i), reason)
                     return reason
 
-            # No open order was found that conflicts with this intent.
             logger.info("No conflicting open orders found | underlying=%s", str(underlying))
             return None
+

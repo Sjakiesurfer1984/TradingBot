@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-from TradingBot.v2.brokers.alpaca_broker_v2 import AlpacaBrokerV2
+from TradingBot.v2.brokers.alpaca_broker import AlpacaBroker
 from TradingBot.v2.brokers.errors import MissingBrokerCredentialsError
 
 from TradingBot.v2.logger import setup_logger
@@ -46,7 +46,7 @@ def _alpaca_env_vars_for_mode(mode: str) -> Tuple[str, str]:
         return ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET")
 
 
-def build_alpaca_broker(request_timeout_seconds: float = 10.0) -> AlpacaBrokerV2:
+def build_alpaca_broker(request_timeout_seconds: float = 10.0) -> AlpacaBroker:
     with log_scope("alpaca_factory.build_alpaca_broker", logger, extra=f"request_timeout_seconds={request_timeout_seconds}"):
         mode: str = (_get_env("ALPACA_MODE") or "paper").lower()
         logger.info("Alpaca mode resolved | mode=%s", mode)
@@ -74,12 +74,12 @@ def build_alpaca_broker(request_timeout_seconds: float = 10.0) -> AlpacaBrokerV2
         paper: bool = mode != "live"
         logger.info("Alpaca paper flag resolved | paper=%s", paper)
 
-        broker: AlpacaBrokerV2 = AlpacaBrokerV2(
+        broker: AlpacaBroker = AlpacaBroker(
             api_key=api_key,
             api_secret=api_secret,
             paper=paper,
             request_timeout_seconds=request_timeout_seconds,
         )
 
-        logger.info("AlpacaBrokerV2 constructed | type=%s paper=%s", type(broker).__name__, paper)
+        logger.info("AlpacaBroker constructed | type=%s paper=%s", type(broker).__name__, paper)
         return broker

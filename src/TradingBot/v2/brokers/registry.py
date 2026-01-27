@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict
 
-from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.brokers.broker_interface import BrokerInterface
 
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
@@ -24,10 +24,10 @@ class UnknownBrokerError(ValueError):
         return f"Unknown broker '{self.broker_name}'. Supported brokers: {supported_csv}."
 
 
-BrokerFactory = Callable[[], BrokerInterfaceV2]
+BrokerFactory = Callable[[], BrokerInterface]
 
 
-def resolve_broker(factory_map: Dict[str, BrokerFactory], broker_name: str) -> BrokerInterfaceV2:
+def resolve_broker(factory_map: Dict[str, BrokerFactory], broker_name: str) -> BrokerInterface:
     """
     Resolve and build a broker from a name -> factory mapping.
     """
@@ -43,6 +43,6 @@ def resolve_broker(factory_map: Dict[str, BrokerFactory], broker_name: str) -> B
             raise UnknownBrokerError(broker_name=broker_name, supported=supported)
 
         logger.info("Broker factory found | key=%s. Constructing broker.", key)
-        broker: BrokerInterfaceV2 = factory_map[key]()
+        broker: BrokerInterface = factory_map[key]()
         logger.info("Broker constructed | key=%s type=%s", key, type(broker).__name__)
         return broker

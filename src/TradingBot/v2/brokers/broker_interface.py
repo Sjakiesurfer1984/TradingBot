@@ -16,7 +16,7 @@ logger = setup_logger("Broker Interface")
 # That is, AlpacaBrokerV2, FakeBrokerV2, etc. must all implement this interface.
 # meaning they must implement all the abstract methods defined here as concrete methods.
 # ------------------------------------------------------------------------------------------
-class BrokerInterfaceV2(ABC):
+class BrokerInterface(ABC):
     """
     V2 broker interface.
 
@@ -75,12 +75,13 @@ class BrokerInterfaceV2(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_positions(self) -> Dict[str, Any]:
+    def get_positions(self) -> List[Dict[str, Any]]:
         """
         Return current positions.
 
-        Why a dict
-        - Positions are typically keyed by symbol for fast lookup.
+        Why a list
+        - Broker payloads are naturally a list of records.
+        - Risk rules can scan it consistently.
         """
         raise NotImplementedError
 

@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 
 from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.orchestrator import OrchestratorV2
+from TradingBot.v2.orchestrator import Orchestrator
 
 logger = setup_logger("Scheduler")
 
@@ -31,8 +31,8 @@ class SchedulerV2:
     - Orchestrator remains single-cycle and testable.
     """
 
-    def __init__(self, orchestrator: OrchestratorV2, config: SchedulerConfig) -> None:
-        self._orchestrator: OrchestratorV2 = orchestrator
+    def __init__(self, orchestrator: Orchestrator, config: SchedulerConfig) -> None:
+        self._orchestrator: Orchestrator = orchestrator
         self._config: SchedulerConfig = config
 
     def run_forever(self) -> None:

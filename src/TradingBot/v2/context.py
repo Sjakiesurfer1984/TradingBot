@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 from TradingBot.v2.domain.types import AssetQuote, Symbol
 from TradingBot.v2.risk.price_policy import PriceSelectionPolicy, PriceSide
 
-
 @dataclass(frozen=True)
 class RiskContext:
     """
@@ -41,7 +40,7 @@ class RiskContext:
     open_orders: List[Dict[str, Any]]
 
     # Positions at the time of snapshot (raw broker payloads).
-    positions: List[Any]
+    positions: List[Dict[str, Any]]
 
     # Underlying symbol -> latest quote (bid/ask/mid).
     # Populated by orchestrator using broker market-data IO once per cycle.

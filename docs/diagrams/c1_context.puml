@@ -1,0 +1,11 @@
+@startuml C1 Diagram - Context diagram
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+Person(user, "Trader")
+System(tradingbot, "TradingBot V2", "PMCC automated trading system")
+System_Ext(alpaca, "Alpaca", "Broker & execution")
+
+Rel(user, tradingbot, "Configures / monitors")
+Rel(tradingbot, alpaca, "Submits orders, fetches account state")
+
+@enduml

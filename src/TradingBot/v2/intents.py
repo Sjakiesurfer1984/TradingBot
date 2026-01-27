@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Union, Optional
+from typing import Tuple, Union, Optional, Protocol
 from datetime import datetime
+from TradingBot.v2.domain.orders import TimeInForce
 from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
 
 class OrderSide(Enum):
@@ -121,6 +122,9 @@ class TradeIntent:
     # For multi-leg options, this is usually the underlying.
     symbol: Symbol
 
-    payload: IntentPayload
-    time_in_force: str = "DAY"
+    payload: HasUnderlying
+    time_in_force: TimeInForce = TimeInForce.DAY
     tags: Tuple[str, ...] = ()
+
+class HasUnderlying(Protocol):
+    underlying_symbol: Symbol

@@ -24,7 +24,6 @@ from TradingBot.v2.logging_utils import log_scope
 
 logger = setup_logger("PricePolicy")
 
-
 class PriceSide(Enum):
     """
     Trade intent side used for execution-aware pricing.

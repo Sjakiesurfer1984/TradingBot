@@ -12,7 +12,6 @@ from enum import Enum
 # Decimal is used for money-like quantities where you want predictable arithmetic.
 # Floats can introduce rounding noise (e.g., 0.1 + 0.2 != 0.3 exactly in binary floating point).
 from decimal import Decimal
-
 # datetime is used to represent timestamps.
 # Optional describes values that may be missing (None).
 # Sequence is for ordered collections (list or tuple).
@@ -21,8 +20,7 @@ from typing import Optional, Sequence
 
 # Symbol is a domain type representing a canonicalised underlying symbol.
 # We use it here so "SPY", " spy ", and "Spy" get treated as the same canonical thing.
-from TradingBot.v2.domain.types import Symbol
-
+from TradingBot.v2.domain.types import Symbol, ClientOrderId
 
 class OrderSide(str, Enum):
     """
@@ -128,7 +126,7 @@ class OptionLeg:
     - PMCC typically has:
         - BUY 1 long-dated call (ratio 1)
         - SELL 1 short-dated call (ratio 1)
-
+cl
     Why ratio exists
     - Some spreads use ratios (e.g., 1x2).
     - We need a structured place for this so it does not become a "special case".
@@ -174,7 +172,7 @@ class MultiLegLimitOrder:
 
     # Deterministic identifier set by our system.
     # Used for deduplication, reconciliation, and auditing.
-    client_order_id: str
+    client_order_id: ClientOrderId
 
     # Underlying symbol used for reporting, risk grouping, and heuristics.
     underlying: Symbol

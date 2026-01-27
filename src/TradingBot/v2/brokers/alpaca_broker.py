@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, TypeVar, TYPE_CHECKING, cast
+from decimal import ROUND_HALF_UP, Decimal
+
+from TradingBot.v2.domain.orders import MultiLegLimitOrder, OptionLeg as DomainOptionLeg, OrderSide as DomainOrderSide, TimeInForce as DomainTIF
 
 import time
 from datetime import date, datetime, timezone
@@ -11,17 +14,26 @@ from requests import Session
 from requests.adapters import HTTPAdapter
 
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.broker_interface_v2 import BrokerInterfaceV2
+from TradingBot.v2.brokers.broker_interface import BrokerInterface
 from TradingBot.v2.brokers.errors import BrokerConnectionError
-from TradingBot.v2.domain.types import AssetQuote, Symbol
+from TradingBot.v2.domain.types import AssetQuote, ClientOrderId
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
 
+import json
+import os
+
 logger = setup_logger("AlpacaBroker")
 
+TOrder = TypeVar("TOrder")
 
+if TYPE_CHECKING:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import OrderRequest
+    from alpaca.trading.models import Order as AlpacaOrder
+    
 @dataclass
-class AlpacaBrokerV2(BrokerInterfaceV2):
+class AlpacaBroker(BrokerInterface):
     """
     Alpaca broker adapter for TradingBot V2.
 
@@ -49,6 +61,8 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
     debug_http: bool = True
 
     _session: Optional[Session] = field(default=None, init=False)
+    _trading_client: Optional["TradingClient"] = field(default=None, init=False, repr=False)
+
 
     # ---------------------------------------------------------------------
     # Internal helpers
@@ -112,6 +126,32 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
                 )
 
         return self._session
+
+    def _ensure_trading_client(self) -> "TradingClient":
+        """
+        Create and cache the Alpaca TradingClient instance.
+
+        Why this exists
+        - TradingClient manages auth + session configuration for the Alpaca SDK.
+        - Creating it repeatedly is unnecessary and makes behaviour harder to reason about.
+        """
+        if self._trading_client is not None:
+            return self._trading_client
+
+        with log_scope("alpaca_broker._ensure_trading_client", logger, extra=f"paper={self.paper}"):
+            try:
+                from alpaca.trading.client import TradingClient  # type: ignore
+            except Exception as exc:
+                raise RuntimeError("alpaca-py is not installed or import failed") from exc
+
+            self._trading_client = TradingClient(
+                api_key=self.api_key,
+                secret_key=self.api_secret,
+                paper=self.paper,
+            )
+
+            logger.info("Created Alpaca TradingClient paper=%s", bool(self.paper))
+            return self._trading_client
 
     def _log_request_start(
         self,
@@ -247,8 +287,127 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
         except Exception:
             return float(default)
 
+    def _quantise_money_2dp(self, value: Decimal) -> Decimal:
+        """
+        Quantise a Decimal money value to 2 decimal places.
+
+        Why this exists
+        - Alpaca requires limit_price to be 2 decimal places for order submission.
+        - Domain can keep higher precision, broker adapts at the boundary.
+        """
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    
+    def _to_alpaca_order_request(self, order: Any) -> "OrderRequest":
+        """
+        Convert our broker-agnostic domain order objects into Alpaca request objects.
+
+        Supported now
+        - MultiLegLimitOrder (options multi-leg limit order via Alpaca OrderClass.MLEG)
+
+        Important
+        - We require each OptionContract to already have contract.option_symbol populated.
+        This keeps strategy and risk broker-agnostic, while making the broker adapter
+        responsible for submitting only execution-ready orders.
+        """
+
+        
+        try:
+            from alpaca.trading.enums import OrderClass, OrderType, TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
+            from alpaca.trading.requests import OrderRequest, LimitOrderRequest, OptionLegRequest
+        except Exception as exc:
+            raise RuntimeError("alpaca-py is not installed or import failed") from exc
+
+        # Passthrough for already-constructed Alpaca requests (useful during migration).
+        if isinstance(order, OrderRequest):
+            return order
+
+        if not isinstance(order, MultiLegLimitOrder):
+            raise TypeError(
+                f"Unsupported internal order type for Alpaca mapping: {type(order).__name__}. "
+                "Expected MultiLegLimitOrder."
+            )
+
+        if order.quantity <= 0:
+            raise ValueError(f"MultiLegLimitOrder.quantity must be > 0, got {order.quantity}")
+
+        if not isinstance(order.limit_price, Decimal):
+            raise ValueError(
+                f"MultiLegLimitOrder.limit_price must be Decimal, got {type(order.limit_price).__name__}"
+            )
+
+        if not order.client_order_id or not str(order.client_order_id).strip():
+            raise ValueError("MultiLegLimitOrder.client_order_id must be a non-empty string")
+
+        # Map TIF
+        tif_map: dict[DomainTIF, AlpacaTIF] = {
+            DomainTIF.DAY: AlpacaTIF.DAY,
+            DomainTIF.GTC: AlpacaTIF.GTC,
+        }
+        alpaca_tif: AlpacaTIF = tif_map[order.time_in_force]
+
+        # Map legs
+        alpaca_legs: list[OptionLegRequest] = []
+        for idx, leg in enumerate(order.legs):
+            if not isinstance(leg, DomainOptionLeg):
+                raise ValueError(
+                    f"Order legs must be DomainOptionLeg, got {type(leg).__name__} at index {idx}"
+                )
+
+            if leg.ratio <= 0:
+                raise ValueError(f"OptionLeg.ratio must be > 0, got {leg.ratio} at index {idx}")
+
+            option_symbol: Optional[str] = leg.contract.option_symbol
+            if option_symbol is None or not str(option_symbol).strip():
+                raise ValueError(
+                    "OptionContract.option_symbol is required for Alpaca submission. "
+                    f"Missing on leg index {idx} (underlying={leg.contract.underlying})."
+                )
+
+            if leg.side == DomainOrderSide.BUY:
+                alpaca_side: AlpacaSide = AlpacaSide.BUY
+            elif leg.side == DomainOrderSide.SELL:
+                alpaca_side = AlpacaSide.SELL
+            else:
+                raise ValueError(f"Unsupported leg.side value: {leg.side!r}")
+
+            alpaca_legs.append(
+                OptionLegRequest(
+                    symbol=str(option_symbol).strip().upper(),
+                    side=alpaca_side,
+                    ratio_qty=int(leg.ratio),
+                )
+            )
+
+        if len(alpaca_legs) < 2:
+            raise ValueError("Multi-leg options order must have at least 2 legs for Alpaca MLEG submission")
+
+        limit_price_2dp: Decimal = self._quantise_money_2dp(order.limit_price)
+
+        if limit_price_2dp != order.limit_price:
+            logger.info(
+                "Alpaca limit_price quantised to 2dp client_order_id=%s before=%s after=%s",
+                str(order.client_order_id),
+                str(order.limit_price),
+                str(limit_price_2dp),
+            )
+
+        request = LimitOrderRequest(
+            type=OrderType.LIMIT,
+            order_class=OrderClass.MLEG,
+            qty=float(order.quantity),
+            limit_price=float(limit_price_2dp),
+            time_in_force=alpaca_tif,
+            client_order_id=str(order.client_order_id),
+            legs=alpaca_legs,
+        )
+
+        return request
+
+
+
+
     # ---------------------------------------------------------------------
-    # BrokerInterfaceV2 implementation
+    # BrokerInterface implementation
     # ---------------------------------------------------------------------
     def get_account_snapshot(self) -> AccountSnapshot:
         self._log_io_boundary("get_account_snapshot")
@@ -287,26 +446,42 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
             logger.info("Broker result get_equity equity=%.2f", float(equity))
             return max(equity, 0.0)
 
-    def get_positions(self) -> Dict[str, Any]:
+    def get_positions(self) -> List[Dict[str, Any]]:
         self._log_io_boundary("get_positions")
         with log_scope("broker.get_positions", logger):
+            # -----------------------------
+            # TEST OVERRIDE (local only)
+            # -----------------------------
+            enabled_raw: str = str(os.getenv("TBOT_TEST_POSITIONS_ENABLED", "")).strip().lower()
+            test_enabled: bool = enabled_raw in {"1", "true", "yes", "y", "on"}
+
+            if test_enabled:
+                raw_json: str = str(os.getenv("TBOT_TEST_POSITIONS_JSON", "")).strip()
+                if raw_json:
+                    try:
+                        positions_any: Any = json.loads(raw_json)
+                        if isinstance(positions_any, list):
+                            positions: List[Dict[str, Any]] = [p for p in positions_any if isinstance(p, dict)]
+                            logger.warning(
+                                "TEST POSITIONS OVERRIDE ACTIVE | returning mocked positions | count=%d",
+                                int(len(positions)),
+                            )
+                            return positions
+                        logger.warning("TBOT_TEST_POSITIONS_JSON is not a list; ignoring override")
+                    except Exception as exc:
+                        logger.warning("Failed to parse TBOT_TEST_POSITIONS_JSON; ignoring override | error=%s", str(exc))
+
+            # Normal behaviour (real broker IO)
             logger.info("Broker call get_positions")
-            positions: Any = self._request_json("GET", "/positions")
+            positions_any: Any = self._request_json("GET", "/positions")
 
-            result: Dict[str, Any] = {}
-            if not isinstance(positions, list):
-                logger.warning("Broker result get_positions unexpected_type=%s", type(positions).__name__)
-                return result
+            if not isinstance(positions_any, list):
+                logger.warning("Broker result get_positions unexpected_type=%s", type(positions_any).__name__)
+                return []
 
-            for pos in positions:
-                if not isinstance(pos, dict):
-                    continue
-                symbol: str = str(pos.get("symbol", "")).strip().upper()
-                if symbol:
-                    result[symbol] = pos
-
-            logger.info("Broker result get_positions count=%d", int(len(result)))
-            return result
+            positions: List[Dict[str, Any]] = [p for p in positions_any if isinstance(p, dict)]
+            logger.info("Broker result get_positions count=%d", int(len(positions)))
+            return positions
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         self._log_io_boundary("get_open_orders")
@@ -639,38 +814,61 @@ class AlpacaBrokerV2(BrokerInterfaceV2):
 
             return chain
         
-    def submit_order(self, order: Any) -> Any:
+    def submit_order(self, order: TOrder) -> "AlpacaOrder":
         """
-        Submit an order to the broker.
+        Submit an order to Alpaca.
 
-        Intent
-        - This is the *only* method in the system that should talk to broker order placement APIs.
-        - Everything upstream (strategy, sizing, risk) must produce a fully-formed order request object.
+        Parameters
+        - order: internal executable order (for example MultiLegLimitOrder)
 
-        Expectations on `order`
-        - Must contain everything required to place an order: symbol(s), legs, qty, order type,
-        limit/debit price, time-in-force, and a client_order_id for dedupe.
-        - Must be validated upstream. The broker adapter should treat invalid order objects as a bug.
-
-        Implementation notes
-        - Keep network IO bounded (timeouts) and heavily logged, like the other broker methods.
-        - Return the broker's raw response payload so the orchestrator can log/store it.
-        - If you support dry-run, that should live in orchestrator, not here. This should do one job only.
-
-        Why this is NotImplemented
-        - The V2 order request types (v2/domain/orders.py) must be defined first so this method can
-        be type-safe and stable.
-        - Once those types exist, this method becomes a thin adapter: order -> broker payload -> HTTP call.
-
+        Returns
+        - Alpaca Order model returned by alpaca-py
         """
         self._log_io_boundary("submit_order")
-        with log_scope("broker.submit_order", logger):  
-            logger.info("Broker call submit_order order=%s", order)
-            try:
-                print("je moeder")
-                # Placeholder for future implementation.
-            except Exception as e:
-                raise NotImplementedError(
-                    "Order submission not implemented yet. "
-                    "Next: Unsure what to do. But the Order has already been given"
+
+        with log_scope("alpaca_broker.submit_order", logger):
+            client_order_id: Optional[ClientOrderId] = getattr(order, "client_order_id", None)
+
+            logger.info(
+                "Submitting order to Alpaca client_order_id=%s order_type=%s",
+                client_order_id,
+                type(order).__name__,
+            )
+
+            order_request = self._to_alpaca_order_request(order)
+
+            # This log is useful when debugging request-shape issues.
+            # Many alpaca-py request objects are Pydantic models and support model_dump().
+            request_payload: Any
+            if hasattr(order_request, "model_dump"):
+                request_payload = order_request.model_dump()
+            elif hasattr(order_request, "dict"):
+                request_payload = order_request.dict()
+            else:
+                request_payload = str(order_request)
+
+            logger.info(
+                "Alpaca submit_order request client_order_id=%s payload=%s",
+                client_order_id,
+                request_payload,
+            )
+
+            trading_client = self._ensure_trading_client()
+            response_any: Any = trading_client.submit_order(order_data=order_request)
+
+            logger.info(
+                "Alpaca submit_order response client_order_id=%s alpaca_order_id=%s status=%s",
+                client_order_id,
+                getattr(response_any, "id", None) if not isinstance(response_any, dict) else response_any.get("id"),
+                getattr(response_any, "status", None) if not isinstance(response_any, dict) else response_any.get("status"),
+            )
+
+            if isinstance(response_any, dict):
+                raise TypeError(
+                    "Alpaca submit_order returned raw dict payload. "
+                    "This violates the broker contract. "
+                    f"payload_keys={list(response_any.keys())}"
                 )
+
+            return cast("AlpacaOrder", response_any)
+
