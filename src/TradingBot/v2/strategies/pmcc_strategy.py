@@ -87,7 +87,7 @@ class _Candidate:
 
 
 @dataclass(frozen=True)
-class PmccStrategyV2(Strategy):
+class PmccStrategy(Strategy):
     """
     Poor Man's Covered Call (PMCC) strategy (V2).
 

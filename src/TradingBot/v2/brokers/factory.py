@@ -3,11 +3,12 @@ from TradingBot.v2.brokers.alpaca_factory import build_alpaca_broker
 
 from TradingBot.v2.logger import setup_logger
 from TradingBot.v2.logging_utils import log_scope
+from TradingBot.v2.brokers.broker_interface import BrokerInterface
 
 logger = setup_logger("Broker Factory")
 
 
-def build_broker(name: str):
+def build_broker(name: str) -> BrokerInterface:
     """
     Construct a broker adapter based on the provided name.
 

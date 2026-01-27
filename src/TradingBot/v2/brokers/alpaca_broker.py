@@ -14,7 +14,6 @@ from requests import Session
 from requests.adapters import HTTPAdapter
 
 from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
 from TradingBot.v2.brokers.errors import BrokerConnectionError
 from TradingBot.v2.domain.types import AssetQuote, ClientOrderId
 from TradingBot.v2.logger import setup_logger
@@ -33,7 +32,7 @@ if TYPE_CHECKING:
     from alpaca.trading.models import Order as AlpacaOrder
     
 @dataclass
-class AlpacaBroker(BrokerInterface):
+class AlpacaBroker:
     """
     Alpaca broker adapter for TradingBot V2.
 
