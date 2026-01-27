@@ -26,6 +26,10 @@ from TradingBot.v2.app.scheduler import SchedulerV2, SchedulerConfig
 
 logger = setup_logger("Main")
 
+# The _STOP_REQUESTED event is set when a SIGINT is received, and serves as a signal to gracefully stop operations.
+#_LAST_SIGINT_TS records the timestamp of the last SIGINT to handle double interrupts.
+# SIGINT is a keyboard interrupt (Ctrl+C).
+
 _STOP_REQUESTED = Event()
 _LAST_SIGINT_TS: float = 0.0
 
@@ -223,3 +227,6 @@ def main() -> None:
 
         logger.info("Start scheduler.run_forever | cycle_seconds=%s", cycle_seconds)
         scheduler.run_forever()
+
+if __name__ == "__main__":
+    main()

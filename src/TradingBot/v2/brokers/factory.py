@@ -1,4 +1,3 @@
-from TradingBot.v2.brokers.fake_factory import build_fake_broker
 from TradingBot.v2.brokers.alpaca_factory import build_alpaca_broker
 
 from TradingBot.v2.logger import setup_logger
@@ -26,8 +25,7 @@ def build_broker(name: str) -> BrokerInterface:
             broker = build_alpaca_broker()
             logger.info("Alpaca broker constructed | type=%s", type(broker).__name__)
             return broker
+        
+    raise ValueError(f"Unsupported broker name: {name!r}")
 
-        logger.info("Selected Fake broker (default)")
-        broker = build_fake_broker()
-        logger.info("Fake broker constructed | type=%s", type(broker).__name__)
-        return broker
+
