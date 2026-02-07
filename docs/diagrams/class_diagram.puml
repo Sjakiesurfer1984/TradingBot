@@ -1,0 +1,300 @@
+@startuml
+title TradingBot  - Class diagram (SOLID + ABC enforcement)
+
+left to right direction
+skinparam classAttributeIconSize 0
+
+package "composition" {
+  class Main <<module>> {
+    +main() : None
+  }
+
+  interface ConfigResolverABC <<abstract>> {
+    +load_runtime_config() : RuntimeConfig
+    +load_app_config() : AppConfig
+    +resolve_run_mode(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RunMode
+    +resolve_scheduler_config() : SchedulerConfig
+  }
+
+  class EnvConfigResolver {
+    +load_runtime_config() : RuntimeConfig
+    +load_app_config() : AppConfig
+    +resolve_run_mode(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RunMode
+    +resolve_scheduler_config() : SchedulerConfig
+  }
+
+  interface BrokerFactoryABC <<abstract>> {
+    +build(app_cfg : AppConfig) : BrokerABC
+  }
+
+  class BrokerFactory {
+    -registry : dict
+    +build(app_cfg : AppConfig) : BrokerABC
+    +register(name : str, builder : BrokerBuilderABC) : None
+  }
+
+  interface BrokerBuilderABC <<abstract>> {
+    +build(app_cfg : AppConfig) : BrokerABC
+  }
+
+  class AlpacaBrokerBuilder {
+    +build(app_cfg : AppConfig) : BrokerABC
+  }
+
+  class FakeBrokerBuilder {
+    +build(app_cfg : AppConfig) : BrokerABC
+  }
+
+  interface RiskEngineFactoryABC <<abstract>> {
+    +build(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RiskEngineABC
+  }
+
+  class RiskEngineFactory {
+    +build(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RiskEngineABC
+  }
+
+  interface StrategyFactoryABC <<abstract>> {
+    +build(runtime_cfg : RuntimeConfig) : list<StrategyABC>
+  }
+
+  class StrategyFactory {
+    +build(runtime_cfg : RuntimeConfig) : list<StrategyABC>
+  }
+}
+
+package "scheduling" {
+  class SchedulerConfig {
+    +cycle_seconds : float
+  }
+
+  class Scheduler {
+    -orchestrator : OrchestratorABC
+    -config : SchedulerConfig
+    +run_forever() : None
+  }
+}
+
+package "orchestration" {
+  enum RunMode {
+    LIVE
+    DRY_RUN
+  }
+
+  interface OrchestratorABC <<abstract>> {
+    +run_cycle() : None
+  }
+
+  class Orchestrator {
+    -broker : BrokerABC
+    -strategies : list<StrategyABC>
+    -risk_engine : RiskEngineABC
+    -run_mode : RunMode
+    +run_cycle() : None
+    -build_risk_context() : RiskContext
+    -collect_intents(ctx : RiskContext) : list<TradeIntent>
+    -evaluate(ctx : RiskContext, intents : list<TradeIntent>) : list<RiskDecision>
+    -submit(decisions : list<RiskDecision>) : None
+  }
+
+  class RiskContext {
+    +as_of_utc : datetime
+    +option_buying_power : float
+    +equity : float
+    +positions : dict
+    +open_orders : list
+    +prices : dict
+    +option_chains : dict
+    +get_price(symbol : str) : float
+  }
+}
+
+package "strategies" {
+  interface StrategyABC <<abstract>> {
+    +strategy_id : str
+    +generate_intents(ctx : RiskContext) : list<TradeIntent>
+  }
+
+  class PmccStrategy {
+    +strategy_id : str
+    +generate_intents(ctx : RiskContext) : list<TradeIntent>
+  }
+
+  class TradeIntent {
+    +intent_id : str
+    +strategy_id : str
+    +symbol : str
+    +payload : IntentPayloadABC
+    +time_in_force : str
+    +tags : tuple
+  }
+
+  interface IntentPayloadABC <<abstract>>
+
+  class PmccIntentPayload {
+    +underlying_symbol : str
+    +leap : SelectedOption
+    +near : SelectedOption
+  }
+
+  class SelectedOption {
+    +option_symbol : str
+    +ask_price : float
+    +bid_price : float
+    +delta : float
+    +dte : int
+  }
+}
+
+package "risk" {
+  interface RiskEngineABC <<abstract>> {
+    +evaluate(ctx : RiskContext, intents : list<TradeIntent>) : list<RiskDecision>
+  }
+
+  class RiskEngine {
+    -rules : list<RiskRuleABC>
+    +evaluate(ctx : RiskContext, intents : list<TradeIntent>) : list<RiskDecision>
+  }
+
+  interface RiskRuleABC <<abstract>> {
+    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
+  }
+
+  class RuleResult {
+    +status : RuleStatus
+    +reason : str
+    +amendment : IntentAmendment
+  }
+
+  enum RuleStatus {
+    PASS
+    REJECT
+    AMEND
+  }
+
+  class IntentAmendment {
+    +allocation : AllocationDecision
+    +sizing : SizingDecision
+  }
+
+  class AllocationDecision {
+    +intent_id : str
+    +max_risk_dollars : float
+    +max_contracts_cap : int
+  }
+
+  class SizingDecision {
+    +intent_id : str
+    +quantity : int
+    +limit_price : float
+  }
+
+  class OpenOrderRule {
+    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
+  }
+
+  class AllocationRule {
+    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
+  }
+
+  class SizingRule {
+    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
+  }
+
+  class RiskDecision {
+    +approved : ApprovedOrder
+    +rejected : RejectedIntent
+  }
+
+  class ApprovedOrder {
+    +intent_id : str
+    +client_order_id : str
+    +order : MultiLegLimitOrder
+  }
+
+  class RejectedIntent {
+    +intent_id : str
+    +reason : str
+  }
+}
+
+package "brokers" {
+  interface BrokerABC <<abstract>> {
+    +get_account_snapshot() : dict
+    +get_positions() : list
+    +get_open_orders() : list
+    +get_asset_quote(symbol : str) : dict
+    +get_option_chain(underlying : str) : list
+    +submit_order(order : MultiLegLimitOrder, client_order_id : str) : str
+  }
+
+  class MultiLegLimitOrder {
+    +symbol : str
+    +legs : list<OrderLeg>
+    +quantity : int
+    +limit_price : float
+    +time_in_force : str
+  }
+
+  class OrderLeg {
+    +option_symbol : str
+    +side : str
+    +ratio : int
+  }
+}
+
+package "config" {
+  class RuntimeConfig {
+    +default_run_mode : RunMode
+    +strategies : list
+  }
+
+  class AppConfig {
+    +broker_name : str
+    +broker_mode : str
+  }
+}
+
+Main ..> ConfigResolverABC : uses
+ConfigResolverABC <|.. EnvConfigResolver
+
+Main ..> BrokerFactoryABC : uses
+BrokerFactoryABC <|.. BrokerFactory
+BrokerFactory ..> BrokerBuilderABC : registry
+BrokerBuilderABC <|.. AlpacaBrokerBuilder
+BrokerBuilderABC <|.. FakeBrokerBuilder
+
+Main ..> RiskEngineFactoryABC : uses
+RiskEngineFactoryABC <|.. RiskEngineFactory
+Main ..> StrategyFactoryABC : uses
+StrategyFactoryABC <|.. StrategyFactory
+
+Main ..> Scheduler : constructs
+Scheduler ..> OrchestratorABC : calls
+
+OrchestratorABC <|.. Orchestrator
+Orchestrator --> BrokerABC : IO boundary
+Orchestrator --> StrategyABC : generates intents
+Orchestrator --> RiskEngineABC : evaluates
+
+StrategyABC <|.. PmccStrategy
+TradeIntent --> IntentPayloadABC : payload
+IntentPayloadABC <|.. PmccIntentPayload
+PmccIntentPayload --> SelectedOption
+
+RiskEngineABC <|.. RiskEngine
+RiskEngine --> RiskRuleABC : pipeline
+RiskRuleABC <|.. OpenOrderRule
+RiskRuleABC <|.. AllocationRule
+RiskRuleABC <|.. SizingRule
+
+ApprovedOrder --> MultiLegLimitOrder
+MultiLegLimitOrder --> OrderLeg
+
+note right of Orchestrator
+Hard invariant:
+- Only Orchestrator calls BrokerABC.
+- Strategies never submit orders.
+- RiskEngine is sole authority on sizing/allocation.
+end note
+
+@enduml

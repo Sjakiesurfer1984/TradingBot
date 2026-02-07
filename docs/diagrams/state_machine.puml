@@ -1,0 +1,47 @@
+@startuml
+title TradingBot - Scheduler + cycle state machine
+
+hide empty description
+
+[*] --> Boot
+
+Boot --> BuildDependencies : main() wires app
+BuildDependencies --> Running : scheduler.run_forever()
+
+state Running {
+  [*] --> Idle
+
+  Idle --> BuildSnapshot : tick
+
+  BuildSnapshot --> GenerateIntents : RiskContext built
+  GenerateIntents --> EvaluateRisk : intents collected
+  EvaluateRisk --> DecideSubmit : decisions returned
+
+  DecideSubmit --> DryRunLog : run_mode == DRY_RUN
+  DecideSubmit --> SubmitOrders : run_mode == LIVE
+
+  DryRunLog --> Sleep
+  SubmitOrders --> Sleep
+
+  Sleep --> Idle : after cycle_seconds
+
+  BuildSnapshot --> CycleError : broker read failed
+  GenerateIntents --> CycleError : strategy failed
+  EvaluateRisk --> CycleError : risk evaluation failed
+  SubmitOrders --> CycleError : broker submit failed
+
+  CycleError --> Sleep : log error, continue
+}
+
+Running --> Shutdown : SIGINT/SIGTERM
+Shutdown --> [*]
+
+note right of Running
+Scenarios accounted for:
+- DRY_RUN executes full pipeline but never submits.
+- Partial approvals: some orders submitted, some rejected.
+- No intents: EvaluateRisk runs on empty list, no submit.
+- CycleError: cycle logs failure and continues next tick.
+end note
+
+@enduml

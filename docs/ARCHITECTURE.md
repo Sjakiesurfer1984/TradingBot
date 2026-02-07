@@ -15,7 +15,7 @@ This is a design contract, not just documentation.
 
 ---
 
-## 1. Core philosophy (Option C)
+## 1. Core philosophy
 
 TradingBot V2 follows a request -> evaluate -> execute model.
 
@@ -30,7 +30,7 @@ TradingBot V2 follows a request -> evaluate -> execute model.
 * Strategies never query account state directly
 * Risk is the single authority on capital allocation
 
-If any of the above is violated, Option C has failed.
+If any of the above is violated, the programme has failed.
 
 ---
 

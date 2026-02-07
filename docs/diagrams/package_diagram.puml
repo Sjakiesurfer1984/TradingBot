@@ -1,0 +1,47 @@
+@startuml
+title TradingBot - Package diagram (dependency direction)
+
+skinparam packageStyle rectangle
+left to right direction
+
+package composition
+package config
+package scheduling
+package orchestration
+package strategies
+package risk
+package brokers
+
+composition ..> config
+composition ..> brokers
+composition ..> risk
+composition ..> strategies
+composition ..> orchestration
+composition ..> scheduling
+
+scheduling ..> orchestration
+
+orchestration ..> brokers
+orchestration ..> risk
+orchestration ..> strategies
+orchestration ..> config
+
+risk ..> strategies
+risk ..> orchestration
+
+strategies ..> orchestration
+
+brokers ..> config
+
+note right of composition
+Composition root:
+Only place where concrete implementations
+are chosen and assembled.
+end note
+
+note right of orchestration
+IO boundary enforced here:
+Orchestrator is the only broker caller.
+end note
+
+@enduml
