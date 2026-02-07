@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.orchestrator import Orchestrator
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.orchestration.orchestrator import Orchestrator
 
 logger = setup_logger("Scheduler")
 
@@ -22,7 +22,7 @@ class SchedulerConfig:
     cycle_seconds: float
 
 
-class SchedulerV2:
+class Scheduler:
     """
     Very small scheduler for running Option C cycles repeatedly.
 

@@ -24,20 +24,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
+from TradingBot.brokers.account_snapshot import AccountSnapshot
+from TradingBot.brokers.broker_interface import BrokerInterface
 
-from TradingBot.v2.context import RiskContext
-from TradingBot.v2.domain.types import AssetQuote, OptionChainRequest, Symbol, normalise_symbol
-from TradingBot.v2.intents import TradeIntent
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-from TradingBot.v2.risk.decisions import RiskDecision
-from TradingBot.v2.risk.price_policy import DefaultPriceSelectionPolicy, PriceSelectionPolicy
-from TradingBot.v2.risk.risk_engine import RiskEngine
-from TradingBot.v2.strategies.strategy_interface import Strategy
+from TradingBot.orchestration.context import RiskContext
+from TradingBot.domain.types import AssetQuote, OptionChainRequest, Symbol, normalise_symbol
+from TradingBot.domain.intents import TradeIntent
 
-from TradingBot.v2.cycle_plan import CyclePlan, build_cycle_plan
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+from TradingBot.risk.decisions import RiskDecision
+from TradingBot.risk.price_policy import DefaultPriceSelectionPolicy, PriceSelectionPolicy
+from TradingBot.risk.risk_engine import RiskEngine
+from TradingBot.strategies.strategy_interface import Strategy
+
+from TradingBot.orchestration.cycle_plan import CyclePlan, build_cycle_plan
 
 
 logger = setup_logger("Orchestrator")

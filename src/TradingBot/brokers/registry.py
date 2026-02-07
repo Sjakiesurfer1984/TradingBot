@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict
 
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
+from TradingBot.brokers.broker_interface import BrokerInterface
 
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
 
 logger = setup_logger("Broker Registry")
 

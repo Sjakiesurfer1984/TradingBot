@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, TypeVar
 
-from TradingBot.v2.context import RiskContext
-from TradingBot.v2.pmcc_sizer import parse_osi
-from TradingBot.v2.domain.orders import (
+from TradingBot.orchestration.context import RiskContext
+from TradingBot.risk.pmcc_sizer import parse_osi, PmccSizer
+
+from TradingBot.domain.orders import (
     MultiLegLimitOrder,
     OptionContract,
     OptionLeg as DomainOptionLeg,
@@ -14,13 +15,15 @@ from TradingBot.v2.domain.orders import (
     OptionRight,
     TimeInForce,
 )
-from TradingBot.v2.domain.types import ClientOrderId, Symbol, normalise_symbol
-from TradingBot.v2.intents import PmccIntentPayload, TradeIntent
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-from TradingBot.v2.risk.decisions import ApprovedOrder, RejectedIntent, RiskDecision
-from TradingBot.v2.pmcc_sizer import PmccSizer
-from TradingBot.v2.risk.rules.open_order_rule import OpenOrderDedupeRule
+
+from TradingBot.domain.types import ClientOrderId, Symbol, normalise_symbol
+from TradingBot.domain.intents import PmccIntentPayload, TradeIntent
+
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.risk.decisions import ApprovedOrder, RejectedIntent, RiskDecision
+from TradingBot.risk.rules.open_order_rule import OpenOrderDedupeRule
 
 logger = setup_logger("RiskEngine")
 
@@ -66,7 +69,7 @@ class RiskEngine:
             )
             return decision
 
-    def _approve(self, *, intent: TradeIntent, order: TOrder) -> RiskDecision:
+    def _approve(self, *, intent: TradeIntent, order: object) -> RiskDecision:
         with log_scope(
             "risk_engine._approved",
             logger,

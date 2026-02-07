@@ -4,7 +4,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
-from TradingBot.v2.logger import setup_logger
+from TradingBot.utilities.logger import setup_logger
 
 logger = setup_logger("LoggingUtils")
 

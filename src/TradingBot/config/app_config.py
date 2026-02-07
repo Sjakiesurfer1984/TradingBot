@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from TradingBot.v2.config.risk_config import RiskConfig
-from TradingBot.v2.config.strategy_configs import StrategySpec
+from TradingBot.config.risk_config import RiskConfig
+from TradingBot.config.strategy_config import StrategySpec
 
 
 @dataclass(frozen=True)

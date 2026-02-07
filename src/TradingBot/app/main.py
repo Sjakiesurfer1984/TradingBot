@@ -9,19 +9,24 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
-from TradingBot.v2.brokers.factory import build_broker
-from TradingBot.v2.config.runtime_config import RuntimeConfig, load_runtime_config
-from TradingBot.v2.config.settings import load_app_config_from_env
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-from TradingBot.v2.orchestrator import Orchestrator
-from TradingBot.v2.pmcc_sizer import PmccSizer, PmccSizingConfig
-from TradingBot.v2.risk.risk_engine import RiskEngine
-from TradingBot.v2.risk.rules.open_order_rule import OpenOrderDedupeRule
-from TradingBot.v2.strategies.pmcc_strategy import PmccStrategy
-from TradingBot.v2.strategies.strategy_interface import Strategy
-from TradingBot.v2.app.scheduler import SchedulerV2, SchedulerConfig
+from TradingBot.brokers.broker_interface import BrokerInterface
+from TradingBot.brokers.factory import build_broker
+
+from TradingBot.config.runtime_config import RuntimeConfig, load_runtime_config
+from TradingBot.config.settings import load_app_config_from_env
+
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.orchestration.orchestrator import Orchestrator
+from TradingBot.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
+from TradingBot.risk.risk_engine import RiskEngine
+from TradingBot.risk.rules.open_order_rule import OpenOrderDedupeRule
+
+from TradingBot.strategies.pmcc_strategy import PmccStrategy
+from TradingBot.strategies.strategy_interface import Strategy
+
+from TradingBot.app.scheduler import SchedulerConfig, Scheduler
 
 
 logger = setup_logger("Main")
@@ -220,7 +225,7 @@ def main() -> None:
         logger.info("Orchestrator built | type=%s", type(orchestrator).__name__)
 
         cycle_seconds: float = float(os.getenv("TBOT_CYCLE_SECONDS", "60"))
-        scheduler: SchedulerV2 = SchedulerV2(
+        scheduler: Scheduler = Scheduler(
             orchestrator=orchestrator,
             config=SchedulerConfig(cycle_seconds=cycle_seconds),
         )

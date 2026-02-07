@@ -1,28 +1,30 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TypeVar, TYPE_CHECKING, cast
-from decimal import ROUND_HALF_UP, Decimal
-
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
-from TradingBot.v2.domain.orders import MultiLegLimitOrder, OptionLeg as DomainOptionLeg, OrderSide as DomainOrderSide, TimeInForce as DomainTIF
-
+import json
+import os
 import time
-from datetime import date, datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Dict, List, Optional, TypeVar, TYPE_CHECKING, cast
 
 import requests
 from requests import Session
 from requests.adapters import HTTPAdapter
 
-from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.broker_base import BrokerBase
-from TradingBot.v2.brokers.errors import BrokerConnectionError
-from TradingBot.v2.domain.types import AssetQuote, ClientOrderId
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
+from TradingBot.brokers.account_snapshot import AccountSnapshot
 
-import json
-import os
+from TradingBot.brokers.errors import BrokerConnectionError
+from TradingBot.domain.orders import (
+    MultiLegLimitOrder,
+    OptionLeg as DomainOptionLeg,
+    OrderSide as DomainOrderSide,
+    TimeInForce as DomainTIF,
+)
+from TradingBot.domain.types import AssetQuote, ClientOrderId
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+from TradingBot.brokers.broker_interface import BrokerABC
 
 logger = setup_logger("AlpacaBroker")
 
@@ -32,11 +34,12 @@ if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import OrderRequest
     from alpaca.trading.models import Order as AlpacaOrder
+
     
 @dataclass
-class AlpacaBroker(BrokerBase, BrokerInterface):
+class AlpacaBroker(BrokerABC):
     """
-    Alpaca broker adapter for TradingBot V2.
+    Alpaca broker adapter for TradingBot.
 
     What this file optimises for
     - Strictly bounded network IO where possible using timeouts.
@@ -812,7 +815,7 @@ class AlpacaBroker(BrokerBase, BrokerInterface):
 
             return chain
         
-    def submit_order(self, order: TOrder) -> "AlpacaOrder":
+    def submit_order(self, order: object) -> "AlpacaOrder":
         """
         Submit an order to Alpaca.
 
@@ -870,3 +873,129 @@ class AlpacaBroker(BrokerBase, BrokerInterface):
 
             return cast("AlpacaOrder", response_any)
 
+
+
+    # ---------------------------------------------------------------------
+    # Market data convenience methods required by MarketDataProviderABC
+    # ---------------------------------------------------------------------
+
+    def get_latest_price(self, symbol: str) -> float:
+        """
+        Return a single representative price for the symbol.
+
+        Implementation choice:
+        - Use AssetQuote mid if available.
+        - Fall back to ask, then bid.
+        """
+        self._log_io_boundary("get_latest_price")
+        with log_scope("broker.get_latest_price", logger, extra=f"symbol={symbol}"):
+            q: AssetQuote = self.get_asset_quote(symbol)
+
+            mid = getattr(q, "mid", None)
+            if isinstance(mid, (int, float)) and float(mid) > 0.0:
+                return float(mid)
+
+            ask = getattr(q, "ask", None)
+            if isinstance(ask, (int, float)) and float(ask) > 0.0:
+                return float(ask)
+
+            bid = getattr(q, "bid", None)
+            if isinstance(bid, (int, float)) and float(bid) > 0.0:
+                return float(bid)
+
+            raise BrokerConnectionError(
+                broker_name="alpaca",
+                message=f"No usable price for symbol={symbol!r}",
+            )
+
+    def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
+        """
+        Fetch daily OHLCV bars.
+
+        Return type is Any by design (interface choice).
+        This implementation returns the raw Alpaca response dict.
+        """
+        self._log_io_boundary("get_daily_bars")
+
+        sym: str = symbol.strip().upper()
+        if not sym:
+            raise ValueError("symbol must be a non-empty string")
+
+        if lookback_days <= 0:
+            raise ValueError("lookback_days must be > 0")
+
+        # Alpaca stock bars endpoint
+        url: str = f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+
+        # Alpaca expects RFC3339 timestamps. We use UTC and request N calendar days.
+        # This is sufficient for your current bot usage. If you later need trading-day
+        # precision, we can integrate an exchange calendar.
+        end_utc: datetime = datetime.now(timezone.utc)
+        start_utc: datetime = end_utc - timedelta(days=int(lookback_days) + 5)
+
+        params: Dict[str, Any] = {
+            "timeframe": "1Day",
+            "start": start_utc.isoformat(),
+            "end": end_utc.isoformat(),
+            "adjustment": "raw",
+            "feed": "iex",
+            "limit": 1000,
+        }
+
+        with log_scope("broker.get_daily_bars", logger, extra=f"symbol={sym}"):
+            logger.info("Broker call get_daily_bars symbol=%s lookback_days=%d", sym, int(lookback_days))
+            data_any: Any = self._request_json_url("GET", url, params=params)
+
+            if not isinstance(data_any, dict):
+                raise BrokerConnectionError(
+                    broker_name="alpaca",
+                    message=f"Unexpected bars response type for {sym}: {type(data_any).__name__}",
+                )
+
+            return data_any
+
+    # ---------------------------------------------------------------------
+    # Execution methods required by ExecutionBrokerABC
+    # ---------------------------------------------------------------------
+
+    def cancel_order(self, order_id: str) -> None:
+        self._log_io_boundary("cancel_order")
+
+        oid: str = str(order_id).strip()
+        if not oid:
+            raise ValueError("order_id must be a non-empty string")
+
+        with log_scope("broker.cancel_order", logger, extra=f"order_id={oid}"):
+            logger.info("Broker call cancel_order order_id=%s", oid)
+            self._request_json("DELETE", f"/orders/{oid}")
+            logger.info("Broker result cancel_order order_id=%s ok=true", oid)
+
+    def get_account(self) -> Any:
+        """
+        Return the raw broker account payload.
+        """
+        self._log_io_boundary("get_account")
+        with log_scope("broker.get_account", logger):
+            return self._request_json("GET", "/account")
+
+    def list_open_orders(self) -> list[Any]:
+        """
+        Return raw open orders payload.
+        """
+        self._log_io_boundary("list_open_orders")
+        with log_scope("broker.list_open_orders", logger):
+            orders: Any = self._request_json("GET", "/orders", params={"status": "open"})
+            if isinstance(orders, list):
+                return orders
+            return []
+
+    def list_positions(self) -> list[Any]:
+        """
+        Return raw positions payload.
+        """
+        self._log_io_boundary("list_positions")
+        with log_scope("broker.list_positions", logger):
+            positions: Any = self._request_json("GET", "/positions")
+            if isinstance(positions, list):
+                return positions
+            return []

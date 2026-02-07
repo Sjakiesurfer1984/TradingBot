@@ -20,7 +20,7 @@ from typing import Optional, Sequence
 
 # Symbol is a domain type representing a canonicalised underlying symbol.
 # We use it here so "SPY", " spy ", and "Spy" get treated as the same canonical thing.
-from TradingBot.v2.domain.types import Symbol, ClientOrderId
+from TradingBot.domain.types import Symbol, ClientOrderId
 
 class OrderSide(str, Enum):
     """

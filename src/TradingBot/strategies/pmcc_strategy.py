@@ -3,24 +3,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from TradingBot.domain.orders import TimeInForce
+from TradingBot.orchestration.context import RiskContext
 
-from TradingBot.v2.context import RiskContext
-from TradingBot.v2.domain.ids import make_intent_id
-from TradingBot.v2.domain.types import IntentId, OptionChainRequest, StrategyId, Symbol, normalise_symbol
-from TradingBot.v2.intents import (
+from TradingBot.domain.ids import make_intent_id
+from TradingBot.domain.types import (
+    IntentId,
+    OptionChainRequest,
+    StrategyId,
+    Symbol,
+    normalise_symbol,
+)
+
+from TradingBot.domain.intents import (
     OrderSide,
     OptionLeg,
     PmccIntentPayload,
     SelectedOption,
     TradeIntent,
 )
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-from TradingBot.v2.strategies.strategy_interface import Strategy
+
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.strategies.strategy_interface import Strategy
 
 logger = setup_logger("PMCC Strategy")
 
-
+# WHy is this defined here?
 def _parse_iso8601_utc(ts: Any) -> Optional[datetime]:
     """
     Parse ISO8601 timestamps produced by brokers, typically ending in 'Z'.
@@ -354,7 +364,7 @@ class PmccStrategy(Strategy):
                 strategy_id=self.strategy_id,
                 symbol=underlying,
                 payload=payload,
-                time_in_force="day",
+                time_in_force=TimeInForce.DAY,
                 tags=tags,
             )
 

@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Union, Optional, Protocol
+from typing import Tuple, Optional
 from datetime import datetime
-from TradingBot.v2.domain.orders import TimeInForce
-from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
+from TradingBot.domain.orders import TimeInForce
+from TradingBot.domain.types import IntentId, StrategyId, Symbol
+
+
+class IntentPayloadABC(ABC):
+    # The @property decorator lets us access the method like an attribute (object.primary_symbol, vs. object.primary_symbol() ).
+    # This:
+    # - Protects our API from future change, if we later decide to add some code to the primary_symbol method
+    @abstractmethod
+    def primary_symbol(self) -> Symbol:
+        """
+        Primary symbol for dedupe and exposure checks.
+
+        Examples
+        - PMCC: underlying_symbol
+        - Single option: underlying_symbol
+        - Equity: symbol
+        """
+        raise NotImplementedError
+
 
 class OrderSide(Enum):
     """
@@ -30,6 +50,7 @@ class SelectedOption:
     # Option chain metadata (broker-agnostic)
     feed: str = "indicative"  # "opra" or "indicative"
     chain_newest_ts_utc: Optional[datetime] = None
+
 @dataclass(frozen=True)
 class OptionLeg:
     """
@@ -46,7 +67,7 @@ class OptionLeg:
 
 
 @dataclass(frozen=True)
-class PmccIntentPayload:
+class PmccIntentPayload(IntentPayloadABC):
     """
     Payload for a Poor Man's Covered Call (PMCC).
 
@@ -54,14 +75,18 @@ class PmccIntentPayload:
     - BUY a long-dated call option (LEAP).
     - SELL a shorter-dated call option (near-term) against that LEAP.
     """
-
     underlying_symbol: Symbol
     leap_leg: OptionLeg
     near_leg: OptionLeg
 
+    @property
+    def primary_symbol(self) -> Symbol:
+        return self.underlying_symbol
+
+
 
 @dataclass(frozen=True)
-class EquityIntentPayload:
+class EquityIntentPayload(IntentPayloadABC):
     """
     Payload for equity-style intents (stocks and ETFs).
 
@@ -74,13 +99,16 @@ class EquityIntentPayload:
       If you later want strategies to request a quantity, add
       requested_quantity and let risk cap/override it.
     """
-
     symbol: Symbol
     side: OrderSide
 
+    @property
+    def primary_symbol(self) -> Symbol:
+        return self.symbol
+
 
 @dataclass(frozen=True)
-class SingleOptionIntentPayload:
+class SingleOptionIntentPayload(IntentPayloadABC):
     """
     Payload for a single-leg option intent (if you ever need it).
 
@@ -88,18 +116,15 @@ class SingleOptionIntentPayload:
     - BUY one call option
     - SELL one put option
     """
-
     underlying_symbol: Symbol
     leg: OptionLeg
 
+    @property
+    def primary_symbol(self) -> Symbol:
+        return self.underlying_symbol
 
-# Strategy-specific payload shapes supported by TradeIntent.
-# Extend this union as new strategies are added.
-IntentPayload = Union[
-    PmccIntentPayload,
-    EquityIntentPayload,
-    SingleOptionIntentPayload,
-]
+
+
 @dataclass(frozen=True)
 class TradeIntent:
     """
@@ -114,17 +139,9 @@ class TradeIntent:
     - No side effects.
     - No final quantity if sizing is risk-layer responsibility.
     """
-
     intent_id: IntentId
     strategy_id: StrategyId
-
-    # Primary symbol for dedupe and symbol-level exposure checks.
-    # For multi-leg options, this is usually the underlying.
     symbol: Symbol
-
-    payload: HasUnderlying
+    payload: IntentPayloadABC
     time_in_force: TimeInForce = TimeInForce.DAY
     tags: Tuple[str, ...] = ()
-
-class HasUnderlying(Protocol):
-    underlying_symbol: Symbol

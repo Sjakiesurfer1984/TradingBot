@@ -17,9 +17,9 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
 
-from TradingBot.v2.domain.types import AssetQuote
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
+from TradingBot.domain.types import AssetQuote
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
 
 
 logger = setup_logger("PricePolicy")

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from TradingBot.v2.domain.types import IntentId, StrategyId, Symbol
-from TradingBot.v2.logger import setup_logger
+from TradingBot.domain.types import IntentId, StrategyId, Symbol
+from TradingBot.utilities.logger import setup_logger
 logger = setup_logger("IDs")
 
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import NewType, Optional
 from datetime import date, datetime
 
-from TradingBot.v2.logger import setup_logger
+from TradingBot.utilities.logger import setup_logger
 logger = setup_logger("Types")
 
 

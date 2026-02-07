@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from TradingBot.v2.domain.types import AssetQuote, Symbol
-from TradingBot.v2.risk.price_policy import PriceSelectionPolicy, PriceSide
+from TradingBot.domain.types import AssetQuote, Symbol
+from TradingBot.risk.price_policy import PriceSelectionPolicy, PriceSide
 
 @dataclass(frozen=True)
 class RiskContext:

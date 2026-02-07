@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Generic, TypeVar
+
+from TradingBot.domain.types import ClientOrderId, IntentId, StrategyId
+
+from TradingBot.utilities.logger import setup_logger
+
 TOrder = TypeVar("TOrder")
-
-from TradingBot.v2.domain.orders import MultiLegLimitOrder
-from TradingBot.v2.domain.types import ClientOrderId, IntentId, StrategyId, ClientOrderId
-
-from TradingBot.v2.logger import setup_logger
 logger = setup_logger("Decisions")
 
 @dataclass(frozen=True)

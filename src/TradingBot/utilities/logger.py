@@ -1,6 +1,6 @@
 # src/TradingBot/v2/logger.py
 #
-# Central logging configuration for TradingBot V2.
+# Central logging configuration for TradingBot.
 #
 # Why this exists
 # - Ensures consistent formatting across all components.

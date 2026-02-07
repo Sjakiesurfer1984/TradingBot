@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 from typing import Optional, Tuple
 
-from TradingBot.v2.brokers.alpaca_broker import AlpacaBroker
-from TradingBot.v2.brokers.errors import MissingBrokerCredentialsError
+from TradingBot.brokers.alpaca_broker import AlpacaBroker
+from TradingBot.brokers.errors import MissingBrokerCredentialsError
 
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
 
 logger = setup_logger("Alpaca Factory")
 

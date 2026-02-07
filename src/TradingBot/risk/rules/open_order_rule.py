@@ -8,18 +8,17 @@ from dataclasses import dataclass
 # which are not under our control and may have inconsistent shapes.
 from typing import Any, Dict, Optional
 
-# RiskContext provides the immutable snapshot for this cycle.
-from TradingBot.v2.context import RiskContext
 
 # Symbol is the canonical domain type for asset identifiers.
-from TradingBot.v2.domain.types import Symbol, ClientOrderId
+from TradingBot.domain.types import Symbol, ClientOrderId
 
-# TradeIntent is the object produced by strategies and consumed by risk rules.
-from TradingBot.v2.intents import TradeIntent, PmccIntentPayload
-
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-
+from TradingBot.orchestration.context import RiskContext
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+from TradingBot.domain.intents import (
+    TradeIntent,
+    PmccIntentPayload,
+)
 logger = setup_logger("Open Order Rule")
 
 

@@ -25,20 +25,19 @@ from typing import List, Sequence
 
 # RiskContext is the only input into V2 strategies.
 # It is an immutable snapshot, which keeps the strategy deterministic.
-from TradingBot.v2.context import RiskContext
+from TradingBot.orchestration.context import RiskContext
 
-# TradeIntent is the output contract from V2 strategies.
+# TradeIntent is the output contract from strategies.
 # Intents describe what the strategy wants to do, not what it is allowed to do.
-from TradingBot.v2.intents import TradeIntent
+from TradingBot.domain.intents import TradeIntent
 
 # StrategyId and Symbol are core domain identifiers.
 # OptionChainRequest expresses what the orchestrator should fetch for option chain snapshots.
-from TradingBot.v2.domain.types import StrategyId, Symbol, OptionChainRequest, normalise_symbol
+from TradingBot.domain.types import StrategyId, Symbol, OptionChainRequest, normalise_symbol
 
-from TradingBot.v2.logger import setup_logger
+from TradingBot.utilities.logger import setup_logger
 
 logger = setup_logger("Strategy Interface")
-
 
 class Strategy(ABC):
     """

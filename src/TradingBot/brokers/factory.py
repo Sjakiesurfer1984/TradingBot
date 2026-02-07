@@ -1,8 +1,8 @@
-from TradingBot.v2.brokers.alpaca_factory import build_alpaca_broker
+from TradingBot.brokers.alpaca_factory import build_alpaca_broker
 
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
-from TradingBot.v2.brokers.broker_interface import BrokerInterface
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
+from TradingBot.brokers.broker_interface import BrokerInterface
 
 logger = setup_logger("Broker Factory")
 

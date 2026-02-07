@@ -1,8 +1,8 @@
 # src/TradingBot/v2/brokers/broker_base.py
 from __future__ import annotations
 
-from TradingBot.v2.logger import setup_logger
-from TradingBot.v2.logging_utils import log_scope
+from TradingBot.utilities.logger import setup_logger
+from TradingBot.utilities.logging_utils import log_scope
 
 logger = setup_logger("BrokerBase")
 

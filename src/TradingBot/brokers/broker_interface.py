@@ -1,24 +1,29 @@
-# src/TradingBot/v2/brokers/broker_interface.py
 from __future__ import annotations
 
-from abc import abstractmethod
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Protocol
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List
 
-from TradingBot.v2.brokers.account_snapshot import AccountSnapshot
-from TradingBot.v2.brokers.execution_broker import ExecutionBroker
-from TradingBot.v2.brokers.market_data_provider import MarketDataProvider
-from TradingBot.v2.domain.types import AssetQuote
+from TradingBot.brokers.account_snapshot import AccountSnapshot
+from TradingBot.brokers.broker_base import BrokerBase
+from TradingBot.brokers.execution_broker import ExecutionBrokerABC
+from TradingBot.brokers.market_data_provider import MarketDataProviderABC
 
 
-class BrokerInterface(MarketDataProvider, ExecutionBroker, Protocol):
+class BrokerABC(BrokerBase, MarketDataProviderABC, ExecutionBrokerABC, ABC):
     """
-    Runtime contract for broker adapters.
+    Full broker contract used by the Orchestrator.
 
-    Notes
-    - This is a Protocol: it defines required methods only.
-    - Do not implement shared logic here.
+    This composes:
+    - MarketDataProviderABC (market data)
+    - ExecutionBrokerABC (execution)
+    - plus account-state reads (equity, buying power, positions, open orders)
+
+    BrokerBase is included so all brokers share common utilities and logging.
     """
+
+    # -------------------------
+    # Account state (reads)
+    # -------------------------
 
     @abstractmethod
     def get_account_snapshot(self) -> AccountSnapshot:
@@ -40,40 +45,8 @@ class BrokerInterface(MarketDataProvider, ExecutionBroker, Protocol):
     def get_open_orders(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    @abstractmethod
-    def get_asset_quote(self, symbol: str) -> AssetQuote:
-        raise NotImplementedError
 
-    @abstractmethod
-    def get_option_chain(
-        self,
-        underlying: str,
-        *,
-        include_calls: bool = True,
-        include_puts: bool = False,
-        feed: str = "indicative",
-        max_age_seconds: int = 5,
-        limit: int = 0,
-        strike_price_gte: Optional[float] = None,
-        strike_price_lte: Optional[float] = None,
-        expiration_date: Optional[date] = None,
-        expiration_date_gte: Optional[date] = None,
-        expiration_date_lte: Optional[date] = None,
-        root_symbol: Optional[str] = None,
-        updated_since: Optional[datetime] = None,
-    ) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def submit_order(self, order: Any) -> Any:
-        raise NotImplementedError
-
-    @abstractmethod
-    def _log_io_boundary(self, method_name: str) -> None:
-        """
-        Optional but recommended to enforce in type checking.
-
-        This is declared here for typing only.
-        Implementation must live in a real base class (inside broker_base.py).
-        """
-        raise NotImplementedError
+# Transitional alias:
+# Keep existing imports working:
+# from TradingBot.brokers.broker_interface import BrokerInterface
+BrokerInterface = BrokerABC

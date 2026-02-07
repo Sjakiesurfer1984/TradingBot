@@ -1,15 +1,16 @@
 @startuml
-title TradingBot  - Class diagram (SOLID + ABC enforcement)
+title TradingBot - Class diagram (SOLID + ABC enforcement)
 
 left to right direction
 skinparam classAttributeIconSize 0
 
 package "composition" {
+
   class Main <<module>> {
     +main() : None
   }
 
-  interface ConfigResolverABC <<abstract>> {
+  abstract class ConfigResolverABC {
     +load_runtime_config() : RuntimeConfig
     +load_app_config() : AppConfig
     +resolve_run_mode(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RunMode
@@ -23,7 +24,11 @@ package "composition" {
     +resolve_scheduler_config() : SchedulerConfig
   }
 
-  interface BrokerFactoryABC <<abstract>> {
+  abstract class BrokerFactoryABC {
+    +build(app_cfg : AppConfig) : BrokerABC
+  }
+
+  abstract class BrokerBuilderABC {
     +build(app_cfg : AppConfig) : BrokerABC
   }
 
@@ -31,10 +36,6 @@ package "composition" {
     -registry : dict
     +build(app_cfg : AppConfig) : BrokerABC
     +register(name : str, builder : BrokerBuilderABC) : None
-  }
-
-  interface BrokerBuilderABC <<abstract>> {
-    +build(app_cfg : AppConfig) : BrokerABC
   }
 
   class AlpacaBrokerBuilder {
@@ -45,7 +46,7 @@ package "composition" {
     +build(app_cfg : AppConfig) : BrokerABC
   }
 
-  interface RiskEngineFactoryABC <<abstract>> {
+  abstract class RiskEngineFactoryABC {
     +build(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RiskEngineABC
   }
 
@@ -53,7 +54,7 @@ package "composition" {
     +build(runtime_cfg : RuntimeConfig, app_cfg : AppConfig) : RiskEngineABC
   }
 
-  interface StrategyFactoryABC <<abstract>> {
+  abstract class StrategyFactoryABC {
     +build(runtime_cfg : RuntimeConfig) : list<StrategyABC>
   }
 
@@ -62,7 +63,22 @@ package "composition" {
   }
 }
 
+package "config" {
+
+  class RuntimeConfig {
+    +default_run_mode : RunMode
+    +default_dry_run : bool
+    +strategies : list
+  }
+
+  class AppConfig {
+    +broker_name : str
+    +broker_mode : str
+  }
+}
+
 package "scheduling" {
+
   class SchedulerConfig {
     +cycle_seconds : float
   }
@@ -75,12 +91,13 @@ package "scheduling" {
 }
 
 package "orchestration" {
+
   enum RunMode {
     LIVE
     DRY_RUN
   }
 
-  interface OrchestratorABC <<abstract>> {
+  abstract class OrchestratorABC {
     +run_cycle() : None
   }
 
@@ -108,16 +125,7 @@ package "orchestration" {
   }
 }
 
-package "strategies" {
-  interface StrategyABC <<abstract>> {
-    +strategy_id : str
-    +generate_intents(ctx : RiskContext) : list<TradeIntent>
-  }
-
-  class PmccStrategy {
-    +strategy_id : str
-    +generate_intents(ctx : RiskContext) : list<TradeIntent>
-  }
+package "domain" {
 
   class TradeIntent {
     +intent_id : str
@@ -128,7 +136,7 @@ package "strategies" {
     +tags : tuple
   }
 
-  interface IntentPayloadABC <<abstract>>
+  abstract class IntentPayloadABC
 
   class PmccIntentPayload {
     +underlying_symbol : str
@@ -143,20 +151,48 @@ package "strategies" {
     +delta : float
     +dte : int
   }
+
+  class MultiLegLimitOrder {
+    +symbol : str
+    +legs : list<OrderLeg>
+    +quantity : int
+    +limit_price : float
+    +time_in_force : str
+  }
+
+  class OrderLeg {
+    +option_symbol : str
+    +side : str
+    +ratio : int
+  }
+}
+
+package "strategies" {
+
+  abstract class StrategyABC {
+    +strategy_id : str
+    +generate_intents(ctx : RiskContext) : list<TradeIntent>
+  }
+
+  class PmccStrategy {
+    +strategy_id : str
+    +generate_intents(ctx : RiskContext) : list<TradeIntent>
+  }
 }
 
 package "risk" {
-  interface RiskEngineABC <<abstract>> {
+
+  abstract class RiskEngineABC {
     +evaluate(ctx : RiskContext, intents : list<TradeIntent>) : list<RiskDecision>
+  }
+
+  abstract class RiskRuleABC {
+    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
   }
 
   class RiskEngine {
     -rules : list<RiskRuleABC>
     +evaluate(ctx : RiskContext, intents : list<TradeIntent>) : list<RiskDecision>
-  }
-
-  interface RiskRuleABC <<abstract>> {
-    +apply(ctx : RiskContext, intent : TradeIntent) : RuleResult
   }
 
   class RuleResult {
@@ -218,80 +254,76 @@ package "risk" {
 }
 
 package "brokers" {
-  interface BrokerABC <<abstract>> {
-    +get_account_snapshot() : dict
-    +get_positions() : list
-    +get_open_orders() : list
-    +get_asset_quote(symbol : str) : dict
-    +get_option_chain(underlying : str) : list
-    +submit_order(order : MultiLegLimitOrder, client_order_id : str) : str
+
+  abstract class MarketDataProviderABC {
+    +get_asset_quote(symbol : str) : AssetQuote
+    +get_daily_bars(symbol : str, lookback_days : int) : Any
+    +get_option_chain(underlying : str, ...) : list
   }
 
-  class MultiLegLimitOrder {
-    +symbol : str
-    +legs : list<OrderLeg>
-    +quantity : int
-    +limit_price : float
-    +time_in_force : str
+  abstract class ExecutionBrokerABC {
+    +submit_order(order : Any) : Any
+    +cancel_order(order_id : str) : None
+    +get_account() : Any
+    +list_open_orders() : list
+    +list_positions() : list
   }
 
-  class OrderLeg {
-    +option_symbol : str
-    +side : str
-    +ratio : int
-  }
+  abstract class BrokerABC
+  BrokerABC --|> MarketDataProviderABC
+  BrokerABC --|> ExecutionBrokerABC
+
+  class AlpacaBroker
+  class FakeBroker
+
+  AlpacaBroker --|> BrokerABC
+  FakeBroker --|> BrokerABC
 }
 
-package "config" {
-  class RuntimeConfig {
-    +default_run_mode : RunMode
-    +strategies : list
-  }
-
-  class AppConfig {
-    +broker_name : str
-    +broker_mode : str
-  }
+package "utilities" {
+  class Logger <<module>>
+  class LogScope <<module>>
 }
 
 Main ..> ConfigResolverABC : uses
-ConfigResolverABC <|.. EnvConfigResolver
+ConfigResolverABC <|-- EnvConfigResolver
 
 Main ..> BrokerFactoryABC : uses
-BrokerFactoryABC <|.. BrokerFactory
+BrokerFactoryABC <|-- BrokerFactory
 BrokerFactory ..> BrokerBuilderABC : registry
-BrokerBuilderABC <|.. AlpacaBrokerBuilder
-BrokerBuilderABC <|.. FakeBrokerBuilder
+BrokerBuilderABC <|-- AlpacaBrokerBuilder
+BrokerBuilderABC <|-- FakeBrokerBuilder
 
 Main ..> RiskEngineFactoryABC : uses
-RiskEngineFactoryABC <|.. RiskEngineFactory
+RiskEngineFactoryABC <|-- RiskEngineFactory
 Main ..> StrategyFactoryABC : uses
-StrategyFactoryABC <|.. StrategyFactory
+StrategyFactoryABC <|-- StrategyFactory
 
 Main ..> Scheduler : constructs
-Scheduler ..> OrchestratorABC : calls
+Scheduler ..> OrchestratorABC : triggers
 
-OrchestratorABC <|.. Orchestrator
+OrchestratorABC <|-- Orchestrator
 Orchestrator --> BrokerABC : IO boundary
-Orchestrator --> StrategyABC : generates intents
-Orchestrator --> RiskEngineABC : evaluates
+Orchestrator --> StrategyABC : calls
+Orchestrator --> RiskEngineABC : evaluate
+Orchestrator --> RiskContext : builds
 
-StrategyABC <|.. PmccStrategy
+StrategyABC <|-- PmccStrategy
 TradeIntent --> IntentPayloadABC : payload
-IntentPayloadABC <|.. PmccIntentPayload
+IntentPayloadABC <|-- PmccIntentPayload
 PmccIntentPayload --> SelectedOption
 
-RiskEngineABC <|.. RiskEngine
-RiskEngine --> RiskRuleABC : pipeline
-RiskRuleABC <|.. OpenOrderRule
-RiskRuleABC <|.. AllocationRule
-RiskRuleABC <|.. SizingRule
+RiskEngineABC <|-- RiskEngine
+RiskEngine ..> RiskRuleABC : pipeline
+RiskRuleABC <|-- OpenOrderRule
+RiskRuleABC <|-- AllocationRule
+RiskRuleABC <|-- SizingRule
 
 ApprovedOrder --> MultiLegLimitOrder
 MultiLegLimitOrder --> OrderLeg
 
 note right of Orchestrator
-Hard invariant:
+Hard invariants:
 - Only Orchestrator calls BrokerABC.
 - Strategies never submit orders.
 - RiskEngine is sole authority on sizing/allocation.
