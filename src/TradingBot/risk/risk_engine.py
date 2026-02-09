@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional
+
+from abc import ABC, abstractmethod
 
 from TradingBot.orchestration.context import RiskContext
 from TradingBot.risk.pmcc_sizer import parse_osi, PmccSizer
@@ -27,11 +29,13 @@ from TradingBot.risk.rules.open_order_rule import OpenOrderDedupeRule
 
 logger = setup_logger("RiskEngine")
 
-TOrder = TypeVar("TOrder")
-
+class RiskEngineABC(ABC):
+    @abstractmethod
+    def evaluate(self, ctx: RiskContext, intents: List[TradeIntent]) -> List[RiskDecision]:
+        raise NotImplementedError
 
 @dataclass(frozen=True)
-class RiskEngine:
+class RiskEngine(RiskEngineABC):
     """
     Central risk evaluation engine for V2 Option C.
 

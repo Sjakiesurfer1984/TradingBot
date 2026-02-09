@@ -1,31 +1,55 @@
-from TradingBot.brokers.alpaca_factory import build_alpaca_broker
+"""
+factory.py
 
+Purpose
+- Construct ONE BrokerABC instance based on AppConfig.
+- Factory contains NO broker-specific wiring.
+- Broker-specific wiring lives in builder classes registered in registry.py.
+
+UML contract
+main -> BrokerFactory -> BrokerRegistry -> BrokerBuilderABC -> ConcreteBuilder -> ConcreteBroker
+"""
+
+from __future__ import annotations
+
+from TradingBot.brokers.broker_interface import BrokerABC
+from TradingBot.brokers.registry import get_broker_builder
+from TradingBot.config.settings import AppConfig
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
-from TradingBot.brokers.broker_interface import BrokerInterface
 
-logger = setup_logger("Broker Factory")
+logger = setup_logger("BrokerFactory")
 
 
-def build_broker(name: str) -> BrokerInterface:
+def build_broker(*, app_cfg: AppConfig) -> BrokerABC:
     """
-    Construct a broker adapter based on the provided name.
+    Build and return the configured broker.
 
-    Why this exists
-    - Centralises broker selection logic.
-    - Prevents the orchestrator or main entrypoint from hard-coding broker types.
-    - Makes it easy to switch between fake and real brokers via configuration.
+    Contract
+    - app_cfg is loaded once at startup via load_app_config_from_env()
+    - broker selection uses app_cfg.broker_name
+    - registry decides which builder is responsible
+    - builder constructs and returns a concrete BrokerABC
     """
-    with log_scope("factory.build_broker", logger, extra=f"raw_name={name}"):
-        name_norm = (name or "fake").strip().lower()
-        logger.info("Normalised broker name | name_norm=%s", name_norm)
+    broker_name: str = str(app_cfg.broker_name).strip()
 
-        if name_norm == "alpaca":
-            logger.info("Selected Alpaca broker")
-            broker = build_alpaca_broker()
-            logger.info("Alpaca broker constructed | type=%s", type(broker).__name__)
-            return broker
-        
-    raise ValueError(f"Unsupported broker name: {name!r}")
+    with log_scope("brokers.factory.build_broker", logger, extra=f"broker_name={broker_name}"):
+        logger.info("Resolving broker builder | broker_name=%s", broker_name)
 
+        builder = get_broker_builder(broker_name)
 
+        logger.info(
+            "Broker builder resolved | broker_name=%s builder_type=%s",
+            broker_name,
+            type(builder).__name__,
+        )
+
+        broker: BrokerABC = builder.build(app_cfg)
+
+        logger.info(
+            "Broker constructed | broker_name=%s broker_type=%s",
+            broker_name,
+            type(broker).__name__,
+        )
+
+        return broker

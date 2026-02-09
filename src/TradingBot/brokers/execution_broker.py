@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, List
 
-
+from TradingBot.domain.orders import OrderABC
 class ExecutionBrokerABC(ABC):
     """
     Execution contract.
@@ -14,7 +14,7 @@ class ExecutionBrokerABC(ABC):
     """
 
     @abstractmethod
-    def submit_order(self, order: Any) -> Any:
+    def submit_order(self, order: OrderABC) -> object:
         raise NotImplementedError
 
     @abstractmethod

@@ -9,7 +9,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from TradingBot.brokers.broker_interface import BrokerInterface
+from TradingBot.brokers.broker_interface import BrokerABC
 from TradingBot.brokers.factory import build_broker
 
 from TradingBot.config.runtime_config import RuntimeConfig, load_runtime_config
@@ -203,7 +203,7 @@ def main() -> None:
         logger.info("Broker selected | name=%s", broker_name)
 
         with log_scope("build_broker", logger, extra=f"name={broker_name}"):
-            broker: BrokerInterface = build_broker(broker_name)
+            broker:  BrokerABC = build_broker(app_cfg=app_cfg)
 
         risk_engine: RiskEngine = _build_risk_engine()
         logger.info("Risk engine built | type=%s", type(risk_engine).__name__)

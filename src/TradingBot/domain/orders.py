@@ -1,6 +1,7 @@
 # src/TradingBot/v2/domain/orders.py
-
 from __future__ import annotations
+
+from abc import ABC
 
 # dataclass is used to define small immutable value objects with minimal boilerplate.
 from dataclasses import dataclass
@@ -18,10 +19,37 @@ from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Sequence
 
+
 # Symbol is a domain type representing a canonicalised underlying symbol.
 # We use it here so "SPY", " spy ", and "Spy" get treated as the same canonical thing.
 from TradingBot.domain.types import Symbol, ClientOrderId
 
+'''
+The Domain layer, of which orders.py is part, defines value objects and a domain aggregate that the rest of the bot can rely on.
+Domain is everything of "the world we operate in". 
+A) Domain model / value objects
+OptionContract, OptionLeg are value objects (immutable dataclasses).
+They exist to represent business concepts in a broker-agnostic way.
+
+B) Aggregate-style object
+MultiLegLimitOrder is effectively an aggregate (it contains legs, which contain contracts).
+It is “execution-ready” domain data.
+
+C) Enum as a constraint mechanism
+OrderSide, OptionRight, TimeInForce use enums to prevent magic strings.
+
+'''
+class OrderABC(ABC):
+    """
+    Base type for all executable domain orders.
+
+    Contract
+    - Broker.submit_order accepts OrderABC, not broker-specific objects.
+    - Concrete subclasses represent specific order kinds.
+    """
+    # Which attributes and mehtods do we need to enforce?
+    # Think of: Qty, symbol, underlying symbol, price, OrderSide, TimeInForce ?
+    pass
 class OrderSide(str, Enum):
     """
     Side of a trade.
@@ -65,8 +93,8 @@ class TimeInForce(str, Enum):
 
     Why we limit values
     - Brokers support many TIFs.
-    - For V2 we keep a small stable set.
-    - You can extend later without rewriting the whole architecture.
+    - We keep a small stable set.
+    - We can extend later without rewriting the whole architecture.
     """
 
     DAY = "day"
@@ -144,7 +172,7 @@ cl
 
 
 @dataclass(frozen=True)
-class MultiLegLimitOrder:
+class MultiLegLimitOrder(OrderABC):
     """
     A broker-agnostic multi-leg limit order.
 
@@ -208,3 +236,11 @@ class MultiLegLimitOrder:
         -> total contracts for this leg = 6
         """
         return self.quantity * leg.ratio
+
+@dataclass(frozen=True)
+class MarketOrder(OrderABC):
+    client_order_id: ClientOrderId
+    quantity: int
+    time_in_force: "TimeInForce"
+    symbol: str
+    side: "OrderSide"

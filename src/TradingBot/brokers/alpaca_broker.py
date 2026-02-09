@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Dict, List, Optional, TypeVar, TYPE_CHECKING, cast
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, cast
 
 import requests
 from requests import Session
@@ -21,18 +21,16 @@ from TradingBot.domain.orders import (
     OrderSide as DomainOrderSide,
     TimeInForce as DomainTIF,
 )
-from TradingBot.domain.types import AssetQuote, ClientOrderId
+from TradingBot.domain.types import AssetQuote
+from TradingBot.domain.orders import OrderABC, MarketOrder
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 from TradingBot.brokers.broker_interface import BrokerABC
 
 logger = setup_logger("AlpacaBroker")
 
-TOrder = TypeVar("TOrder")
-
 if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import OrderRequest
     from alpaca.trading.models import Order as AlpacaOrder
 
     
@@ -300,36 +298,25 @@ class AlpacaBroker(BrokerABC):
         - Domain can keep higher precision, broker adapts at the boundary.
         """
         return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    
-    def _to_alpaca_order_request(self, order: Any) -> "OrderRequest":
-        """
-        Convert our broker-agnostic domain order objects into Alpaca request objects.
-
-        Supported now
-        - MultiLegLimitOrder (options multi-leg limit order via Alpaca OrderClass.MLEG)
-
-        Important
-        - We require each OptionContract to already have contract.option_symbol populated.
-        This keeps strategy and risk broker-agnostic, while making the broker adapter
-        responsible for submitting only execution-ready orders.
-        """
-
         
+    def _to_alpaca_mleg_limit(self, order: MultiLegLimitOrder) -> "LimitOrderRequest":
+        """
+        Convert our domain MultiLegLimitOrder into an Alpaca LimitOrderRequest (MLEG).
+
+        Contract
+        - Input is always our domain order type (MultiLegLimitOrder).
+        - Output is always an Alpaca SDK request object ready for submit_order().
+        """
         try:
-            from alpaca.trading.enums import OrderClass, OrderType, TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
-            from alpaca.trading.requests import OrderRequest, LimitOrderRequest, OptionLegRequest
+            from alpaca.trading.enums import (
+                OrderClass,
+                OrderType,
+                TimeInForce as AlpacaTIF,
+                OrderSide as AlpacaSide,
+            )
+            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
         except Exception as exc:
             raise RuntimeError("alpaca-py is not installed or import failed") from exc
-
-        # Passthrough for already-constructed Alpaca requests (useful during migration).
-        if isinstance(order, OrderRequest):
-            return order
-
-        if not isinstance(order, MultiLegLimitOrder):
-            raise TypeError(
-                f"Unsupported internal order type for Alpaca mapping: {type(order).__name__}. "
-                "Expected MultiLegLimitOrder."
-            )
 
         if order.quantity <= 0:
             raise ValueError(f"MultiLegLimitOrder.quantity must be > 0, got {order.quantity}")
@@ -342,14 +329,12 @@ class AlpacaBroker(BrokerABC):
         if not order.client_order_id or not str(order.client_order_id).strip():
             raise ValueError("MultiLegLimitOrder.client_order_id must be a non-empty string")
 
-        # Map TIF
         tif_map: dict[DomainTIF, AlpacaTIF] = {
             DomainTIF.DAY: AlpacaTIF.DAY,
             DomainTIF.GTC: AlpacaTIF.GTC,
         }
         alpaca_tif: AlpacaTIF = tif_map[order.time_in_force]
 
-        # Map legs
         alpaca_legs: list[OptionLegRequest] = []
         for idx, leg in enumerate(order.legs):
             if not isinstance(leg, DomainOptionLeg):
@@ -387,14 +372,6 @@ class AlpacaBroker(BrokerABC):
 
         limit_price_2dp: Decimal = self._quantise_money_2dp(order.limit_price)
 
-        if limit_price_2dp != order.limit_price:
-            logger.info(
-                "Alpaca limit_price quantised to 2dp client_order_id=%s before=%s after=%s",
-                str(order.client_order_id),
-                str(order.limit_price),
-                str(limit_price_2dp),
-            )
-
         request = LimitOrderRequest(
             type=OrderType.LIMIT,
             order_class=OrderClass.MLEG,
@@ -407,6 +384,7 @@ class AlpacaBroker(BrokerABC):
 
         return request
 
+
     # ---------------------------------------------------------------------
     # BrokerInterface implementation
     # ---------------------------------------------------------------------
@@ -414,12 +392,10 @@ class AlpacaBroker(BrokerABC):
         self._log_io_boundary("get_account_snapshot")
         with log_scope("broker.get_account_snapshot", logger):
             data: Dict[str, Any] = self._request_json("GET", "/account")
-
             equity: float = self._safe_float(data.get("equity"), default=0.0)
             options_buying_power: float = self._safe_float(data.get("options_buying_power"), default=0.0)
             raw_cash: Any = data.get("cash")
             cash: Optional[float] = float(raw_cash) if raw_cash is not None else None
-
 
             return AccountSnapshot(
                 equity=equity,
@@ -815,65 +791,21 @@ class AlpacaBroker(BrokerABC):
 
             return chain
         
-    def submit_order(self, order: object) -> "AlpacaOrder":
-        """
-        Submit an order to Alpaca.
 
-        Parameters
-        - order: internal executable order (for example MultiLegLimitOrder)
-
-        Returns
-        - Alpaca Order model returned by alpaca-py
-        """
+    def submit_order(self, order: OrderABC) -> "AlpacaOrder":
         self._log_io_boundary("submit_order")
 
-        with log_scope("alpaca_broker.submit_order", logger):
-            client_order_id: Optional[ClientOrderId] = getattr(order, "client_order_id", None)
+        if isinstance(order, MultiLegLimitOrder):
+            order_request = self._to_alpaca_mleg_limit(order)
+        elif isinstance(order, MarketOrder):
+            # order_request = self._to_alpaca_market(order)
+            pass # We yet need to implement the _to_alpaca_market(order) method. 
+        else:
+            raise TypeError(f"Unsupported domain order type: {type(order).__name__}")
 
-            logger.info(
-                "Submitting order to Alpaca client_order_id=%s order_type=%s",
-                client_order_id,
-                type(order).__name__,
-            )
-
-            order_request = self._to_alpaca_order_request(order)
-
-            # This log is useful when debugging request-shape issues.
-            # Many alpaca-py request objects are Pydantic models and support model_dump().
-            request_payload: Any
-            if hasattr(order_request, "model_dump"):
-                request_payload = order_request.model_dump()
-            elif hasattr(order_request, "dict"):
-                request_payload = order_request.dict()
-            else:
-                request_payload = str(order_request)
-
-            logger.info(
-                "Alpaca submit_order request client_order_id=%s payload=%s",
-                client_order_id,
-                request_payload,
-            )
-
-            trading_client = self._ensure_trading_client()
-            response_any: Any = trading_client.submit_order(order_data=order_request)
-
-            logger.info(
-                "Alpaca submit_order response client_order_id=%s alpaca_order_id=%s status=%s",
-                client_order_id,
-                getattr(response_any, "id", None) if not isinstance(response_any, dict) else response_any.get("id"),
-                getattr(response_any, "status", None) if not isinstance(response_any, dict) else response_any.get("status"),
-            )
-
-            if isinstance(response_any, dict):
-                raise TypeError(
-                    "Alpaca submit_order returned raw dict payload. "
-                    "This violates the broker contract. "
-                    f"payload_keys={list(response_any.keys())}"
-                )
-
-            return cast("AlpacaOrder", response_any)
-
-
+        trading_client = self._ensure_trading_client()
+        response_any = trading_client.submit_order(order_data=order_request)
+        return cast("AlpacaOrder", response_any)
 
     # ---------------------------------------------------------------------
     # Market data convenience methods required by MarketDataProviderABC

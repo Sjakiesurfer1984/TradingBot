@@ -25,20 +25,23 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from TradingBot.brokers.account_snapshot import AccountSnapshot
-from TradingBot.brokers.broker_interface import BrokerInterface
-
 from TradingBot.orchestration.context import RiskContext
 from TradingBot.domain.types import AssetQuote, OptionChainRequest, Symbol, normalise_symbol
 from TradingBot.domain.intents import TradeIntent
 
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.brokers.broker_interface import BrokerABC
+from TradingBot.risk.risk_engine import RiskEngineABC
+from TradingBot.strategies.strategy_interface import StrategyABC
+
+
 from TradingBot.risk.decisions import RiskDecision
 from TradingBot.risk.price_policy import DefaultPriceSelectionPolicy, PriceSelectionPolicy
-from TradingBot.risk.risk_engine import RiskEngine
-from TradingBot.strategies.strategy_interface import Strategy
 
 from TradingBot.orchestration.cycle_plan import CyclePlan, build_cycle_plan
+from typing import Mapping, Sequence
 
 
 logger = setup_logger("Orchestrator")
@@ -65,22 +68,26 @@ class _BaseSnapshot:
 @dataclass
 class Orchestrator:
     """
-    orchestrator (Option C).
+    Orchestrator (Option C).
 
-    This object owns the “cycle”.
-    A cycle is one full run of:
-    - gather broker state (IO)
-    - build RiskContext snapshot
-    - ask strategies for intents (no IO)
-    - ask risk engine for decisions (no IO)
-    - log results
-    - optionally submit orders
+    Contract (UML + SOLID)
+    - Depends only on abstractions:
+        - BrokerABC
+        - StrategyABC
+        - RiskEngineABC
+    - Coordinates the cycle and performs broker IO.
+    - Does not construct concrete brokers, strategies, or risk engines.
     """
 
-    broker: BrokerInterface
-    strategies: List[Strategy]
-    risk_engine: RiskEngine
+    broker: BrokerABC
+    strategies: List[StrategyABC]
+    risk_engine: RiskEngineABC
     dry_run: bool = True
+
+    # Inject policy as an abstraction.
+    # Default is fine because it is pure and has no IO, but injection keeps UML clean.
+    price_policy: PriceSelectionPolicy = DefaultPriceSelectionPolicy()
+
 
     def _now_utc(self) -> datetime:
         now_utc: datetime = datetime.now(timezone.utc)
@@ -257,8 +264,8 @@ class Orchestrator:
             )
             equity: float = float(equity_raw) if isinstance(equity_raw, (int, float)) else 0.0
 
-            open_orders: List[Dict[str, Any]] = open_orders_raw if isinstance(open_orders_raw, list) else []
-            positions: List[Dict[str, Any]] = positions_raw if isinstance(positions_raw, list) else []
+            open_orders: Sequence[Mapping[str, Any]]  = open_orders_raw if isinstance(open_orders_raw, list) else []
+            positions: Sequence[Mapping[str, Any]] = positions_raw if isinstance(positions_raw, list) else []
 
             logger.info(
                 "Broker snapshot numeric | option_buying_power=%.2f equity=%.2f",
@@ -417,7 +424,12 @@ class Orchestrator:
             logger.info("Option chains built | stored=%d", int(len(chains)))
             return chains
 
-    def _count_pmcc_units_from_positions(self, *, underlying: Symbol, positions: List[Dict[str, Any]]) -> int:
+    def _count_pmcc_units_from_positions(
+        self,
+        *,
+        underlying: Symbol,
+        positions: Sequence[Mapping[str, Any]],
+    ) -> int:
         """
         Conservative PMCC unit counter.
 
@@ -538,16 +550,14 @@ class Orchestrator:
                 option_chains = {}
                 logger.info("Skipping option chain fetch | reason=cycle_plan_filtered_all_requests")
 
-            price_policy: PriceSelectionPolicy = DefaultPriceSelectionPolicy()
-
             ctx: RiskContext = RiskContext(
+                price_policy=self.price_policy,
                 as_of_utc=base.as_of_utc,
                 option_buying_power=base.option_buying_power,
                 equity=base.equity,
                 positions=base.positions,
                 open_orders=base.open_orders,
                 asset_quotes=asset_quotes,
-                price_policy=price_policy,
                 option_chains=option_chains,
             )
 
