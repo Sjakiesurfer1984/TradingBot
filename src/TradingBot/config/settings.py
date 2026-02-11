@@ -42,7 +42,8 @@ def load_app_config_from_env() -> AppConfig:
     - .env holds secrets and toggles
     - code reads env and constructs a typed config object
     """
-    broker_name = os.getenv("TRADINGBOT_BROKER", "fake").strip()
+    broker_name = _get_env("TRADINGBOT_BROKER").strip()
+    print(broker_name)
 
     dry_run = _get_env_bool("TBOT_DRY_RUN", default=True)
 

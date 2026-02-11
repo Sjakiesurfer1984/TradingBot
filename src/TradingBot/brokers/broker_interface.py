@@ -1,32 +1,61 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
-from TradingBot.brokers.account_snapshot import AccountSnapshot
-from TradingBot.brokers.broker_base import BrokerBase
-from TradingBot.brokers.execution_broker import ExecutionBrokerABC
-from TradingBot.brokers.market_data_provider import MarketDataProviderABC
+from TradingBot.domain.orders import OrderABC
+from TradingBot.domain.types import AssetQuote, Symbol
 
 
-class BrokerABC(BrokerBase, MarketDataProviderABC, ExecutionBrokerABC, ABC):
+class MarketDataProviderABC(ABC):
     """
-    Full broker contract used by the Orchestrator.
+    Market data provider contract.
 
-    This composes:
-    - MarketDataProviderABC (market data)
-    - ExecutionBrokerABC (execution)
-    - plus account-state reads (equity, buying power, positions, open orders)
+    Responsibilities
+    - Provide prices/quotes needed for decisions.
+    - Provide option chain data when strategies request it.
 
-    BrokerBase is included so all brokers share common utilities and logging.
+    No order submission methods live here.
     """
-
-    # -------------------------
-    # Account state (reads)
-    # -------------------------
 
     @abstractmethod
-    def get_account_snapshot(self) -> AccountSnapshot:
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_option_chain(
+        self,
+        *,
+        underlying: str,
+        include_calls: bool,
+        include_puts: bool,
+        feed: str,
+        max_age_seconds: int,
+        limit: int,
+        strike_price_gte: float | None,
+        strike_price_lte: float | None,
+        expiration_date: str | None,
+        expiration_date_gte: str | None,
+        expiration_date_lte: str | None,
+        root_symbol: str | None,
+        updated_since: str | None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class ExecutionBrokerABC(ABC):
+    """
+    Execution broker contract.
+
+    Responsibilities
+    - Provide account state needed for risk controls.
+    - Submit orders and expose open orders and positions.
+
+    No market data methods live here.
+    """
+
+    @abstractmethod
+    def get_account_snapshot(self) -> Dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -45,8 +74,15 @@ class BrokerABC(BrokerBase, MarketDataProviderABC, ExecutionBrokerABC, ABC):
     def get_open_orders(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
+    @abstractmethod
+    def submit_order(self, order: OrderABC) -> Any:
+        raise NotImplementedError
 
-# Transitional alias:
-# Keep existing imports working:
-# from TradingBot.brokers.broker_interface import BrokerInterface
-BrokerInterface = BrokerABC
+
+class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
+    """
+    Convenience alias for a broker that supports both execution and market data.
+
+    You can keep using BrokerABC as a composition type in wiring, but the UML should
+    treat the two capabilities separately (ISP).
+    """

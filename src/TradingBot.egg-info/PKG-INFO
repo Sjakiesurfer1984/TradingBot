@@ -1,5 +1,10 @@
 Metadata-Version: 2.4
-Name: TradingBot
+Name: tradingbot
 Version: 0.1.0
-Summary: Options trading bot
-Requires-Python: >=3.10
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: alpaca-py>=0.43.2
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: matplotlib>=3.4.0
+Requires-Dist: python-dotenv>=1.0.0
+Dynamic: license-file

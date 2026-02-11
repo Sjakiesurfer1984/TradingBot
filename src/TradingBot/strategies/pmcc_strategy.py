@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
 from TradingBot.domain.orders import TimeInForce
-from TradingBot.orchestration.context import RiskContext
+from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
+from TradingBot.strategies.option_chain_consumer import OptionChainConsumerABC
 
 from TradingBot.domain.ids import make_intent_id
 from TradingBot.domain.types import (
@@ -26,7 +27,7 @@ from TradingBot.domain.intents import (
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
-from TradingBot.strategies.strategy_interface import Strategy
+from TradingBot.strategies.strategy_interface import StrategyABC
 
 logger = setup_logger("PMCC Strategy")
 
@@ -97,12 +98,12 @@ class _Candidate:
 
 
 @dataclass(frozen=True)
-class PmccStrategy(Strategy):
+class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     """
-    Poor Man's Covered Call (PMCC) strategy (V2).
+    Poor Man's Covered Call (PMCC) strategyy.
 
     Constraints
-    - Strategy is pure: reads only from RiskContext, performs no broker IO.
+    - Strategy is pure: reads only from CycleSnapshot, performs no broker IO.
     - Strategy selects contracts only, it does not size or submit.
     """
 
@@ -136,6 +137,10 @@ class PmccStrategy(Strategy):
     @property
     def option_chain_symbols(self) -> Sequence[Symbol]:
         return self.symbols
+    
+    def universe(self) -> Set[Symbol]:
+        return set(self.symbols)
+
 
     def option_chain_requests(self) -> List[OptionChainRequest]:
         """
@@ -181,7 +186,7 @@ class PmccStrategy(Strategy):
     def _select_candidate(
         self,
         *,
-        ctx: RiskContext,
+        ctx: CycleSnapshotABC,
         underlying: Symbol,
         chain: List[Dict[str, Any]],
         leg_name: str,
@@ -279,7 +284,7 @@ class PmccStrategy(Strategy):
         )
         return best
 
-    def generate_intents(self, ctx: RiskContext) -> List[TradeIntent]:
+    def generate_intents(self, ctx: CycleSnapshotABC) -> List[TradeIntent]:
         with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
             underlying: Symbol = normalise_symbol(self.underlying_symbol)
 

@@ -10,7 +10,8 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from TradingBot.brokers.broker_interface import BrokerABC
-from TradingBot.brokers.factory import build_broker
+from TradingBot.brokers.factory import BrokerFactoryFacade
+from TradingBot.brokers.registry import BrokerBuilderRegistry, AlpacaBrokerBuilder
 
 from TradingBot.config.runtime_config import RuntimeConfig, load_runtime_config
 from TradingBot.config.settings import load_app_config_from_env
@@ -18,13 +19,15 @@ from TradingBot.config.settings import load_app_config_from_env
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
-from TradingBot.orchestration.orchestrator import Orchestrator
+from TradingBot.orchestration.orchestrator import TradingOrchestrator
 from TradingBot.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
 from TradingBot.risk.risk_engine import RiskEngine
 from TradingBot.risk.rules.open_order_rule import OpenOrderDedupeRule
 
 from TradingBot.strategies.pmcc_strategy import PmccStrategy
-from TradingBot.strategies.strategy_interface import Strategy
+from TradingBot.strategies.strategy_interface import StrategyABC
+
+from TradingBot.execution.default_execution_policy import DefaultExecutionPolicy
 
 from TradingBot.app.scheduler import SchedulerConfig, Scheduler
 
@@ -32,9 +35,13 @@ from TradingBot.app.scheduler import SchedulerConfig, Scheduler
 logger = setup_logger("Main")
 
 # The _STOP_REQUESTED event is set when a SIGINT is received, and serves as a signal to gracefully stop operations.
-#_LAST_SIGINT_TS records the timestamp of the last SIGINT to handle double interrupts.
+# _LAST_SIGINT_TS records the timestamp of the last SIGINT to handle double interrupts.
 # SIGINT is a keyboard interrupt (Ctrl+C).
-
+#
+# Note: This file does not yet use _STOP_REQUESTED inside Scheduler.
+# It is kept here because it is the foundation for a clean shutdown path:
+# - First Ctrl+C: request a graceful stop
+# - Second Ctrl+C within a short window: exit immediately
 _STOP_REQUESTED = Event()
 _LAST_SIGINT_TS: float = 0.0
 
@@ -46,6 +53,10 @@ def _get_env(name: str) -> Optional[str]:
     Return value
     - The stripped string value if present and non-empty
     - None if missing or empty
+
+    Why this exists
+    - Environment variables are strings and can be missing.
+    - Centralising the parsing avoids repeated, inconsistent checks.
     """
     value: Optional[str] = os.getenv(name)
     if value is None:
@@ -63,6 +74,10 @@ def _get_env_bool(name: str, default: bool) -> bool:
 
     Everything else is treated as False when the variable is present.
     If missing, returns the provided default.
+
+    Why this exists
+    - The program must behave predictably when variables are missing.
+    - It must also be clear which values count as 'True'.
     """
     raw: Optional[str] = _get_env(name)
     if raw is None:
@@ -75,8 +90,9 @@ def _mask_secret(value: Optional[str], show_prefix: int = 4) -> str:
     Mask secrets in logs.
 
     Why this exists
-    - Logs must never leak API keys.
-    - We still want enough information to confirm which key is in use.
+    - Logs must never leak API keys or secrets.
+    - When debugging, it is still helpful to confirm which key is loaded.
+      Showing a short prefix provides that confidence without exposing the key.
     """
     if value is None:
         return "<missing>"
@@ -91,6 +107,11 @@ def _mask_secret(value: Optional[str], show_prefix: int = 4) -> str:
 def _log_env_snapshot() -> None:
     """
     Log a safe snapshot of configuration and critical env vars.
+
+    Why this exists
+    - When the bot does something unexpected, the first question is often:
+      'What configuration did it actually start with?'
+    - This log is the answer, but it must never print secrets.
     """
     broker_name: str = os.getenv("TRADINGBOT_BROKER", "fake")
 
@@ -114,6 +135,19 @@ def _log_env_snapshot() -> None:
 
 
 def _install_interrupt_tracer() -> None:
+    """
+    Install a signal handler for Ctrl+C (SIGINT).
+
+    Why this exists
+    - A trading bot should stop safely.
+    - The first interrupt requests a graceful stop.
+    - A second interrupt shortly afterwards forces an immediate exit.
+
+    Current limitation
+    - Scheduler does not yet consult _STOP_REQUESTED, so this handler mainly
+      serves as an audit trail and a foundation for a future stop mechanism.
+    """
+
     def _handler(signum: int, frame) -> None:
         global _LAST_SIGINT_TS
         now: float = time.time()
@@ -134,10 +168,29 @@ def _install_interrupt_tracer() -> None:
 
 
 def _build_risk_engine() -> RiskEngine:
-    with log_scope("build_risk_engine", logger):
-        dedupe_rule: OpenOrderDedupeRule = OpenOrderDedupeRule()
+    """
+    Construct the risk engine and its dependencies.
 
+    Design patterns used here
+
+    Strategy pattern (rules list)
+    - Each RiskRule evaluates an intent independently.
+    - The RiskEngine applies the list of rules in order.
+
+    Composition over inheritance
+    - RiskEngine is configured by injecting rule objects and a sizer object.
+    - This makes behaviour easy to change without editing RiskEngine itself.
+
+    Why this exists
+    - Risk checks and sizing can grow complex.
+    - Building them in one place keeps main() readable and keeps wiring explicit.
+    """
+    with log_scope("build_risk_engine", logger):
+        # Each rule is responsible for exactly one concern.
+        # OpenOrderDedupeRule prevents duplicate orders.
         cfg = PmccSizingConfig(
+            # These parameters define the safety envelope for PMCC sizing.
+            # They are read from env so you can adjust risk without changing code.
             equity_budget_pct=float(os.getenv("TBOT_PMCC_EQUITY_BUDGET_PCT", "0")),
             max_option_bp_fraction=float(os.getenv("TBOT_PMCC_MAX_OPTION_BP_FRACTION", "0")),
             max_debit_per_spread_usd=float(os.getenv("TBOT_PMCC_MAX_DEBIT_PER_SPREAD_USD", "0")),
@@ -148,17 +201,36 @@ def _build_risk_engine() -> RiskEngine:
             ignore_spread_checks=_get_env_bool("TBOT_PMCC_IGNORE_SPREAD_CHECKS", default=False),
         )
 
+        # PmccSizer is responsible for turning 'available capital + constraints'
+        # into a quantity and limit price suggestion.
         pmcc_sizer: PmccSizer = PmccSizer(cfg)
 
-        risk_engine: RiskEngine = RiskEngine(
-            dedupe_rule=dedupe_rule,
+        # RiskEngine applies rule objects and then sizes PMCC intents.
+        # It produces policy-neutral approvals that the execution policy converts into orders.
+        risk_engine = RiskEngine(
+            rules=[OpenOrderDedupeRule()],
             pmcc_sizer=pmcc_sizer,
         )
         return risk_engine
 
 
-def _build_strategies(runtime_cfg: RuntimeConfig) -> list[Strategy]:
-    strategies: list[Strategy] = []
+def _build_strategies(runtime_cfg: RuntimeConfig) -> list[StrategyABC]:
+    """
+    Build the strategy objects declared in the runtime configuration.
+
+    Design pattern used here
+
+    Factory (simple selection factory)
+    - This function selects which concrete Strategy class to instantiate
+      based on runtime configuration.
+    - Each strategy object is created with only its own required config.
+
+    Why this exists
+    - Strategies are the primary extension point for the trading system.
+    - Adding a new strategy should require adding one new concrete class
+      and one new wiring branch here, without changing unrelated components.
+    """
+    strategies: list[StrategyABC] = []
 
     for spec in runtime_cfg.strategies:
         if spec.name == "pmcc":
@@ -166,6 +238,9 @@ def _build_strategies(runtime_cfg: RuntimeConfig) -> list[Strategy]:
                 raise ValueError("PMCC StrategySpec missing pmcc config")
 
             cfg = spec.pmcc
+
+            # PmccStrategy will declare its universe() so the orchestrator can
+            # fetch the correct snapshot data for each cycle.
             strategies.append(PmccStrategy(underlying_symbol=cfg.underlying_symbol))
             continue
 
@@ -177,61 +252,119 @@ def _build_strategies(runtime_cfg: RuntimeConfig) -> list[Strategy]:
 def main() -> None:
     """
     Entry point.
-    High-level flow:
-    - Load config from env / .env.
-    - load runtime config.
-    - load app config.
-    - Build one broker instance.
-    - Inject that broker into the orchestrator.
-    - Orchestrator is the only component allowed to perform broker IO.
+
+    High-level flow
+    - Load environment variables from .env.
+    - Load runtime config (which strategies to run, etc).
+    - Load app config (broker settings and secrets).
+    - Build broker via broker factory facade and registry.
+    - Build risk engine, strategies, execution policy.
+    - Build orchestrator by injecting dependencies (composition).
+    - Run the scheduler forever.
+
+    Design patterns used in this file
+
+    Facade
+    - BrokerFactoryFacade provides a single method to construct the broker.
+    - This keeps broker wiring out of main().
+
+    Registry
+    - BrokerBuilderRegistry maps broker name -> builder object.
+    - Adding a broker means registering a new builder, without changing the factory.
+
+    Factory (builders)
+    - AlpacaBrokerBuilder constructs the concrete Alpaca broker instance.
+
+    Strategy
+    - Strategies implement StrategyABC and provide generate_intents(snapshot).
+    - Risk rules implement RiskRuleABC and are applied in sequence.
+
+    Dependency Injection
+    - Objects receive dependencies via constructors rather than importing them internally.
+    - This keeps modules testable and reduces coupling.
     """
     logger.warning("SIGINT handler at start of main: %r", signal.getsignal(signal.SIGINT))
 
     with log_scope("main", logger):
+        # Load variables from a .env file into process environment.
+        # This lets you run locally without permanently setting system env vars.
         load_dotenv()
 
+        # Install interrupt handling early so Ctrl+C is visible in logs.
+        _install_interrupt_tracer()
+
+        # Runtime config controls which strategies run and their parameters.
         runtime_cfg: RuntimeConfig = load_runtime_config()
+
+        # App config represents broker selection and broker credentials loaded from env.
         app_cfg = load_app_config_from_env()
 
+        # Log configuration snapshot so startup configuration is always auditable.
         _log_env_snapshot()
 
-        # If TBOT_DRY_RUN is set, it overrides the runtime default.
+        # Dry run determines whether orders are actually submitted.
+        # TBOT_DRY_RUN overrides runtime default when explicitly set.
         dry_run: bool = _get_env_bool("TBOT_DRY_RUN", default=runtime_cfg.default_dry_run)
         logger.info("Dry run resolved | dry_run=%s", dry_run)
 
+        # Broker is a pluggable component. The selected name comes from AppConfig.
         broker_name: str = app_cfg.broker_name
         logger.info("Broker selected | name=%s", broker_name)
 
+        # Construct broker using registry + facade.
+        # This keeps broker-specific wiring out of main() and supports multiple brokers cleanly.
         with log_scope("build_broker", logger, extra=f"name={broker_name}"):
-            broker:  BrokerABC = build_broker(app_cfg=app_cfg)
+            registry = BrokerBuilderRegistry()
+            registry.register("alpaca", AlpacaBrokerBuilder())
 
+            broker_factory = BrokerFactoryFacade(registry=registry)
+            broker: BrokerABC = broker_factory.build_broker(app_cfg=app_cfg)
+
+        # Construct risk engine and its injected components.
         risk_engine: RiskEngine = _build_risk_engine()
         logger.info("Risk engine built | type=%s", type(risk_engine).__name__)
 
-        strategies: list[Strategy] = _build_strategies(runtime_cfg)
+        # Construct strategy objects from runtime configuration.
+        strategies: list[StrategyABC] = _build_strategies(runtime_cfg)
         logger.info(
             "Strategies built | count=%d types=%s",
             len(strategies),
             [type(s).__name__ for s in strategies],
         )
 
-        # Option B: Orchestrator owns the IO boundary via the single broker object.
-        orchestrator: Orchestrator = Orchestrator(
+        # ExecutionPolicy converts risk-approved specs into executable domain orders.
+        # Changing execution behaviour means swapping this object, not editing risk logic.
+        execution_policy = DefaultExecutionPolicy()
+
+        # TradingOrchestrator coordinates one cycle:
+        # - build snapshot (quotes, chains, account state) via snapshot builder
+        # - ask strategies for intents
+        # - evaluate intents with risk engine
+        # - convert approvals into orders via execution policy
+        # - submit orders via broker (unless dry_run)
+        #
+        # The orchestrator is the only component allowed to perform broker IO.
+        trading_orchestrator: TradingOrchestrator = TradingOrchestrator(
             broker=broker,
             strategies=strategies,
             risk_engine=risk_engine,
+            execution_policy=execution_policy,
             dry_run=dry_run,
+            # snapshot_builder= TODO ADD HERE
         )
-        logger.info("Orchestrator built | type=%s", type(orchestrator).__name__)
+        logger.info("TradingOrchestrator built | type=%s", type(trading_orchestrator).__name__)
 
+        # Scheduler triggers a single cycle repeatedly.
+        # It does not contain trading logic; it only controls timing.
         cycle_seconds: float = float(os.getenv("TBOT_CYCLE_SECONDS", "60"))
         scheduler: Scheduler = Scheduler(
-            orchestrator=orchestrator,
+            orchestrator=trading_orchestrator,
             config=SchedulerConfig(cycle_seconds=cycle_seconds),
         )
 
         logger.info("Start scheduler.run_forever | cycle_seconds=%s", cycle_seconds)
         scheduler.run_forever()
+
 
 if __name__ == "__main__":
     main()
