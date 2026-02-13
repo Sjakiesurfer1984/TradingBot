@@ -1,3 +1,28 @@
+
+# NOTE: The .env files is included in the .gitignore, meaning it is not pushed to the GitHub repo. 
+# This means that if you do a fresh Git Clone, you will have to create the .env yourself. 
+# It needs to include:
+'''
+TRADINGBOT_BROKER=alpaca
+TBOT_DRY_RUN=true
+ALPACA_MODE=paper
+
+ALPACA_PAPER_API_KEY= "generate under your Alpaca account"
+ALPACA_PAPER_API_SECRET= "generate under your Alpaca account"
+
+TBOT_CYCLE_SECONDS=60
+
+TBOT_PMCC_EQUITY_BUDGET_PCT=0.05
+TBOT_PMCC_MAX_OPTION_BP_FRACTION=0.20
+TBOT_PMCC_MAX_DEBIT_PER_SPREAD_USD=500
+TBOT_PMCC_MAX_CONTRACTS_PER_INTENT=2
+TBOT_PMCC_SLIPPAGE_FACTOR=1.05
+TBOT_PMCC_MAX_LEAP_SPREAD_PCT=0.15
+TBOT_PMCC_MAX_NEAR_SPREAD_PCT=0.20
+TBOT_PMCC_IGNORE_SPREAD_CHECKS=false
+'''
+
+
 # src/TradingBot/v2/main.py
 from __future__ import annotations
 

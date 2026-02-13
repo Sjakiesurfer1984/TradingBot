@@ -288,8 +288,9 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
             underlying: Symbol = normalise_symbol(self.underlying_symbol)
 
-            leap_chain: List[Dict[str, Any]] = ctx.option_chains.get((underlying, "pmcc_leap"), [])
-            near_chain: List[Dict[str, Any]] = ctx.option_chains.get((underlying, "pmcc_near"), [])
+            chains = ctx.option_chains()
+            leap_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_leap"), [])
+            near_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_near"), [])
 
             if not leap_chain:
                 logger.warning(

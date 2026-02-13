@@ -1,23 +1,33 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, List, Set
+from typing import List, Set
 
 from TradingBot.brokers.broker_interface import BrokerABC
+
 from TradingBot.domain.intents import TradeIntent
 from TradingBot.domain.orders import OrderABC
 from TradingBot.domain.types import Symbol
+
 from TradingBot.execution.execution_policy_interface import ExecutionPolicyABC
+
 from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
-from TradingBot.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC
+from TradingBot.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC,  DefaultCycleSnapshotBuilder
 from TradingBot.orchestration.orchestrator_interface import CycleRunResult, CycleRunStatus, OrchestratorABC
+
 from TradingBot.risk.decisions import ApprovedIntent, RiskDecision
 from TradingBot.risk.risk_engine import RiskEngineABC
+
 from TradingBot.strategies.option_chain_consumer import OptionChainConsumerABC
 from TradingBot.strategies.strategy_interface import StrategyABC
+
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.signals.signal_pipeline_interface import SignalPipelineABC
+from TradingBot.signals.default_signal_pipeline import DefaultSignalPipeline
+
 
 logger = setup_logger("TradingOrchestrator")
 
@@ -27,9 +37,11 @@ class TradingOrchestrator(OrchestratorABC):
     broker: BrokerABC
     strategies: List[StrategyABC]
     risk_engine: RiskEngineABC
-    snapshot_builder: CycleSnapshotBuilderABC
     execution_policy: ExecutionPolicyABC
     dry_run: bool = True
+
+    snapshot_builder: CycleSnapshotBuilderABC = field(default_factory=DefaultCycleSnapshotBuilder)
+    signal_pipeline: SignalPipelineABC = field(default_factory=DefaultSignalPipeline)
 
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)

@@ -27,6 +27,10 @@ from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 from TradingBot.brokers.broker_interface import BrokerABC
 
+from TradingBot.brokers.broker_base import BrokerBase
+
+
+
 logger = setup_logger("AlpacaBroker")
 
 if TYPE_CHECKING:
@@ -35,7 +39,7 @@ if TYPE_CHECKING:
 
     
 @dataclass
-class AlpacaBroker(BrokerABC):
+class AlpacaBroker(BrokerBase, BrokerABC):
     """
     Alpaca broker adapter for TradingBot.
 
