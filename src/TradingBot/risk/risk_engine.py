@@ -2,17 +2,24 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List
 
 from TradingBot.domain.intents import PmccIntentPayload, TradeIntent
 from TradingBot.domain.types import ClientOrderId, Symbol, normalise_symbol
+
 from TradingBot.execution.order_specs import PmccOrderSpec
+
 from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
+
 from TradingBot.risk.decisions import ApprovedIntent, RejectedIntent, RiskDecision
 from TradingBot.risk.pmcc_sizer import PmccSizer, PmccSizingResult
 from TradingBot.risk.rules.risk_rule_interface import RiskRuleABC, RiskRuleOutcome
+
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
+
+from TradingBot.domain.intents import OptionIntentPayload, MultiLegOptionIntentPayload
+
 
 logger = setup_logger("RiskEngine")
 
@@ -94,13 +101,26 @@ class RiskEngine(RiskEngineABC):
         decisions: List[RiskDecision] = []
 
         with log_scope("risk_engine.evaluate", logger, extra=f"intents={len(intents)}"):
+
             for intent in intents:
+
                 rule_outcome: RiskRuleOutcome = self._apply_rules_one_intent(snapshot, intent)
                 if not rule_outcome.allowed:
                     decisions.append(self._reject(intent=intent, reason=str(rule_outcome.reason)))
                     continue
 
                 payload: Any = intent.payload
+
+                if isinstance(payload, (OptionIntentPayload, MultiLegOptionIntentPayload)):
+                    logger.info(
+                        "RiskEngine skipping payload type (not implemented yet) | payload_type=%s intent_id=%s strategy_id=%s symbol=%s",
+                        type(payload).__name__,
+                        str(intent.intent_id),
+                        str(intent.strategy_id),
+                        str(intent.symbol),
+                    )
+                    decisions.append(self._reject(intent=intent, reason=f"Unsupported intent payload type: {type(payload).__name__}"))
+                    continue
 
                 if isinstance(payload, PmccIntentPayload):
                     underlying_sym: Symbol = normalise_symbol(str(payload.underlying_symbol))
@@ -149,7 +169,7 @@ class RiskEngine(RiskEngineABC):
                         strategy_id=intent.strategy_id,
                         symbol=intent.symbol,
                         client_order_id=client_order_id,
-                        approval_payload=approval_payload
+                        approval_payload=approval_payload,
                     )
                     decisions.append(RiskDecision(approved=approved))
                     continue
