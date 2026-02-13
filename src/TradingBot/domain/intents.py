@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from datetime import datetime
 from TradingBot.domain.orders import TimeInForce
 from TradingBot.domain.types import IntentId, StrategyId, Symbol
@@ -25,6 +25,23 @@ class IntentPayloadABC(ABC):
         - Equity: symbol
         """
         raise NotImplementedError
+
+class PositionIntent(str, Enum):
+    BUY_TO_OPEN = "buy_to_open"
+    SELL_TO_OPEN = "sell_to_open"
+    BUY_TO_CLOSE = "buy_to_close"
+    SELL_TO_CLOSE = "sell_to_close"
+
+
+LegRole = Literal["LEAP", "NEAR", "OTHER"]
+
+
+@dataclass(frozen=True)
+class IntentOptionLeg:
+    contract_symbol: str
+    position_intent: PositionIntent
+    role: LegRole
+    qty: Optional[int] = None
 
 
 class OrderSide(Enum):
@@ -123,6 +140,25 @@ class SingleOptionIntentPayload(IntentPayloadABC):
     def primary_symbol(self) -> Symbol:
         return self.underlying_symbol
 
+
+@dataclass(frozen=True)
+class OptionIntentPayload(IntentPayloadABC):
+    underlying_symbol: Symbol
+    leg: IntentOptionLeg
+
+    @property
+    def primary_symbol(self) -> Symbol:
+        return self.underlying_symbol
+
+
+@dataclass(frozen=True)
+class MultiLegOptionIntentPayload(IntentPayloadABC):
+    underlying_symbol: Symbol
+    legs: Tuple[IntentOptionLeg, ...]
+
+    @property
+    def primary_symbol(self) -> Symbol:
+        return self.underlying_symbol
 
 
 @dataclass(frozen=True)
