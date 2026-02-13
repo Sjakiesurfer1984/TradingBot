@@ -212,7 +212,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             if not contract_symbol:
                 continue
 
-            dte: Optional[int] = _parse_call_dte(contract_symbol, as_of_utc=ctx.as_of_utc)
+            dte: Optional[int] = _parse_call_dte(contract_symbol, as_of_utc=ctx.as_of_utc())
             if dte is None or dte < int(dte_min) or dte > int(dte_max):
                 continue
 
@@ -346,6 +346,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
             enable_pmcc_management: bool = os.getenv("PMCC_ENABLE_MANAGEMENT", "false").lower() == "true"
             underlying: Symbol = normalise_symbol(self.underlying_symbol)
+            as_of_utc = ctx.as_of_utc()
 
             chains = ctx.option_chains()
             leap_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_leap"), [])
@@ -374,7 +375,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                         intents.append(
                             TradeIntent(
                                 intent_id=IntentId.new(),
-                                strategy_id=self.strategy_id(),
+                                strategy_id=self.strategy_id,
                                 symbol=underlying,
                                 payload=OptionIntentPayload(
                                     underlying_symbol=underlying,
@@ -385,7 +386,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                                         qty=None,
                                     ),
                                 ),
-                                time_in_force="day",
+                                time_in_force=TimeInForce.DAY,
                                 tags=("pmcc", "manage", "sell_near"),
                             )
                         )
@@ -396,7 +397,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     intents.append(
                         TradeIntent(
                             intent_id=IntentId.new(),
-                            strategy_id=self.strategy_id(),
+                            strategy_id=self.strategy_id,
                             symbol=underlying,
                             payload=OptionIntentPayload(
                                 underlying_symbol=underlying,
@@ -407,7 +408,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                                     qty=None,
                                 ),
                             ),
-                            time_in_force="day",
+                            time_in_force=TimeInForce.DAY,
                             tags=("pmcc", "manage", "buyback_near"),
                         )
                     )
@@ -415,15 +416,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
 
                 if held_leap is not None and held_near is not None:
                     # Covered: roll NEAR (trigger logic will be added next - for now always no-op)
-                    self._logger.info(
-                        "PMCC covered state detected (management enabled), no roll triggers implemented yet",
-                        underlying_symbol=underlying,
-                        leap=held_leap,
-                        near=held_near,
+                    logger.info(
+                        "PMCC covered state detected (management enabled), no roll triggers implemented yet | underlying=%s leap=%s near=%s",
+                        str(underlying),
+                        str(held_leap),
+                        str(held_near),
                     )
                     return intents
-
-
 
             if not leap_chain:
                 logger.warning(
@@ -467,7 +466,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             intent_id: IntentId = make_intent_id(
                 strategy_id=self.strategy_id,
                 underlying=underlying,
-                as_of_utc=ctx.as_of_utc,
+                as_of_utc=as_of_utc,
             )
 
             leap_sel: SelectedOption = SelectedOption(

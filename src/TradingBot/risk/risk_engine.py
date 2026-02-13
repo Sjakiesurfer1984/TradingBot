@@ -97,6 +97,16 @@ class RiskEngine(RiskEngineABC):
         intent_tail: str = str(intent.intent_id).split(":")[-1]
         return ClientOrderId(f"PMCC:{underlying}:{intent_tail}")
 
+    def _log_and_reject(self, intent: TradeIntent, reason: str) -> RiskDecision:
+        logger.warning(
+            "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+            str(intent.intent_id),
+            str(intent.strategy_id),
+            str(intent.symbol),
+            reason,
+        )
+        return self._reject(intent=intent, reason=reason)
+
     def evaluate(self, snapshot: CycleSnapshotABC, intents: List[TradeIntent]) -> List[RiskDecision]:
         decisions: List[RiskDecision] = []
 
@@ -106,54 +116,111 @@ class RiskEngine(RiskEngineABC):
 
                 rule_outcome: RiskRuleOutcome = self._apply_rules_one_intent(snapshot, intent)
                 if not rule_outcome.allowed:
-                    decisions.append(self._reject(intent=intent, reason=str(rule_outcome.reason)))
+                    reason = str(rule_outcome.reason)
+                    logger.warning(
+                        "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                        str(intent.intent_id),
+                        str(intent.strategy_id),
+                        str(intent.symbol),
+                        reason,
+                    )
+                    decisions.append(self._reject(intent=intent, reason=reason))
                     continue
 
                 payload: Any = intent.payload
 
+                # ------------------------------------------------------------------
+                # Skip unsupported payloads (future management legs)
+                # ------------------------------------------------------------------
                 if isinstance(payload, (OptionIntentPayload, MultiLegOptionIntentPayload)):
-                    logger.info(
-                        "RiskEngine skipping payload type (not implemented yet) | payload_type=%s intent_id=%s strategy_id=%s symbol=%s",
-                        type(payload).__name__,
+                    reason = f"Unsupported intent payload type: {type(payload).__name__}"
+                    logger.warning(
+                        "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
                         str(intent.intent_id),
                         str(intent.strategy_id),
                         str(intent.symbol),
+                        reason,
                     )
-                    decisions.append(self._reject(intent=intent, reason=f"Unsupported intent payload type: {type(payload).__name__}"))
+                    decisions.append(self._reject(intent=intent, reason=reason))
                     continue
 
+                # ------------------------------------------------------------------
+                # PMCC Entry Handling
+                # ------------------------------------------------------------------
                 if isinstance(payload, PmccIntentPayload):
+
                     underlying_sym: Symbol = normalise_symbol(str(payload.underlying_symbol))
 
-                    existing_units: int = self._count_pmcc_units_from_positions(snapshot=snapshot, underlying=underlying_sym)
+                    existing_units: int = self._count_pmcc_units_from_positions(
+                        snapshot=snapshot,
+                        underlying=underlying_sym,
+                    )
+
                     if existing_units >= int(self.pmcc_max_units_per_underlying):
-                        decisions.append(
-                            self._reject(
-                                intent=intent,
-                                reason=f"PMCC unit cap reached | underlying={underlying_sym} cap={self.pmcc_max_units_per_underlying}",
-                            )
+                        reason = (
+                            f"PMCC unit cap reached | "
+                            f"underlying={underlying_sym} cap={self.pmcc_max_units_per_underlying}"
                         )
+                        logger.warning(
+                            "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                            str(intent.intent_id),
+                            str(intent.strategy_id),
+                            str(intent.symbol),
+                            reason,
+                        )
+                        decisions.append(self._reject(intent=intent, reason=reason))
                         continue
 
                     equity: float = float(snapshot.equity())
                     option_bp: float = float(snapshot.option_buying_power())
 
-                    sizing: PmccSizingResult = self.pmcc_sizer.size(
-                        equity=equity,
-                        option_buying_power=option_bp,
-                        leap=payload.leap_leg.contract,
-                        near=payload.near_leg.contract,
-                    )
+                    try:
+                        sizing: PmccSizingResult = self.pmcc_sizer.size(
+                            equity=equity,
+                            option_buying_power=option_bp,
+                            leap=payload.leap_leg.contract,
+                            near=payload.near_leg.contract,
+                        )
+                    except ValueError as exc:
+                        reason = f"PMCC sizing rejected: {str(exc)}"
+                        logger.warning(
+                            "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                            str(intent.intent_id),
+                            str(intent.strategy_id),
+                            str(intent.symbol),
+                            reason,
+                        )
+                        decisions.append(self._reject(intent=intent, reason=reason))
+                        continue
 
                     if int(sizing.qty) <= 0:
-                        decisions.append(self._reject(intent=intent, reason="Sizer produced non-positive quantity"))
+                        reason = "Sizer produced non-positive quantity"
+                        logger.warning(
+                            "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                            str(intent.intent_id),
+                            str(intent.strategy_id),
+                            str(intent.symbol),
+                            reason,
+                        )
+                        decisions.append(self._reject(intent=intent, reason=reason))
                         continue
 
                     if float(sizing.limit_price) <= 0.0:
-                        decisions.append(self._reject(intent=intent, reason="Sizer produced non-positive limit price"))
+                        reason = "Sizer produced non-positive limit price"
+                        logger.warning(
+                            "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                            str(intent.intent_id),
+                            str(intent.strategy_id),
+                            str(intent.symbol),
+                            reason,
+                        )
+                        decisions.append(self._reject(intent=intent, reason=reason))
                         continue
 
-                    client_order_id: ClientOrderId = self._build_pmcc_client_order_id(underlying=underlying_sym, intent=intent)
+                    client_order_id: ClientOrderId = self._build_pmcc_client_order_id(
+                        underlying=underlying_sym,
+                        intent=intent,
+                    )
 
                     approval_payload = PmccOrderSpec(
                         underlying_symbol=underlying_sym,
@@ -171,9 +238,21 @@ class RiskEngine(RiskEngineABC):
                         client_order_id=client_order_id,
                         approval_payload=approval_payload,
                     )
+
                     decisions.append(RiskDecision(approved=approved))
                     continue
 
-                decisions.append(self._reject(intent=intent, reason="Unsupported intent payload type"))
+                # ------------------------------------------------------------------
+                # Fallback
+                # ------------------------------------------------------------------
+                reason = "Unsupported intent payload type"
+                logger.warning(
+                    "Risk reject | intent_id=%s strategy=%s symbol=%s reason=%s",
+                    str(intent.intent_id),
+                    str(intent.strategy_id),
+                    str(intent.symbol),
+                    reason,
+                )
+                decisions.append(self._reject(intent=intent, reason=reason))
 
         return decisions
