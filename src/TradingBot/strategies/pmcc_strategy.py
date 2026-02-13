@@ -1,8 +1,10 @@
 from __future__ import annotations
+import os
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Literal
+
 from TradingBot.domain.orders import TimeInForce
 from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
 from TradingBot.strategies.option_chain_consumer import OptionChainConsumerABC
@@ -22,6 +24,10 @@ from TradingBot.domain.intents import (
     PmccIntentPayload,
     SelectedOption,
     TradeIntent,
+    MultiLegOptionIntentPayload,
+    OptionIntentPayload,
+    IntentOptionLeg,
+    PositionIntent,
 )
 
 from TradingBot.utilities.logger import setup_logger
@@ -30,6 +36,7 @@ from TradingBot.utilities.logging_utils import log_scope
 from TradingBot.strategies.strategy_interface import StrategyABC
 
 logger = setup_logger("PMCC Strategy")
+PmccState = Literal["FLAT", "LEAP_ONLY", "COVERED", "BROKEN"]
 
 # WHy is this defined here?
 def _parse_iso8601_utc(ts: Any) -> Optional[datetime]:
@@ -283,14 +290,140 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             best.chain_newest_ts_utc.isoformat() if best.chain_newest_ts_utc else None,
         )
         return best
+    
+    def _select_near_contract(self, *, underlying: Symbol, chain: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Select the best NEAR contract from the already-fetched chain.
+
+        Phase 1 selection rule
+        - Use the first contract in the chain that has a symbol.
+        - This is a placeholder until we add delta/DTE ranking.
+        """
+        for c in chain:
+            if c.get("symbol"):
+                return c
+        return None
+
+    def _pmcc_management_enabled(self) -> bool:
+        return os.getenv("PMCC_ENABLE_MANAGEMENT", "false").lower() == "true"
+
+    def _find_pmcc_legs_in_positions(
+        self,
+        *,
+        positions: List[Dict[str, Any]],
+        leap_chain: List[Dict[str, Any]],
+        near_chain: List[Dict[str, Any]],
+    ) -> Dict[str, Optional[str]]:
+        """
+        Identify held LEAP and held NEAR by matching position symbols against the fetched chains.
+
+        Returns
+        - {"leap": <contract_symbol|None>, "near": <contract_symbol|None>}
+        """
+        leap_symbols = {c.get("symbol") for c in leap_chain if c.get("symbol")}
+        near_symbols = {c.get("symbol") for c in near_chain if c.get("symbol")}
+
+        held_leap: Optional[str] = None
+        held_near: Optional[str] = None
+
+        for p in positions:
+            sym = p.get("symbol")
+            if not sym:
+                continue
+
+            # Alpaca positions include both equities and options.
+            # We only classify positions that exist in our requested chains.
+            if sym in leap_symbols:
+                held_leap = sym
+            if sym in near_symbols:
+                held_near = sym
+
+        return {"leap": held_leap, "near": held_near}
 
     def generate_intents(self, ctx: CycleSnapshotABC) -> List[TradeIntent]:
+        intents: List[TradeIntent] = []
+
         with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
+            enable_pmcc_management: bool = os.getenv("PMCC_ENABLE_MANAGEMENT", "false").lower() == "true"
             underlying: Symbol = normalise_symbol(self.underlying_symbol)
 
             chains = ctx.option_chains()
             leap_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_leap"), [])
             near_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_near"), [])
+
+            if not enable_pmcc_management:
+                # Phase 1/2 safe mode: run entry logic only.
+                # Management intents are introduced behind a flag so we do not break the pipeline
+                # until RiskEngine + ExecutionPolicy support the new payloads end-to-end.
+                pass
+            else:
+                legs = self._find_pmcc_legs_in_positions(
+                    positions=ctx.positions(),
+                    leap_chain=leap_chain,
+                    near_chain=near_chain,
+                )
+
+                held_leap = legs["leap"]
+                held_near = legs["near"]
+
+                # State machine
+                if held_leap is not None and held_near is None:
+                    # LEAP-only: sell a NEAR
+                    selected_near = self._select_near_contract(underlying=underlying, chain=near_chain)
+                    if selected_near is not None:
+                        intents.append(
+                            TradeIntent(
+                                intent_id=IntentId.new(),
+                                strategy_id=self.strategy_id(),
+                                symbol=underlying,
+                                payload=OptionIntentPayload(
+                                    underlying_symbol=underlying,
+                                    leg=IntentOptionLeg(
+                                        contract_symbol=selected_near["symbol"],
+                                        position_intent=PositionIntent.SELL_TO_OPEN,
+                                        role="NEAR",
+                                        qty=None,
+                                    ),
+                                ),
+                                time_in_force="day",
+                                tags=("pmcc", "manage", "sell_near"),
+                            )
+                        )
+                    return intents
+
+                if held_leap is None and held_near is not None:
+                    # Broken: buy back NEAR
+                    intents.append(
+                        TradeIntent(
+                            intent_id=IntentId.new(),
+                            strategy_id=self.strategy_id(),
+                            symbol=underlying,
+                            payload=OptionIntentPayload(
+                                underlying_symbol=underlying,
+                                leg=IntentOptionLeg(
+                                    contract_symbol=held_near,
+                                    position_intent=PositionIntent.BUY_TO_CLOSE,
+                                    role="NEAR",
+                                    qty=None,
+                                ),
+                            ),
+                            time_in_force="day",
+                            tags=("pmcc", "manage", "buyback_near"),
+                        )
+                    )
+                    return intents
+
+                if held_leap is not None and held_near is not None:
+                    # Covered: roll NEAR (trigger logic will be added next - for now always no-op)
+                    self._logger.info(
+                        "PMCC covered state detected (management enabled), no roll triggers implemented yet",
+                        underlying_symbol=underlying,
+                        leap=held_leap,
+                        near=held_near,
+                    )
+                    return intents
+
+
 
             if not leap_chain:
                 logger.warning(
