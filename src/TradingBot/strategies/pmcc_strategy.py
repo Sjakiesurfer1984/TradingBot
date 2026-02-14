@@ -1,15 +1,23 @@
 from __future__ import annotations
-import os
 
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Literal
+from typing import Any, Dict, List, Optional, Sequence, Set, Literal
 
-from TradingBot.domain.orders import TimeInForce
-from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
-from TradingBot.strategies.option_chain_consumer import OptionChainConsumerABC
-
+from TradingBot.config.strategy_config import PmccConfig
 from TradingBot.domain.ids import make_intent_id
+from TradingBot.domain.intents import (
+    IntentOptionLeg,
+    OptionIntentPayload,
+    OrderSide,
+    OptionLeg,
+    PmccIntentPayload,
+    PositionIntent,
+    SelectedOption,
+    TradeIntent,
+)
+from TradingBot.domain.orders import TimeInForce
 from TradingBot.domain.types import (
     IntentId,
     OptionChainRequest,
@@ -17,56 +25,30 @@ from TradingBot.domain.types import (
     Symbol,
     normalise_symbol,
 )
-
-from TradingBot.domain.intents import (
-    OrderSide,
-    OptionLeg,
-    PmccIntentPayload,
-    SelectedOption,
-    TradeIntent,
-    MultiLegOptionIntentPayload,
-    OptionIntentPayload,
-    IntentOptionLeg,
-    PositionIntent,
-)
-
+from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
+from TradingBot.strategies.option_chain_consumer import OptionChainConsumerABC
+from TradingBot.strategies.strategy_interface import StrategyABC
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
-from TradingBot.strategies.strategy_interface import StrategyABC
-
 logger = setup_logger("PMCC Strategy")
+
 PmccState = Literal["FLAT", "LEAP_ONLY", "COVERED", "BROKEN"]
 
-# WHy is this defined here?
-def _parse_iso8601_utc(ts: Any) -> Optional[datetime]:
-    """
-    Parse ISO8601 timestamps produced by brokers, typically ending in 'Z'.
 
-    Returns
-    -------
-    datetime | None
-        Timezone-aware UTC datetime, or None if parsing fails.
-    """
+def _parse_iso8601_utc(ts: Any) -> Optional[datetime]:
     if not isinstance(ts, str):
         return None
     s: str = ts.strip()
     if not s:
         return None
     try:
-        # Supports "2026-01-07T21:14:50.927197Z"
         return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
 
 
 def _parse_call_dte(contract_symbol: str, *, as_of_utc: datetime) -> Optional[int]:
-    """
-    Extract DTE from OCC/OSI option symbol suffix.
-
-    Expected suffix (last 15 chars):
-    YYMMDD + (C/P) + strike(8 digits)
-    """
     try:
         suffix: str = contract_symbol[-15:]
         yymmdd: str = suffix[0:6]
@@ -98,8 +80,6 @@ class _Candidate:
     spread_abs: float
     spread_pct: float
     score: float
-
-    # Metadata carried through into SelectedOption
     feed: str
     chain_newest_ts_utc: Optional[datetime]
 
@@ -107,24 +87,15 @@ class _Candidate:
 @dataclass(frozen=True)
 class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     """
-    Poor Man's Covered Call (PMCC) strategyy.
+    Poor Man's Covered Call (PMCC) strategy.
 
     Constraints
     - Strategy is pure: reads only from CycleSnapshot, performs no broker IO.
     - Strategy selects contracts only, it does not size or submit.
     """
 
-    underlying_symbol: str
-
-    leap_min_dte: int = 365
-    leap_max_dte: int = 545
-    leap_target_delta: float = 0.80
-
-    near_min_dte: int = 21
-    near_max_dte: int = 45
-    near_target_delta: float = 0.20
-
-    _strategy_id: StrategyId = StrategyId("pmcc_v2")
+    config: PmccConfig
+    _strategy_id: StrategyId = StrategyId("PMCC")
 
     @property
     def strategy_id(self) -> StrategyId:
@@ -132,8 +103,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
 
     @property
     def symbols(self) -> Sequence[Symbol]:
-        with log_scope("pmcc.symbols", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
-            syms: Sequence[Symbol] = (normalise_symbol(self.underlying_symbol),)
+        cfg: PmccConfig = self.config
+        underlying: str = str(cfg.underlying_symbol).strip().upper()
+        with log_scope("pmcc.symbols", logger, extra=f"underlying_symbol={underlying}"):
+            syms: Sequence[Symbol] = (normalise_symbol(underlying),)
             logger.info("Symbols declared | symbols=%s", [str(s) for s in syms])
             return syms
 
@@ -144,28 +117,23 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     @property
     def option_chain_symbols(self) -> Sequence[Symbol]:
         return self.symbols
-    
+
     def universe(self) -> Set[Symbol]:
         return set(self.symbols)
 
-
     def option_chain_requests(self) -> List[OptionChainRequest]:
-        """
-        Tell the orchestrator which option chains to fetch.
-
-        Freshness policy (max_age_seconds) is orchestrator-owned, not strategy-owned.
-        """
-        underlying: str = str(self.underlying_symbol).strip().upper()
+        cfg: PmccConfig = self.config
+        underlying: str = str(cfg.underlying_symbol).strip().upper()
         if not underlying:
             return []
 
         today: date = date.today()
 
-        leap_exp_gte: date = today + timedelta(days=int(self.leap_min_dte))
-        leap_exp_lte: date = today + timedelta(days=int(self.leap_max_dte))
+        leap_exp_gte: date = today + timedelta(days=int(cfg.leap.dte_min))
+        leap_exp_lte: date = today + timedelta(days=int(cfg.leap.dte_max))
 
-        near_exp_gte: date = today + timedelta(days=int(self.near_min_dte))
-        near_exp_lte: date = today + timedelta(days=int(self.near_max_dte))
+        near_exp_gte: date = today + timedelta(days=int(cfg.short.dte_min))
+        near_exp_lte: date = today + timedelta(days=int(cfg.short.dte_max))
 
         return [
             OptionChainRequest(
@@ -189,6 +157,9 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 expiration_date_lte=near_exp_lte,
             ),
         ]
+
+    def _pmcc_management_enabled(self) -> bool:
+        return os.getenv("PMCC_ENABLE_MANAGEMENT", "false").strip().lower() == "true"
 
     def _select_candidate(
         self,
@@ -290,22 +261,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             best.chain_newest_ts_utc.isoformat() if best.chain_newest_ts_utc else None,
         )
         return best
-    
-    def _select_near_contract(self, *, underlying: Symbol, chain: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """
-        Select the best NEAR contract from the already-fetched chain.
 
-        Phase 1 selection rule
-        - Use the first contract in the chain that has a symbol.
-        - This is a placeholder until we add delta/DTE ranking.
-        """
-        for c in chain:
-            if c.get("symbol"):
-                return c
+    def _select_near_contract_symbol(self, *, near_chain: List[Dict[str, Any]]) -> Optional[str]:
+        for row in near_chain:
+            sym_any: Any = row.get("contract_symbol")
+            if isinstance(sym_any, str) and sym_any.strip():
+                return sym_any.strip().upper()
         return None
-
-    def _pmcc_management_enabled(self) -> bool:
-        return os.getenv("PMCC_ENABLE_MANAGEMENT", "false").lower() == "true"
 
     def _find_pmcc_legs_in_positions(
         self,
@@ -314,25 +276,26 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         leap_chain: List[Dict[str, Any]],
         near_chain: List[Dict[str, Any]],
     ) -> Dict[str, Optional[str]]:
-        """
-        Identify held LEAP and held NEAR by matching position symbols against the fetched chains.
-
-        Returns
-        - {"leap": <contract_symbol|None>, "near": <contract_symbol|None>}
-        """
-        leap_symbols = {c.get("symbol") for c in leap_chain if c.get("symbol")}
-        near_symbols = {c.get("symbol") for c in near_chain if c.get("symbol")}
+        leap_symbols: Set[str] = {
+            str(c.get("contract_symbol")).strip().upper()
+            for c in leap_chain
+            if isinstance(c.get("contract_symbol"), str) and str(c.get("contract_symbol")).strip()
+        }
+        near_symbols: Set[str] = {
+            str(c.get("contract_symbol")).strip().upper()
+            for c in near_chain
+            if isinstance(c.get("contract_symbol"), str) and str(c.get("contract_symbol")).strip()
+        }
 
         held_leap: Optional[str] = None
         held_near: Optional[str] = None
 
         for p in positions:
-            sym = p.get("symbol")
-            if not sym:
+            sym_any: Any = p.get("symbol")
+            if not isinstance(sym_any, str) or not sym_any.strip():
                 continue
 
-            # Alpaca positions include both equities and options.
-            # We only classify positions that exist in our requested chains.
+            sym: str = sym_any.strip().upper()
             if sym in leap_symbols:
                 held_leap = sym
             if sym in near_symbols:
@@ -341,36 +304,31 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         return {"leap": held_leap, "near": held_near}
 
     def generate_intents(self, ctx: CycleSnapshotABC) -> List[TradeIntent]:
+        cfg: PmccConfig = self.config
         intents: List[TradeIntent] = []
 
-        with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={self.underlying_symbol}"):
-            enable_pmcc_management: bool = os.getenv("PMCC_ENABLE_MANAGEMENT", "false").lower() == "true"
-            underlying: Symbol = normalise_symbol(self.underlying_symbol)
-            as_of_utc = ctx.as_of_utc()
+        underlying_str: str = str(cfg.underlying_symbol).strip().upper()
+        with log_scope("pmcc.generate_intents", logger, extra=f"underlying_symbol={underlying_str}"):
+            underlying: Symbol = normalise_symbol(underlying_str)
+            as_of_utc: datetime = ctx.as_of_utc()
 
             chains = ctx.option_chains()
             leap_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_leap"), [])
             near_chain: List[Dict[str, Any]] = chains.get((underlying, "pmcc_near"), [])
 
-            if not enable_pmcc_management:
-                # Phase 1/2 safe mode: run entry logic only.
-                # Management intents are introduced behind a flag so we do not break the pipeline
-                # until RiskEngine + ExecutionPolicy support the new payloads end-to-end.
-                pass
-            else:
+            # Management logic behind a flag
+            if self._pmcc_management_enabled():
                 legs = self._find_pmcc_legs_in_positions(
                     positions=ctx.positions(),
                     leap_chain=leap_chain,
                     near_chain=near_chain,
                 )
+                held_leap: Optional[str] = legs.get("leap")
+                held_near: Optional[str] = legs.get("near")
 
-                held_leap = legs["leap"]
-                held_near = legs["near"]
-
-                # State machine
+                # LEAP-only: sell a NEAR
                 if held_leap is not None and held_near is None:
-                    # LEAP-only: sell a NEAR
-                    selected_near = self._select_near_contract(underlying=underlying, chain=near_chain)
+                    selected_near: Optional[str] = self._select_near_contract_symbol(near_chain=near_chain)
                     if selected_near is not None:
                         intents.append(
                             TradeIntent(
@@ -380,7 +338,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                                 payload=OptionIntentPayload(
                                     underlying_symbol=underlying,
                                     leg=IntentOptionLeg(
-                                        contract_symbol=selected_near["symbol"],
+                                        contract_symbol=selected_near,
                                         position_intent=PositionIntent.SELL_TO_OPEN,
                                         role="NEAR",
                                         qty=None,
@@ -392,8 +350,8 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                         )
                     return intents
 
+                # Broken: buy back NEAR
                 if held_leap is None and held_near is not None:
-                    # Broken: buy back NEAR
                     intents.append(
                         TradeIntent(
                             intent_id=IntentId.new(),
@@ -402,7 +360,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                             payload=OptionIntentPayload(
                                 underlying_symbol=underlying,
                                 leg=IntentOptionLeg(
-                                    contract_symbol=held_near,
+                                    contract_symbol=str(held_near),
                                     position_intent=PositionIntent.BUY_TO_CLOSE,
                                     role="NEAR",
                                     qty=None,
@@ -414,29 +372,26 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     )
                     return intents
 
+                # Covered: decide roll using cfg.roll thresholds (next step expands this)
                 if held_leap is not None and held_near is not None:
-                    # Covered: roll NEAR (trigger logic will be added next - for now always no-op)
-                    logger.info(
-                        "PMCC covered state detected (management enabled), no roll triggers implemented yet | underlying=%s leap=%s near=%s",
-                        str(underlying),
-                        str(held_leap),
-                        str(held_near),
-                    )
+                    if self._should_roll_near(
+                        held_near_symbol=str(held_near),
+                        near_chain=near_chain,
+                        as_of_utc=as_of_utc,
+                    ):
+                        logger.info(
+                            "PMCC roll triggered | underlying=%s held_near=%s",
+                            str(underlying),
+                            str(held_near),
+                        )
                     return intents
 
+            # Entry logic
             if not leap_chain:
-                logger.warning(
-                    "No LEAP option chain available in context | underlying=%s key=%s",
-                    str(underlying),
-                    "pmcc_leap",
-                )
+                logger.warning("No LEAP option chain available in context | underlying=%s key=%s", str(underlying), "pmcc_leap")
                 return []
             if not near_chain:
-                logger.warning(
-                    "No NEAR option chain available in context | underlying=%s key=%s",
-                    str(underlying),
-                    "pmcc_near",
-                )
+                logger.warning("No NEAR option chain available in context | underlying=%s key=%s", str(underlying), "pmcc_near")
                 return []
 
             leap: Optional[_Candidate] = self._select_candidate(
@@ -444,9 +399,9 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 underlying=underlying,
                 chain=leap_chain,
                 leg_name="LEAP",
-                target_delta=float(self.leap_target_delta),
-                dte_min=int(self.leap_min_dte),
-                dte_max=int(self.leap_max_dte),
+                target_delta=float(cfg.leap.target_delta),
+                dte_min=int(cfg.leap.dte_min),
+                dte_max=int(cfg.leap.dte_max),
             )
             if leap is None:
                 return []
@@ -456,9 +411,9 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 underlying=underlying,
                 chain=near_chain,
                 leg_name="NEAR",
-                target_delta=float(self.near_target_delta),
-                dte_min=int(self.near_min_dte),
-                dte_max=int(self.near_max_dte),
+                target_delta=float(cfg.short.target_delta),
+                dte_min=int(cfg.short.dte_min),
+                dte_max=int(cfg.short.dte_max),
             )
             if near is None:
                 return []
@@ -495,15 +450,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 near_leg=OptionLeg(contract=near_sel, side=OrderSide.SELL, ratio=1),
             )
 
-            tags: Tuple[str, ...] = ("v2", "pmcc", "mleg")
-
             intent: TradeIntent = TradeIntent(
                 intent_id=intent_id,
                 strategy_id=self.strategy_id,
                 symbol=underlying,
                 payload=payload,
                 time_in_force=TimeInForce.DAY,
-                tags=tags,
+                tags=("pmcc", "entry", "mleg"),
             )
 
             logger.info(
@@ -513,6 +466,42 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 leap_sel.option_symbol,
                 near_sel.option_symbol,
             )
-
             return [intent]
 
+    def _should_roll_near(
+        self,
+        held_near_symbol: str,
+        near_chain: List[Dict[str, Any]],
+        *,
+        as_of_utc: datetime,
+    ) -> bool:
+        cfg: PmccConfig = self.config
+        roll = cfg.roll
+
+        held_sym: str = str(held_near_symbol).strip().upper()
+        if not held_sym:
+            return False
+
+        for row in near_chain:
+            sym_any: Any = row.get("contract_symbol")
+            if not isinstance(sym_any, str) or not sym_any.strip():
+                continue
+
+            sym: str = sym_any.strip().upper()
+            if sym != held_sym:
+                continue
+
+            dte_opt: Optional[int] = _parse_call_dte(sym, as_of_utc=as_of_utc)
+            if dte_opt is not None and int(dte_opt) <= int(roll.dte_threshold):
+                return True
+
+            greeks_any: Any = row.get("greeks")
+            if isinstance(greeks_any, dict):
+                delta: Optional[float] = _to_float(greeks_any.get("delta"))
+                if delta is not None and abs(float(delta)) >= float(roll.delta_threshold):
+                    return True
+
+            # Profit trigger needs entry credit/price tracking; not implemented yet.
+            return False
+
+        return False

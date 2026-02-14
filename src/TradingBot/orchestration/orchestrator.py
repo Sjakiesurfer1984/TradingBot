@@ -87,13 +87,48 @@ class TradingOrchestrator(OrchestratorABC):
         submitted: int = 0
 
         with log_scope("orchestrator._submit_orders", logger, extra=f"orders={len(orders)}"):
-            for order in orders:
-                try:
-                    self.broker.submit_order(order)
-                    submitted += 1
-                except Exception as exc:
-                    logger.exception("Order submit failed | order_type=%s error=%s", type(order).__name__, str(exc))
+            for req in orders:
+                order_obj = self.broker.submit_order(req)
+                submitted += 1
 
+                order_id = getattr(order_obj, "id", None)
+                status = getattr(order_obj, "status", None)
+                order_type = getattr(order_obj, "order_type", getattr(order_obj, "type", None))
+                limit_price = getattr(order_obj, "limit_price", None)
+
+                # Parent order log
+                logger.info(
+                    "ORDER SUBMITTED | parent_id=%s status=%s type=%s limit=%s",
+                    order_id,
+                    status,
+                    order_type,
+                    limit_price,
+                )
+
+                # 🔥 THIS IS WHAT YOU WERE MISSING — LOG THE LEGS
+                legs = getattr(order_obj, "legs", None)
+
+                if legs:
+                    for leg in legs:
+                        logger.info(
+                            "ORDER LEG | parent_id=%s leg_id=%s symbol=%s side=%s qty=%s status=%s",
+                            order_id,
+                            getattr(leg, "id", None),
+                            getattr(leg, "symbol", None),
+                            getattr(leg, "side", None),
+                            getattr(leg, "qty", None),
+                            getattr(leg, "status", None),
+                        )
+                else:
+                    # Single-leg fallback (in case it's not multi-leg)
+                    logger.info(
+                        "ORDER SINGLE | parent_id=%s symbol=%s side=%s qty=%s status=%s",
+                        order_id,
+                        getattr(order_obj, "symbol", None),
+                        getattr(order_obj, "side", None),
+                        getattr(order_obj, "qty", None),
+                        status,
+                    )
         return submitted
 
     def run_cycle(self) -> CycleRunResult:

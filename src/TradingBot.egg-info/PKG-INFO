@@ -7,4 +7,5 @@ Requires-Dist: alpaca-py>=0.43.2
 Requires-Dist: pandas>=1.3.0
 Requires-Dist: matplotlib>=3.4.0
 Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pyyaml>=6.0.3
 Dynamic: license-file

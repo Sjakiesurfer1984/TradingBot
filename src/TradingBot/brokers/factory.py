@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from TradingBot.brokers.broker_interface import BrokerABC
 from TradingBot.brokers.registry import BrokerBuilderRegistryABC
-from TradingBot.config.settings import AppConfig
+from TradingBot.config.env_config import EnvConfig
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
@@ -25,7 +25,7 @@ logger = setup_logger("BrokerFactoryFacade")
 
 class BrokerFactoryFacadeABC(ABC):
     @abstractmethod
-    def build_broker(self, *, app_cfg: AppConfig) -> BrokerABC:
+    def build_broker(self, *, app_cfg: EnvConfig) -> BrokerABC:
         raise NotImplementedError
 
 
@@ -33,7 +33,7 @@ class BrokerFactoryFacadeABC(ABC):
 class BrokerFactoryFacade(BrokerFactoryFacadeABC):
     registry: BrokerBuilderRegistryABC
 
-    def build_broker(self, *, app_cfg: AppConfig) -> BrokerABC:
+    def build_broker(self, *, app_cfg: EnvConfig) -> BrokerABC:
         broker_name: str = str(app_cfg.broker_name).strip()
 
         with log_scope("brokers.factory_facade.build_broker", logger, extra=f"broker_name={broker_name}"):

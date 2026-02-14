@@ -1,3 +1,14 @@
 {
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    "terminal.integrated.profiles.windows": {
+        "PowerShell (no profile)": {
+            "source": "PowerShell",
+            "args": [
+                "-NoProfile"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell (no profile)",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": false
 }

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
+
 @dataclass(frozen=True)
 class PmccSizingConfig:
     equity_budget_pct: float

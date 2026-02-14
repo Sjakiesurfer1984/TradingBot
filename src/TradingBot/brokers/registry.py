@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 from TradingBot.brokers.broker_interface import BrokerABC
-from TradingBot.config.settings import AppConfig
+
+from TradingBot.config.env_config import EnvConfig
+
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
@@ -35,7 +37,7 @@ class UnknownBrokerError(ValueError):
 
 class BrokerBuilderABC(ABC):
     @abstractmethod
-    def build(self, app_cfg: AppConfig) -> BrokerABC:
+    def build(self, app_cfg: EnvConfig) -> BrokerABC:
         raise NotImplementedError
 
 
@@ -81,9 +83,12 @@ class BrokerBuilderRegistry(BrokerBuilderRegistryABC):
             return builder
 
 
-@dataclass(frozen=True)
 class AlpacaBrokerBuilder(BrokerBuilderABC):
-    def build(self, app_cfg: AppConfig) -> BrokerABC:
+    def build(self, app_cfg: EnvConfig) -> BrokerABC:
+        mode: str = str(app_cfg.alpaca.mode).strip().lower()
+        api_key: str = str(app_cfg.alpaca.api_key).strip()
+        api_secret: str = str(app_cfg.alpaca.api_secret).strip()
+
         from TradingBot.brokers.alpaca_broker import AlpacaBroker
 
         mode: str = str(app_cfg.alpaca.mode).strip().lower()
