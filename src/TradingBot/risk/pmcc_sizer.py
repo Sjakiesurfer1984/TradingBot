@@ -90,7 +90,6 @@ class PmccSizingResult:
     chain_newest_ts_utc: Optional[datetime]
 
 
-
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 

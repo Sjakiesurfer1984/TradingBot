@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Mapping
+from typing import Mapping
 
 
 class RegimeLabel(str, Enum):

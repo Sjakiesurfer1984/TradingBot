@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Tuple
 
-from TradingBot.domain.orders import OrderSide
+from TradingBot.domain.signals import SignalSnapshot
 from TradingBot.domain.types import AssetQuote, Symbol
 from TradingBot.risk.price_policy import PriceSelectionPolicy
 
 
 class CycleSnapshotABC(ABC):
     """
-    Per-cycle snapshot contract.
+    Per cycle snapshot contract.
 
     Contract
     - Immutable view of what the rest of the cycle operates on.
-    - Contains a price selection policy so execution pricing is consistent.
+    - Contains per cycle signals computed after IO is completed.
+    - Carries a price selection policy (even if not used yet).
     """
 
     @abstractmethod
@@ -48,7 +49,15 @@ class CycleSnapshotABC(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_execution_price(self, symbol: Symbol, side: OrderSide) -> float:
+    def signals(self) -> SignalSnapshot:
+        raise NotImplementedError
+
+    @abstractmethod
+    def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshotABC":
+        raise NotImplementedError
+
+    @abstractmethod
+    def price_policy(self) -> PriceSelectionPolicy:
         raise NotImplementedError
 
 
@@ -61,6 +70,7 @@ class CycleSnapshot(CycleSnapshotABC):
     _open_orders: List[Dict[str, Any]]
     _asset_quotes: Dict[Symbol, AssetQuote]
     _option_chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]]
+    _signals: SignalSnapshot
     _price_policy: PriceSelectionPolicy
 
     def as_of_utc(self) -> datetime:
@@ -84,6 +94,11 @@ class CycleSnapshot(CycleSnapshotABC):
     def option_chains(self) -> Mapping[Tuple[Symbol, str], List[Dict[str, Any]]]:
         return dict(self._option_chains)
 
-    def get_execution_price(self, symbol: Symbol, side: OrderSide) -> float:
-        quote: AssetQuote = self._asset_quotes[symbol]
-        return float(self._price_policy.get_execution_price(quote=quote, side=side))
+    def signals(self) -> SignalSnapshot:
+        return self._signals
+
+    def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshot":
+        return replace(self, _signals=signals)
+
+    def price_policy(self) -> PriceSelectionPolicy:
+        return self._price_policy

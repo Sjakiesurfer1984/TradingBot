@@ -140,7 +140,16 @@ class TradingOrchestrator(OrchestratorABC):
         try:
             with log_scope("orchestrator.run_cycle", logger):
                 snapshot: CycleSnapshotABC = self._build_cycle_snapshot()
+                signals = self.signal_pipeline.build(snapshot)
+
+                if hasattr(snapshot, "with_signals"):
+                    snapshot = snapshot.with_signals(signals)  # type: ignore[assignment]
+                else:
+                    # Defensive: should not happen once CycleSnapshot is updated.
+                    pass
+
                 intents: List[TradeIntent] = self._collect_intents(snapshot)
+
                 intents_count = int(len(intents))
 
                 decisions: List[RiskDecision] = self._evaluate_intents(snapshot, intents)
