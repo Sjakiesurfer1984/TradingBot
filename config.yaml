@@ -1,0 +1,32 @@
+strategies:
+  - name: pmcc
+    pmcc:
+      underlying_symbol: SPY
+      max_units: 1
+
+      leap:
+        dte_min: 365
+        dte_max: 545
+        target_delta: 0.80
+
+      short:
+        dte_min: 21
+        dte_max: 45
+        target_delta: 0.20
+
+      roll:
+        dte_threshold: 14
+        delta_threshold: 0.35
+        profit_pct: 0.50
+
+      liquidity:
+        max_leap_spread_pct: 0.10
+        max_near_spread_pct: 0.10
+
+      risk:
+        equity_budget_pct: 0.05
+        max_option_bp_fraction: 0.50
+        max_debit_per_spread_usd: 1500
+        max_contracts_per_intent: 1
+        slippage_factor: 1.05
+        ignore_spread_checks: false

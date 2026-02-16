@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Tuple
 
+from TradingBot.domain.orders import OrderSide
 from TradingBot.domain.signals import SignalSnapshot
 from TradingBot.domain.types import AssetQuote, Symbol
 from TradingBot.risk.price_policy import PriceSelectionPolicy
@@ -12,12 +13,7 @@ from TradingBot.risk.price_policy import PriceSelectionPolicy
 
 class CycleSnapshotABC(ABC):
     """
-    Per cycle snapshot contract.
-
-    Contract
-    - Immutable view of what the rest of the cycle operates on.
-    - Contains per cycle signals computed after IO is completed.
-    - Carries a price selection policy (even if not used yet).
+    Immutable per-cycle state container.
     """
 
     @abstractmethod
@@ -53,11 +49,7 @@ class CycleSnapshotABC(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshotABC":
-        raise NotImplementedError
-
-    @abstractmethod
-    def price_policy(self) -> PriceSelectionPolicy:
+    def get_execution_price(self, symbol: Symbol, side: OrderSide) -> float:
         raise NotImplementedError
 
 
@@ -70,8 +62,8 @@ class CycleSnapshot(CycleSnapshotABC):
     _open_orders: List[Dict[str, Any]]
     _asset_quotes: Dict[Symbol, AssetQuote]
     _option_chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]]
-    _signals: SignalSnapshot
-    _price_policy: PriceSelectionPolicy
+    _signals: SignalSnapshot | None = None
+    _price_policy: PriceSelectionPolicy | None = None
 
     def as_of_utc(self) -> datetime:
         return self._as_of_utc
@@ -95,10 +87,16 @@ class CycleSnapshot(CycleSnapshotABC):
         return dict(self._option_chains)
 
     def signals(self) -> SignalSnapshot:
+        if self._signals is None:
+            return SignalSnapshot.empty(as_of_utc=self._as_of_utc)
         return self._signals
 
     def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshot":
         return replace(self, _signals=signals)
 
-    def price_policy(self) -> PriceSelectionPolicy:
-        return self._price_policy
+    def get_execution_price(self, symbol: Symbol, side: OrderSide) -> float:
+        if self._price_policy is None:
+            raise RuntimeError("PriceSelectionPolicy not configured in CycleSnapshot")
+
+        quote: AssetQuote = self._asset_quotes[symbol]
+        return float(self._price_policy.get_execution_price(quote=quote, side=side))

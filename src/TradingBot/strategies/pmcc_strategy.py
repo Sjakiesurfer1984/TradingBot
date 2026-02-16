@@ -132,6 +132,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     contract_symbol=held.held_near_symbol,
                     tif=TimeInForce.DAY,
                     qty=int(held.held_near_qty_abs),
+                    as_of_utc=as_of_utc,
                 )
             ]
 
@@ -145,6 +146,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     contract_symbol=selected_near,
                     tif=TimeInForce.DAY,
                     qty=None,
+                    as_of_utc=as_of_utc,
                 )
             ]
 
@@ -166,6 +168,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                         new_near_symbol=str(new_near),
                         tif=TimeInForce.DAY,
                         qty=int(held.held_near_qty_abs),
+                        
                     )
                 ]
             return []

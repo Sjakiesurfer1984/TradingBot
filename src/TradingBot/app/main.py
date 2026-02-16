@@ -17,8 +17,10 @@ from TradingBot.strategies.strategy_interface import StrategyABC
 from TradingBot.utilities.logger import setup_logger
 from TradingBot.utilities.logging_utils import log_scope
 
-logger = setup_logger("Main")
+from TradingBot.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+from TradingBot.signals.default_signal_pipeline import DefaultSignalPipeline
 
+logger = setup_logger("Main")
 
 def _build_broker(settings: SettingsRuntime) -> BrokerABC:
 
@@ -95,13 +97,19 @@ def main() -> None:
 
         execution_policy = DefaultExecutionPolicy()
 
+        snapshot_builder = CycleSnapshotBuilder(broker=broker)
+        signal_pipeline = DefaultSignalPipeline()
+
         orchestrator = TradingOrchestrator(
             broker=broker,
             strategies=strategies,
             risk_engine=risk_engine,
             execution_policy=execution_policy,
+            snapshot_builder=snapshot_builder,
+            signal_pipeline=signal_pipeline,
             dry_run=settings.app_cfg.default_dry_run,
         )
+
 
         scheduler = Scheduler(
             orchestrator=orchestrator,

@@ -13,7 +13,7 @@ from TradingBot.domain.types import Symbol
 from TradingBot.execution.execution_policy_interface import ExecutionPolicyABC
 
 from TradingBot.orchestration.cycle_snapshot import CycleSnapshotABC
-from TradingBot.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC,  DefaultCycleSnapshotBuilder
+from TradingBot.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC, CycleSnapshotBuilder
 from TradingBot.orchestration.orchestrator_interface import CycleRunResult, CycleRunStatus, OrchestratorABC
 
 from TradingBot.risk.decisions import ApprovedIntent, RiskDecision
@@ -38,11 +38,10 @@ class TradingOrchestrator(OrchestratorABC):
     strategies: List[StrategyABC]
     risk_engine: RiskEngineABC
     execution_policy: ExecutionPolicyABC
-    dry_run: bool = True
-
-    snapshot_builder: CycleSnapshotBuilderABC = field(default_factory=DefaultCycleSnapshotBuilder)
+    snapshot_builder: CycleSnapshotBuilderABC
     signal_pipeline: SignalPipelineABC = field(default_factory=DefaultSignalPipeline)
-
+    dry_run: bool = True
+    
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)
 
@@ -58,8 +57,6 @@ class TradingOrchestrator(OrchestratorABC):
                     option_chain_requests.extend(strat.option_chain_requests())
 
             return self.snapshot_builder.build_snapshot(
-                execution_broker=self.broker,
-                market_data = self.broker,
                 universe=universe,
                 option_chain_requests=option_chain_requests,
             )
@@ -105,7 +102,6 @@ class TradingOrchestrator(OrchestratorABC):
                     limit_price,
                 )
 
-                # 🔥 THIS IS WHAT YOU WERE MISSING — LOG THE LEGS
                 legs = getattr(order_obj, "legs", None)
 
                 if legs:
