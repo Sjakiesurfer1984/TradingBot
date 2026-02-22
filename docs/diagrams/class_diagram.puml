@@ -1,208 +1,262 @@
 @startuml
-skinparam style strictuml
-skinparam classAttributeIconSize 0
+classDiagram
+    class OrchestratorABC {
+        <<interface>>
+        +run_cycle() CycleRunResult
+    }
+    class TradingOrchestrator {
+        -broker: BrokerABC
+        -strategies: List~StrategyABC~
+        -risk_engine: RiskEngineABC
+        -execution_policy: ExecutionPolicyABC
+        +run_cycle()
+    }
+    OrchestratorABC <|.. TradingOrchestrator
 
-' ============================================================
-' TradingBot - target SOLID architecture (revised)
-' Fixes applied:
-' - RiskRuleABC.apply(snapshot, intent) one-at-a-time
-' - Scheduler depends on OrchestratorABC (DIP)
-' - ExecutionPolicy outputs domain OrderSpec (not broker payload)
-' - Typo fixed: closing ">" in return types
-' ============================================================
+    class BrokerABC {
+        <<interface>>
+        +get_account_snapshot()
+        +submit_order(order)
+    }
+    class AlpacaBroker {
+        +submit_order()
+    }
+    BrokerABC <|.. AlpacaBroker
 
-package "presentation (composition root)" {
-  class AppBootstrapper {
-    +bootstrap() : TradingBotApp
-  }
+    class StrategyABC {
+        <<interface>>
+        +strategy_id: StrategyId
+        +universe() Set~Symbol~
+        +generate_intents(snapshot) List~TradeIntent~
+    }
+    class PmccStrategy {
+        +generate_intents()
+    }
+    StrategyABC <|.. PmccStrategy
 
-  class TradingBotApp {
-    -scheduler : CycleScheduler
-    +run_forever() : void
-    +run_once() : void
-  }
-}
+    class RiskEngineABC {
+        <<interface>>
+        +evaluate(snapshot, intents) List~RiskDecision~
+    }
+    class RiskEngine {
+        -rules: List~RiskRuleABC~
+        -sizer: PmccSizer
+        +evaluate()
+    }
+    RiskEngineABC <|.. RiskEngine
 
-package "application" {
-  class CycleScheduler {
-    -orchestrator : OrchestratorABC
-    +run_forever() : void
-    +run_once() : CycleRunResult
-  }
-
-  interface OrchestratorABC {
-    +run_cycle() : CycleRunResult
-  }
-
-  class TradingOrchestrator {
-    -broker : BrokerABC
-    -strategies : List<StrategyABC>
-    -risk_engine : RiskEngineABC
-    -execution_policy : ExecutionPolicyABC
-    -snapshot_builder : CycleSnapshotBuilderABC
-    +run_cycle() : CycleRunResult
-  }
-
-  interface RiskEngineABC {
-    +evaluate(snapshot : CycleSnapshotABC, intents : List<Intent>) : RiskEvaluationResult
-  }
-
-  class RiskEngine {
-    -rules : List<RiskRuleABC>
-    +evaluate(snapshot : CycleSnapshotABC, intents : List<Intent>) : RiskEvaluationResult
-  }
-
-  interface RiskRuleABC {
-    +apply(snapshot : CycleSnapshotABC, intent : Intent) : RiskRuleOutcome
-  }
-
-  interface ExecutionPolicyABC {
-    +to_order_specs(snapshot : CycleSnapshotABC, approved_intents : List<Intent>) : List<OrderSpec>
-  }
-
-  class DefaultExecutionPolicy {
-    +to_order_specs(snapshot : CycleSnapshotABC, approved_intents : List<Intent>) : List<OrderSpec>
-  }
-
-  interface CycleSnapshotBuilderABC {
-    +build_snapshot(broker : BrokerABC, universe : Set<Symbol>) : CycleSnapshotABC
-  }
-
-  class DefaultCycleSnapshotBuilder {
-    +build_snapshot(broker : BrokerABC, universe : Set<Symbol>) : CycleSnapshotABC
-  }
-}
-
-package "ports (interfaces)" {
-  interface StrategyABC {
-    +strategy_id() : str
-    +universe() : Set<Symbol>
-    +generate_intents(snapshot : CycleSnapshotABC) : List<Intent>
-  }
-
-  interface BrokerABC {
-    +get_account_snapshot() : AccountSnapshot
-    +get_positions() : List<Position>
-    +get_open_orders() : List<Order>
-    +get_quotes(symbols : Set<Symbol>) : Map<Symbol, Quote>
-    +submit_orders(order_specs : List<OrderSpec>) : List<OrderAck>
-    +cancel_orders(order_ids : List<OrderId>) : void
-  }
-
-  interface CycleSnapshotABC {
-    +as_of_utc() : datetime
-    +account() : AccountSnapshot
-    +positions() : List<Position>
-    +open_orders() : List<Order>
-    +quotes() : Map<Symbol, Quote>
-  }
-
-  interface BrokerBuilderABC {
-    +broker_key() : str
-    +build(app_cfg : AppConfig) : BrokerABC
-  }
-
-  interface BrokerBuilderRegistryABC {
-    +register(builder : BrokerBuilderABC) : void
-    +get(broker_key : str) : BrokerBuilderABC
-  }
-
-  interface BrokerFactoryFacadeABC {
-    +build_broker(app_cfg : AppConfig) : BrokerABC
-  }
-}
-
-package "infrastructure (integrations)" {
-  class BrokerBuilderRegistry {
-    -builders : Map<str, BrokerBuilderABC>
-    +register(builder : BrokerBuilderABC) : void
-    +get(broker_key : str) : BrokerBuilderABC
-  }
-
-  class BrokerFactoryFacade {
-    -registry : BrokerBuilderRegistryABC
-    +build_broker(app_cfg : AppConfig) : BrokerABC
-  }
-
-  class AlpacaBroker
-  class AlpacaBrokerBuilder
-
-  class IbkrBroker
-  class IbkrBrokerBuilder
-
-  class EnvAppConfigLoader {
-    +load_app_config() : AppConfig
-  }
-}
-
-package "domain (stable types)" {
-  class AppConfig
-  class Intent
-  class OrderSpec
-  class OrderAck
-
-  class AccountSnapshot
-  class Position
-  class Order
-  class Quote
-  class Symbol
-  class OrderId
-
-  class CycleSnapshot {
-    +as_of_utc : datetime
-    +account : AccountSnapshot
-    +positions : List<Position>
-    +open_orders : List<Order>
-    +quotes : Map<Symbol, Quote>
-  }
-
-  class RiskEvaluationResult
-  class RiskRuleOutcome
-  class CycleRunResult
-}
-
-' =====================
-' Relationships
-' =====================
-
-TradingBotApp --> CycleScheduler
-CycleScheduler --> OrchestratorABC
-TradingOrchestrator ..|> OrchestratorABC
-
-TradingOrchestrator --> BrokerABC
-TradingOrchestrator --> StrategyABC
-TradingOrchestrator --> RiskEngineABC
-TradingOrchestrator --> ExecutionPolicyABC
-TradingOrchestrator --> CycleSnapshotBuilderABC
-
-RiskEngine ..|> RiskEngineABC
-RiskEngine --> RiskRuleABC
-
-DefaultExecutionPolicy ..|> ExecutionPolicyABC
-DefaultCycleSnapshotBuilder ..|> CycleSnapshotBuilderABC
-
-CycleSnapshot ..|> CycleSnapshotABC
-
-BrokerFactoryFacade ..|> BrokerFactoryFacadeABC
-BrokerBuilderRegistry ..|> BrokerBuilderRegistryABC
-
-BrokerFactoryFacade --> BrokerBuilderRegistryABC
-BrokerBuilderRegistry --> BrokerBuilderABC
-BrokerBuilderABC --> BrokerABC
-
-AlpacaBroker ..|> BrokerABC
-IbkrBroker ..|> BrokerABC
-
-AlpacaBrokerBuilder ..|> BrokerBuilderABC
-IbkrBrokerBuilder ..|> BrokerBuilderABC
-
-EnvAppConfigLoader --> AppConfig
-AppBootstrapper --> EnvAppConfigLoader
-AppBootstrapper --> BrokerFactoryFacadeABC
-AppBootstrapper --> CycleScheduler
-AppBootstrapper --> OrchestratorABC
-
+    TradingOrchestrator --> BrokerABC : uses
+    TradingOrchestrator --> StrategyABC : uses
+    TradingOrchestrator --> RiskEngineABC : uses
 @enduml
+
+
+
+' @startuml
+' skinparam style strictuml
+' skinparam classAttributeIconSize 0
+
+' ' ============================================================
+' ' TradingBot - target SOLID architecture (revised)
+' ' Fixes applied:
+' ' - RiskRuleABC.apply(snapshot, intent) one-at-a-time
+' ' - Scheduler depends on OrchestratorABC (DIP)
+' ' - ExecutionPolicy outputs domain OrderSpec (not broker payload)
+' ' - Typo fixed: closing ">" in return types
+' ' ============================================================
+
+' package "presentation (composition root)" {
+'   class AppBootstrapper {
+'     +bootstrap() : TradingBotApp
+'   }
+
+'   class TradingBotApp {
+'     -scheduler : CycleScheduler
+'     +run_forever() : void
+'     +run_once() : void
+'   }
+' }
+
+' package "application" {
+'   class CycleScheduler {
+'     -orchestrator : OrchestratorABC
+'     +run_forever() : void
+'     +run_once() : CycleRunResult
+'   }
+
+'   interface OrchestratorABC {
+'     +run_cycle() : CycleRunResult
+'   }
+
+'   class TradingOrchestrator {
+'     -broker : BrokerABC
+'     -strategies : List<StrategyABC>
+'     -risk_engine : RiskEngineABC
+'     -execution_policy : ExecutionPolicyABC
+'     -snapshot_builder : CycleSnapshotBuilderABC
+'     +run_cycle() : CycleRunResult
+'   }
+
+'   interface RiskEngineABC {
+'     +evaluate(snapshot : CycleSnapshotABC, intents : List<Intent>) : RiskEvaluationResult
+'   }
+
+'   class RiskEngine {
+'     -rules : List<RiskRuleABC>
+'     +evaluate(snapshot : CycleSnapshotABC, intents : List<Intent>) : RiskEvaluationResult
+'   }
+
+'   interface RiskRuleABC {
+'     +apply(snapshot : CycleSnapshotABC, intent : Intent) : RiskRuleOutcome
+'   }
+
+'   interface ExecutionPolicyABC {
+'     +to_order_specs(snapshot : CycleSnapshotABC, approved_intents : List<Intent>) : List<OrderSpec>
+'   }
+
+'   class DefaultExecutionPolicy {
+'     +to_order_specs(snapshot : CycleSnapshotABC, approved_intents : List<Intent>) : List<OrderSpec>
+'   }
+
+'   interface CycleSnapshotBuilderABC {
+'     +build_snapshot(broker : BrokerABC, universe : Set<Symbol>) : CycleSnapshotABC
+'   }
+
+'   class DefaultCycleSnapshotBuilder {
+'     +build_snapshot(broker : BrokerABC, universe : Set<Symbol>) : CycleSnapshotABC
+'   }
+' }
+
+' package "ports (interfaces)" {
+'   interface StrategyABC {
+'     +strategy_id() : str
+'     +universe() : Set<Symbol>
+'     +generate_intents(snapshot : CycleSnapshotABC) : List<Intent>
+'   }
+
+'   interface BrokerABC {
+'     +get_account_snapshot() : AccountSnapshot
+'     +get_positions() : List<Position>
+'     +get_open_orders() : List<Order>
+'     +get_quotes(symbols : Set<Symbol>) : Map<Symbol, Quote>
+'     +submit_orders(order_specs : List<OrderSpec>) : List<OrderAck>
+'     +cancel_orders(order_ids : List<OrderId>) : void
+'   }
+
+'   interface CycleSnapshotABC {
+'     +as_of_utc() : datetime
+'     +account() : AccountSnapshot
+'     +positions() : List<Position>
+'     +open_orders() : List<Order>
+'     +quotes() : Map<Symbol, Quote>
+'   }
+
+'   interface BrokerBuilderABC {
+'     +broker_key() : str
+'     +build(app_cfg : AppConfig) : BrokerABC
+'   }
+
+'   interface BrokerBuilderRegistryABC {
+'     +register(builder : BrokerBuilderABC) : void
+'     +get(broker_key : str) : BrokerBuilderABC
+'   }
+
+'   interface BrokerFactoryFacadeABC {
+'     +build_broker(app_cfg : AppConfig) : BrokerABC
+'   }
+' }
+
+' package "infrastructure (integrations)" {
+'   class BrokerBuilderRegistry {
+'     -builders : Map<str, BrokerBuilderABC>
+'     +register(builder : BrokerBuilderABC) : void
+'     +get(broker_key : str) : BrokerBuilderABC
+'   }
+
+'   class BrokerFactoryFacade {
+'     -registry : BrokerBuilderRegistryABC
+'     +build_broker(app_cfg : AppConfig) : BrokerABC
+'   }
+
+'   class AlpacaBroker
+'   class AlpacaBrokerBuilder
+
+'   class IbkrBroker
+'   class IbkrBrokerBuilder
+
+'   class EnvAppConfigLoader {
+'     +load_app_config() : AppConfig
+'   }
+' }
+
+' package "domain (stable types)" {
+'   class AppConfig
+'   class Intent
+'   class OrderSpec
+'   class OrderAck
+
+'   class AccountSnapshot
+'   class Position
+'   class Order
+'   class Quote
+'   class Symbol
+'   class OrderId
+
+'   class CycleSnapshot {
+'     +as_of_utc : datetime
+'     +account : AccountSnapshot
+'     +positions : List<Position>
+'     +open_orders : List<Order>
+'     +quotes : Map<Symbol, Quote>
+'   }
+
+'   class RiskEvaluationResult
+'   class RiskRuleOutcome
+'   class CycleRunResult
+' }
+
+' ' =====================
+' ' Relationships
+' ' =====================
+
+' TradingBotApp --> CycleScheduler
+' CycleScheduler --> OrchestratorABC
+' TradingOrchestrator ..|> OrchestratorABC
+
+' TradingOrchestrator --> BrokerABC
+' TradingOrchestrator --> StrategyABC
+' TradingOrchestrator --> RiskEngineABC
+' TradingOrchestrator --> ExecutionPolicyABC
+' TradingOrchestrator --> CycleSnapshotBuilderABC
+
+' RiskEngine ..|> RiskEngineABC
+' RiskEngine --> RiskRuleABC
+
+' DefaultExecutionPolicy ..|> ExecutionPolicyABC
+' DefaultCycleSnapshotBuilder ..|> CycleSnapshotBuilderABC
+
+' CycleSnapshot ..|> CycleSnapshotABC
+
+' BrokerFactoryFacade ..|> BrokerFactoryFacadeABC
+' BrokerBuilderRegistry ..|> BrokerBuilderRegistryABC
+
+' BrokerFactoryFacade --> BrokerBuilderRegistryABC
+' BrokerBuilderRegistry --> BrokerBuilderABC
+' BrokerBuilderABC --> BrokerABC
+
+' AlpacaBroker ..|> BrokerABC
+' IbkrBroker ..|> BrokerABC
+
+' AlpacaBrokerBuilder ..|> BrokerBuilderABC
+' IbkrBrokerBuilder ..|> BrokerBuilderABC
+
+' EnvAppConfigLoader --> AppConfig
+' AppBootstrapper --> EnvAppConfigLoader
+' AppBootstrapper --> BrokerFactoryFacadeABC
+' AppBootstrapper --> CycleScheduler
+' AppBootstrapper --> OrchestratorABC
+
+' @enduml
 
 
 

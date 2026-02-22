@@ -1,0 +1,2979 @@
+
+============================================================
+FILE: .\config.yaml
+============================================================
+
+strategies:
+  - name: pmcc
+    pmcc:
+      underlying_symbol: SPY
+      max_units: 1
+
+      leap:
+        dte_min: 365
+        dte_max: 545
+        target_delta: 0.80
+
+      short:
+        dte_min: 21
+        dte_max: 45
+        target_delta: 0.20
+
+      roll:
+        dte_threshold: 14
+        delta_threshold: 0.35
+        profit_pct: 0.50
+
+      liquidity:
+        max_leap_spread_pct: 0.10
+        max_near_spread_pct: 0.10
+
+      risk:
+        equity_budget_pct: 0.05
+        max_option_bp_fraction: 0.50
+        max_debit_per_spread_usd: 1500
+        max_contracts_per_intent: 1
+        slippage_factor: 1.05
+        ignore_spread_checks: false
+
+
+============================================================
+FILE: .\pack_repo.py
+============================================================
+
+import os
+
+# Folders and files to ignore
+IGNORE_DIRS = {'.git', '__pycache__', 'venv', '.venv', 'env', '.env', '.idea', '.vscode', 'node_modules', 'logs', 'data', 'docs','TradingBot.egg-info', 'Bot.zip', 'tests', 'TradingBot_mapped','codebase.txt','uv.lock','.dependencygraph', 'out'}
+ALLOWED_EXTENSIONS = {'.py', '.md', '.json', '.yaml', '.yml', '.ini'}
+
+with open("codebase.txt", "w", encoding="utf-8") as outfile:
+    for root, dirs, files in os.walk("."):
+        # Modify dirs in-place to skip ignored directories
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        
+        for file in files:
+            if any(file.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+                filepath = os.path.join(root, file)
+                if filepath == "./pack_repo.py":
+                    continue
+                
+                outfile.write(f"\n{'='*60}\n")
+                outfile.write(f"FILE: {filepath}\n")
+                outfile.write(f"{'='*60}\n\n")
+                
+                try:
+                    with open(filepath, "r", encoding="utf-8") as infile:
+                        outfile.write(infile.read() + "\n")
+                except Exception as e:
+                    outfile.write(f"[Error reading file: {e}]\n")
+
+print("Finished! Upload codebase.txt to the AI.")
+
+============================================================
+FILE: .\config\config.yaml
+============================================================
+
+default_dry_run: false
+cycle_seconds: 60
+
+risk:
+  enable_open_order_dedupe: true
+
+strategies:
+  - name: pmcc
+    pmcc:
+      underlying_symbol: SPY
+      max_units: 2
+
+      leap:
+        dte_min: 365
+        dte_max: 545
+        target_delta: 0.80
+
+      short:
+        dte_min: 21
+        dte_max: 45
+        target_delta: 0.20
+
+      roll:
+        dte_threshold: 7
+        delta_threshold: 0.35
+        profit_pct: 0.50
+
+      liquidity:
+        max_leap_spread_pct: 0.15
+        max_near_spread_pct: 0.20
+
+      risk:
+        equity_budget_pct: 0.50
+        max_option_bp_fraction: 0.20
+        max_debit_per_spread_usd: 20000
+        max_contracts_per_intent: 10
+        slippage_factor: 1.05
+        ignore_spread_checks: false
+
+
+============================================================
+FILE: .\src\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\app\container.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from src.config.env_config import EnvConfig, load_env_config
+from src.config.yaml_config import AppConfig, load_app_config
+
+
+@dataclass(frozen=True)
+class SettingsRuntime:
+    app_cfg: AppConfig
+    env_cfg: EnvConfig
+
+
+def build_settings_runtime(config_path: Optional[Path] = None) -> SettingsRuntime:
+    return SettingsRuntime(
+        app_cfg=load_app_config(config_path),
+        env_cfg=load_env_config(),
+    )
+
+
+============================================================
+FILE: .\src\app\main.py
+============================================================
+
+from __future__ import annotations
+
+import sys
+
+from src.app.container import build_settings_runtime
+from src.app.scheduler import Scheduler, SchedulerConfig
+from src.brokers.factory import BrokerFactoryFacade
+from src.brokers.registry import AlpacaBrokerBuilder, BrokerBuilderRegistry
+from src.execution.default_execution_policy import DefaultExecutionPolicy
+from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+from src.orchestration.orchestrator import TradingOrchestrator
+from src.risk.evaluators import OptionIntentEvaluator, PmccIntentEvaluator
+from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
+from src.risk.risk_engine import RiskEngine
+from src.risk.rules.open_order_rule import OpenOrderDedupeRule
+from src.signals.signal_pipeline import DefaultSignalPipeline
+from src.strategies.pmcc_strategy import PmccStrategy
+from src.strategies.registry import StrategyBuilderRegistry
+from src.utilities.logger import setup_logger
+from src.domain.intents import PmccIntentPayload, OptionIntentPayload
+
+logger = setup_logger("Main")
+
+
+def main() -> int:
+    settings = build_settings_runtime()
+    app_cfg  = settings.app_cfg
+
+    logger.info("Trading bot starting | config=%s", app_cfg.config_path)
+
+    broker  = _build_broker(settings.env_cfg)
+    strategies = _build_strategies(app_cfg.strategies)
+    risk_engine = _build_risk_engine(app_cfg)
+
+    orchestrator = TradingOrchestrator(
+        broker=broker,
+        strategies=strategies,
+        risk_engine=risk_engine,
+        execution_policy=DefaultExecutionPolicy(),
+        snapshot_builder=CycleSnapshotBuilder(broker=broker),
+        signal_pipeline=DefaultSignalPipeline(),
+        dry_run=app_cfg.default_dry_run,
+    )
+
+    scheduler = Scheduler(
+        orchestrator=orchestrator,
+        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds),
+    )
+    scheduler.run()
+    return 0
+
+
+def _build_broker(env_cfg):
+    registry = BrokerBuilderRegistry()
+    registry.register("alpaca", AlpacaBrokerBuilder())
+    return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
+
+
+def _build_strategies(specs):
+    registry = StrategyBuilderRegistry()
+    registry.register("pmcc", lambda spec: PmccStrategy(config=spec.pmcc))
+    return registry.build_all(specs)
+
+
+def _build_risk_engine(app_cfg):
+    engine = RiskEngine(rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else [])
+
+    # Find PMCC config for sizer — use first PMCC strategy found
+    pmcc_risk_cfg = next(
+        (s.pmcc.risk for s in app_cfg.strategies if s.pmcc is not None),
+        None,
+    )
+
+    sizing_cfg = PmccSizingConfig(
+        equity_budget_pct=pmcc_risk_cfg.equity_budget_pct            if pmcc_risk_cfg else 0.05,
+        max_option_bp_fraction=pmcc_risk_cfg.max_option_bp_fraction  if pmcc_risk_cfg else 0.25,
+        max_debit_per_spread_usd=pmcc_risk_cfg.max_debit_per_spread_usd if pmcc_risk_cfg else 5000.0,
+        max_contracts_per_intent=pmcc_risk_cfg.max_contracts_per_intent if pmcc_risk_cfg else 5,
+        slippage_factor=pmcc_risk_cfg.slippage_factor                if pmcc_risk_cfg else 1.02,
+    )
+    max_units = next(
+        (s.pmcc.max_units for s in app_cfg.strategies if s.pmcc is not None),
+        2,
+    )
+
+    engine.register(PmccIntentPayload, PmccIntentEvaluator(sizer=PmccSizer(config=sizing_cfg), max_units=max_units))
+    engine.register(OptionIntentPayload, OptionIntentEvaluator())
+    return engine
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+============================================================
+FILE: .\src\app\scheduler.py
+============================================================
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from src.orchestration.orchestrator_interface import OrchestratorABC
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("Scheduler")
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    cycle_seconds: float = 60.0
+    max_cycles:    int   = 0   # 0 = run forever
+
+
+@dataclass
+class Scheduler:
+    orchestrator: OrchestratorABC
+    config:       SchedulerConfig
+
+    def run(self) -> None:
+        cycle_count = 0
+        logger.info("Scheduler started | cycle_seconds=%.1f", self.config.cycle_seconds)
+
+        while True:
+            try:
+                result = self.orchestrator.run_cycle()
+                cycle_count += 1
+                logger.info(
+                    "Cycle %d complete | submitted=%d approved=%d rejected=%d",
+                    cycle_count, result.orders_submitted, result.intents_approved, result.intents_rejected,
+                )
+            except KeyboardInterrupt:
+                logger.info("Scheduler interrupted — shutting down")
+                break
+            except Exception:
+                logger.exception("Unhandled exception in cycle %d", cycle_count + 1)
+
+            if self.config.max_cycles > 0 and cycle_count >= self.config.max_cycles:
+                logger.info("Max cycles reached (%d) — stopping", self.config.max_cycles)
+                break
+
+            time.sleep(self.config.cycle_seconds)
+
+
+============================================================
+FILE: .\src\app\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\brokers\alpaca_broker.py
+============================================================
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+from src.brokers.broker_base import BrokerBase
+from src.brokers.errors import BrokerConnectionError
+from src.brokers.interfaces import BrokerABC
+from src.domain.orders import (
+    MarketOrder,
+    MultiLegLimitOrder,
+    OrderABC,
+    OrderSide as DomainOrderSide,
+    TimeInForce as DomainTIF,
+)
+from src.domain.types import AssetQuote
+from src.utilities.logger import setup_logger
+
+if TYPE_CHECKING:
+    from alpaca.trading.client import TradingClient
+
+logger = setup_logger("AlpacaBroker")
+
+
+class AlpacaBroker(BrokerBase, BrokerABC):
+    """
+    Adapter: wraps the Alpaca REST API behind BrokerABC.
+    All Alpaca-specific SDK knowledge is contained here.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key:                 str,
+        api_secret:              str,
+        paper:                   bool  = True,
+        request_timeout_seconds: float = 10.0,
+        connect_timeout_seconds: float = 3.0,
+    ) -> None:
+        self._api_key           = api_key
+        self._api_secret        = api_secret
+        self._paper             = paper
+        self._request_timeout   = request_timeout_seconds
+        self._connect_timeout   = connect_timeout_seconds
+        self._session: Optional[Session]          = None
+        self._trading_client: Optional["TradingClient"] = None
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _base_url_v2(self) -> str:
+        base = "https://paper-api.alpaca.markets" if self._paper else "https://api.alpaca.markets"
+        return f"{base}/v2"
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "APCA-API-KEY-ID":     self._api_key,
+            "APCA-API-SECRET-KEY": self._api_secret,
+        }
+
+    def _ensure_session(self) -> Session:
+        if self._session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+            session.mount("https://", adapter)
+            session.mount("http://",  adapter)
+            self._session = session
+            logger.info("HTTP session created | paper=%s", self._paper)
+        return self._session
+
+    def _ensure_trading_client(self) -> "TradingClient":
+        if self._trading_client is None:
+            from alpaca.trading.client import TradingClient
+            self._trading_client = TradingClient(
+                api_key=self._api_key,
+                secret_key=self._api_secret,
+                paper=self._paper,
+            )
+        return self._trading_client
+
+    def _request_json(self, method: str, path: str, *, params: Optional[Dict] = None) -> Any:
+        return self._request_json_url(method, self._base_url_v2() + path, params=params)
+
+    def _request_json_url(self, method: str, url: str, *, params: Optional[Dict] = None) -> Any:
+        session  = self._ensure_session()
+        timeout  = (self._connect_timeout, self._request_timeout)
+        response = session.request(method, url, headers=self._headers(), params=params, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _quantise_2dp(value: Decimal) -> Decimal:
+        return value.quantize(Decimal("0.01"))
+
+    # ------------------------------------------------------------------
+    # ExecutionBrokerABC
+    # ------------------------------------------------------------------
+
+    def get_account_snapshot(self) -> Dict[str, Any]:
+        self._log_io_boundary("get_account_snapshot")
+        return self._request_json("GET", "/account")  # type: ignore[return-value]
+
+    def get_option_buying_power(self) -> float:
+        return self._safe_float(self.get_account_snapshot().get("options_buying_power"))
+
+    def get_equity(self) -> float:
+        return self._safe_float(self.get_account_snapshot().get("equity"))
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        self._log_io_boundary("get_positions")
+        data = self._request_json("GET", "/positions")
+        return [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        self._log_io_boundary("get_open_orders")
+        data = self._request_json("GET", "/orders", params={"status": "open"})
+        return [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
+
+    def submit_order(self, order: OrderABC) -> Any:
+        self._log_io_boundary("submit_order")
+        if isinstance(order, MultiLegLimitOrder):
+            return self._ensure_trading_client().submit_order(order_data=self._to_alpaca_mleg(order))
+        if isinstance(order, MarketOrder):
+            return self._ensure_trading_client().submit_order(order_data=self._to_alpaca_market(order))
+        raise TypeError(f"Unsupported order type: {type(order).__name__}")
+
+    def cancel_order(self, order_id: str) -> None:
+        self._log_io_boundary("cancel_order")
+        self._request_json("DELETE", f"/orders/{order_id.strip()}")
+
+    # ------------------------------------------------------------------
+    # MarketDataProviderABC
+    # ------------------------------------------------------------------
+
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
+        self._log_io_boundary("get_asset_quote")
+        sym  = symbol.strip().upper()
+        url  = f"https://data.alpaca.markets/v2/stocks/{sym}/quotes/latest"
+        data = self._request_json_url("GET", url, params={"feed": "iex"})
+        if not isinstance(data, dict):
+            raise BrokerConnectionError("alpaca", f"Unexpected response for {sym}")
+        q = data.get("quote")
+        if not isinstance(q, dict):
+            raise BrokerConnectionError("alpaca", f"Missing 'quote' for {sym}")
+        ask = self._safe_float(q.get("ap"))
+        bid = self._safe_float(q.get("bp"))
+        mid = (ask + bid) / 2.0 if ask > 0 and bid > 0 else None
+        return AssetQuote(symbol=sym, bid=bid or None, ask=ask or None, mid=mid, timestamp_utc=None)
+
+    def get_latest_price(self, symbol: str) -> float:
+        q = self.get_asset_quote(symbol)
+        for v in (q.mid, q.ask, q.bid):
+            if isinstance(v, float) and v > 0:
+                return v
+        raise BrokerConnectionError("alpaca", f"No usable price for {symbol}")
+
+    def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
+        self._log_io_boundary("get_daily_bars")
+        sym   = symbol.strip().upper()
+        end   = datetime.now(timezone.utc)
+        start = end - timedelta(days=lookback_days + 5)
+        url   = f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
+        return self._request_json_url("GET", url, params={
+            "timeframe":  "1Day",
+            "start":      start.isoformat(),
+            "end":        end.isoformat(),
+            "adjustment": "raw",
+            "feed":       "iex",
+            "limit":      1000,
+        })
+
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls:       bool            = True,
+        include_puts:        bool            = False,
+        feed:                str             = "indicative",
+        max_age_seconds:     int             = 30,
+        limit:               int             = 0,
+        strike_price_gte:    Optional[float] = None,
+        strike_price_lte:    Optional[float] = None,
+        expiration_date:     Optional[date]  = None,
+        expiration_date_gte: Optional[date]  = None,
+        expiration_date_lte: Optional[date]  = None,
+        root_symbol:         Optional[str]   = None,
+        updated_since:       Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        self._log_io_boundary("get_option_chain")
+        sym    = underlying.strip().upper()
+        url    = f"https://data.alpaca.markets/v1beta1/options/snapshots/{sym}"
+        params: Dict[str, Any] = {"feed": feed.strip().lower()}
+
+        if include_calls and not include_puts:
+            params["type"] = "call"
+        elif include_puts and not include_calls:
+            params["type"] = "put"
+        if strike_price_gte is not None:
+            params["strike_price_gte"] = strike_price_gte
+        if strike_price_lte is not None:
+            params["strike_price_lte"] = strike_price_lte
+        if expiration_date is not None:
+            params["expiration_date"] = expiration_date.isoformat()
+        if expiration_date_gte is not None:
+            params["expiration_date_gte"] = expiration_date_gte.isoformat()
+        if expiration_date_lte is not None:
+            params["expiration_date_lte"] = expiration_date_lte.isoformat()
+        if root_symbol:
+            params["root_symbol"] = root_symbol.strip().upper()
+        if updated_since is not None:
+            params["updated_since"] = (
+                updated_since.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+
+        chain: List[Dict[str, Any]] = []
+        next_page: Optional[str] = None
+
+        while True:
+            p = dict(params)
+            if next_page:
+                p["page_token"] = next_page
+            data = self._request_json_url("GET", url, params=p)
+            if not isinstance(data, dict):
+                raise BrokerConnectionError("alpaca", f"Unexpected chain response for {sym}")
+            for contract_sym, snap in (data.get("snapshots") or {}).items():
+                if isinstance(snap, dict):
+                    row = dict(snap)
+                    row["contract_symbol"] = contract_sym
+                    chain.append(row)
+                    if 0 < limit <= len(chain):
+                        return chain
+            nxt = data.get("next_page_token")
+            next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
+            if not next_page:
+                break
+
+        return chain
+
+    # ------------------------------------------------------------------
+    # Private Alpaca order builders
+    # ------------------------------------------------------------------
+
+    def _to_alpaca_mleg(self, order: MultiLegLimitOrder) -> Any:
+        try:
+            from alpaca.trading.enums import OrderClass, OrderType
+            from alpaca.trading.enums import TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
+            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+        except ImportError as exc:
+            raise RuntimeError("alpaca-py is not installed") from exc
+
+        tif  = AlpacaTIF.DAY if order.time_in_force == DomainTIF.DAY else AlpacaTIF.GTC
+        legs = [
+            OptionLegRequest(
+                symbol=str(leg.contract.option_symbol).strip().upper(),
+                side=AlpacaSide.BUY if leg.side == DomainOrderSide.BUY else AlpacaSide.SELL,
+                ratio_qty=int(leg.ratio),
+            )
+            for leg in order.legs
+        ]
+        if len(legs) < 2:
+            raise ValueError("MLEG order requires at least 2 legs")
+
+        return LimitOrderRequest(
+            type=OrderType.LIMIT,
+            order_class=OrderClass.MLEG,
+            qty=float(order.quantity),
+            limit_price=float(self._quantise_2dp(order.limit_price)),
+            time_in_force=tif,
+            client_order_id=str(order.client_order_id),
+            legs=legs,
+        )
+
+    def _to_alpaca_market(self, order: MarketOrder) -> Any:
+        try:
+            from alpaca.trading.enums import TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
+            from alpaca.trading.requests import MarketOrderRequest
+        except ImportError as exc:
+            raise RuntimeError("alpaca-py is not installed") from exc
+
+        return MarketOrderRequest(
+            symbol=order.symbol,
+            qty=order.quantity,
+            side=AlpacaSide.BUY if order.side == DomainOrderSide.BUY else AlpacaSide.SELL,
+            time_in_force=AlpacaTIF.DAY if order.time_in_force == DomainTIF.DAY else AlpacaTIF.GTC,
+        )
+
+
+============================================================
+FILE: .\src\brokers\alpaca_factory.py
+============================================================
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from src.brokers.alpaca_broker import AlpacaBroker
+from src.brokers.errors import MissingBrokerCredentialsError
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("AlpacaFactory")
+
+
+def _env(name: str) -> Optional[str]:
+    v = os.getenv(name, "").strip()
+    return v or None
+
+
+def _mask(v: Optional[str], n: int = 4) -> str:
+    if not v:
+        return "<missing>"
+    return v[:n] + "*" * max(0, len(v) - n)
+
+
+def build_alpaca_broker(request_timeout_seconds: float = 10.0) -> AlpacaBroker:
+    mode = (_env("ALPACA_MODE") or "paper").lower()
+    creds = {
+        "paper": ("ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET"),
+        "live":  ("ALPACA_LIVE_API_KEY",  "ALPACA_LIVE_API_SECRET"),
+    }
+    key_var, sec_var = creds.get(mode, creds["paper"])
+
+    api_key    = _env(key_var)
+    api_secret = _env(sec_var)
+
+    logger.info("Alpaca mode=%s key=%s", mode, _mask(api_key))
+
+    if api_key is None or api_secret is None:
+        raise MissingBrokerCredentialsError(
+            broker_name=f"alpaca({mode})",
+            required_env_vars=(key_var, sec_var),
+        )
+
+    return AlpacaBroker(
+        api_key=api_key,
+        api_secret=api_secret,
+        paper=(mode != "live"),
+        request_timeout_seconds=request_timeout_seconds,
+    )
+
+
+============================================================
+FILE: .\src\brokers\broker_base.py
+============================================================
+
+from __future__ import annotations
+
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("BrokerBase")
+
+
+class BrokerBase:
+    """Shared helpers for broker adapters."""
+
+    def _log_io_boundary(self, method_name: str) -> None:
+        logger.info("Broker IO | method=%s", method_name)
+
+    @staticmethod
+    def _safe_float(value, *, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+
+============================================================
+FILE: .\src\brokers\errors.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Sequence
+
+
+@dataclass(frozen=True)
+class MissingBrokerCredentialsError(ValueError):
+    broker_name:       str
+    required_env_vars: Sequence[str]
+
+    def __str__(self) -> str:
+        return (
+            f"No credentials for {self.broker_name}. "
+            f"Set: {', '.join(self.required_env_vars)}"
+        )
+
+
+class BrokerConnectionError(RuntimeError):
+    def __init__(self, broker_name: str, message: str) -> None:
+        super().__init__(f"{broker_name}: {message}")
+        self.broker_name = broker_name
+
+
+============================================================
+FILE: .\src\brokers\factory.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from src.brokers.interfaces import BrokerABC
+from src.brokers.registry import BrokerBuilderRegistryABC
+from src.config.env_config import EnvConfig
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("BrokerFactory")
+
+
+@dataclass(frozen=True)
+class BrokerFactoryFacade:
+    registry: BrokerBuilderRegistryABC
+
+    def build_broker(self, *, env_cfg: EnvConfig) -> BrokerABC:
+        name = str(env_cfg.broker_name).strip()
+        logger.info("Building broker | name=%s", name)
+        broker = self.registry.get_builder(name).build(env_cfg)
+        logger.info("Broker built | type=%s", type(broker).__name__)
+        return broker
+
+
+============================================================
+FILE: .\src\brokers\interfaces.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
+
+from src.domain.orders import OrderABC
+from src.domain.types import AssetQuote
+
+
+class MarketDataProviderABC(ABC):
+
+    @abstractmethod
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_latest_price(self, symbol: str) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls:       bool            = True,
+        include_puts:        bool            = False,
+        feed:                str             = "indicative",
+        max_age_seconds:     int             = 30,
+        limit:               int             = 0,
+        strike_price_gte:    Optional[float] = None,
+        strike_price_lte:    Optional[float] = None,
+        expiration_date:     Optional[date]  = None,
+        expiration_date_gte: Optional[date]  = None,
+        expiration_date_lte: Optional[date]  = None,
+        root_symbol:         Optional[str]   = None,
+        updated_since:       Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+    
+
+    
+
+class ExecutionBrokerABC(ABC):
+
+    @abstractmethod
+    def get_equity(self) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    # THis is to use the individual methods to provide an entire account snapshot. Not sure yet how to deal with this. 
+    def get_account_snapshot(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_option_buying_power(self) -> float:
+        raise NotImplementedError
+    @abstractmethod
+    def get_positions(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def submit_order(self, order: OrderABC) -> Any:
+        raise NotImplementedError
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> None:
+        raise NotImplementedError
+
+
+class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
+    """Full broker — composition of market data + execution. Depend on the narrow interface where possible."""
+
+
+============================================================
+FILE: .\src\brokers\registry.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Dict
+
+from src.brokers.interfaces import BrokerABC
+from src.config.env_config import EnvConfig
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("BrokerRegistry")
+
+
+class BrokerBuilderABC(ABC):
+    """
+    Abstract Broker Builder.
+
+    Purpose:
+    - Defines the contract for "how to build a BrokerABC" given EnvConfig.
+    - This is the plug-in interface for new brokers.
+
+    Key idea:
+    - Code that needs a broker should depend on BrokerABC.
+    - Code that chooses which broker to construct should depend on BrokerBuilderABC,
+      not on AlpacaBroker, IbkrBroker, etc.
+
+    Why an ABC here:
+    - It forces every broker integration to provide a consistent build(env_cfg) entry point.
+    - It prevents leaking broker-specific constructor details into the rest of the application.
+    """
+
+    @abstractmethod
+    def build(self, env_cfg: EnvConfig) -> BrokerABC:
+        """
+        Build and return a concrete broker implementation that satisfies BrokerABC.
+
+        env_cfg:
+        - Contains environment-driven settings such as broker name, api keys, mode, etc.
+
+        Returns:
+        - A fully configured BrokerABC (for example AlpacaBroker).
+        """
+        raise NotImplementedError
+
+
+class BrokerBuilderRegistryABC(ABC):
+    """
+    Abstract Registry interface.
+
+    Purpose:
+    - Defines how builders are stored and retrieved.
+    - Allows you to swap out the registry implementation later (for example, add validation,
+      allow aliases, support lazy registration, support discovery) without rewriting callers.
+
+    The registry is a map:
+    - broker_name (string key) -> BrokerBuilderABC (builder instance)
+    """
+
+    @abstractmethod
+    def register(self, name: str, builder: BrokerBuilderABC) -> None:
+        """
+        Register a builder under a broker name.
+
+        Example:
+        - register("alpaca", AlpacaBrokerBuilder())
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_builder(self, name: str) -> BrokerBuilderABC:
+        """
+        Lookup and return the builder for the given broker name.
+
+        The caller typically provides the value from configuration, for example:
+        - env_cfg.broker_name
+        """
+        raise NotImplementedError
+
+
+@dataclass
+class BrokerBuilderRegistry(BrokerBuilderRegistryABC):
+    """
+    Concrete in-memory registry.
+
+    How it is used:
+    - Startup code registers supported brokers (alpaca, ibkr, etc.).
+    - A factory (often called BrokerFactoryFacade) retrieves the correct builder based on config.
+    - The builder constructs the actual BrokerABC instance.
+
+    Why keep builders in a registry instead of if/elif?
+    - It avoids a growing conditional chain in your factory or main entry point.
+    - New brokers become a small, isolated change: implement a builder + register it.
+    - The application remains open for extension but closed for modification (OCP).
+    """
+
+    _builders: Dict[str, BrokerBuilderABC] = field(default_factory=dict, init=False)
+
+    def register(self, name: str, builder: BrokerBuilderABC) -> None:
+        """
+        Store the builder using a normalised (lowercased, stripped) key.
+
+        This normalisation reduces configuration fragility:
+        - "Alpaca", " alpaca ", "ALPACA" all map to the same entry.
+        """
+        self._builders[name.lower().strip()] = builder
+        logger.info("Registered broker builder | name=%s", name)
+
+    def get_builder(self, name: str) -> BrokerBuilderABC:
+        """
+        Retrieve a builder by broker name.
+
+        If the name is not registered:
+        - Raise KeyError with helpful diagnostics (show registered keys).
+        """
+        key = name.lower().strip()
+        if key not in self._builders:
+            raise KeyError(f"No broker builder for '{name}'. Registered: {list(self._builders)}")
+        return self._builders[key]
+
+
+class AlpacaBrokerBuilder(BrokerBuilderABC):
+    """
+    Concrete builder for Alpaca.
+
+    Responsibility:
+    - Knows how to construct an Alpaca broker instance.
+    - Contains the only direct dependency on alpaca construction code (alpaca_factory).
+
+    Important design rule:
+    - The rest of the codebase should not import alpaca_factory directly.
+    - Only this builder (and Alpaca-specific modules) should know about Alpaca construction.
+
+    Cooperation with a factory facade (typical flow):
+    - A factory reads env_cfg.broker_name (for example "alpaca").
+    - It asks the registry for the builder registered under that name.
+    - It calls builder.build(env_cfg) to create a BrokerABC.
+    - The returned broker is injected into the orchestrator and used via BrokerABC only.
+    """
+
+    def build(self, env_cfg: EnvConfig) -> BrokerABC:
+        """
+        Build and return an AlpacaBroker.
+
+        Note:
+        - This delegates to a factory function (build_alpaca_broker) which typically:
+          - reads env vars or uses env_cfg to obtain credentials
+          - configures paper/live mode
+          - returns a fully initialised AlpacaBroker adapter
+        """
+        from src.brokers.alpaca_factory import build_alpaca_broker
+        return build_alpaca_broker()
+
+
+============================================================
+FILE: .\src\brokers\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\config\env_config.py
+============================================================
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+
+
+def _repo_root() -> Path:
+    """
+    Resolve repository root deterministically.
+
+    This file is: <repo_root>/src/config/env_config.py
+    So repo_root is parents[2].
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_root_dotenv() -> None:
+    """
+    Load <repo_root>/.env if present.
+
+    override=False means real OS env vars win over .env.
+    """
+    dotenv_path = _repo_root() / ".env"
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+
+
+@dataclass(frozen=True)
+class AlpacaEnvConfig:
+    mode: str  # "paper" | "live"
+
+
+@dataclass(frozen=True)
+class EnvConfig:
+    broker_name: str
+    alpaca: AlpacaEnvConfig
+
+
+def _get_env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    if v is None:
+        return ""
+    return v.strip()
+
+
+def load_env_config() -> EnvConfig:
+    _load_root_dotenv()
+
+    return EnvConfig(
+        broker_name=_get_env("BROKER_NAME", "alpaca").lower(),
+        alpaca=AlpacaEnvConfig(mode=_get_env("ALPACA_MODE", "paper").lower()),
+    )
+
+
+============================================================
+FILE: .\src\config\yaml_config.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+import yaml
+
+
+@dataclass(frozen=True)
+class PmccLeapConfig:
+    dte_min:      int
+    dte_max:      int
+    target_delta: float
+
+
+@dataclass(frozen=True)
+class PmccShortConfig:
+    dte_min:      int
+    dte_max:      int
+    target_delta: float
+
+
+@dataclass(frozen=True)
+class PmccRollConfig:
+    dte_threshold:   int
+    delta_threshold: float
+    profit_pct:      float
+
+
+@dataclass(frozen=True)
+class PmccLiquidityConfig:
+    max_leap_spread_pct: float
+    max_near_spread_pct: float
+
+
+@dataclass(frozen=True)
+class PmccRiskConfig:
+    equity_budget_pct:        float
+    max_option_bp_fraction:   float
+    max_debit_per_spread_usd: float
+    max_contracts_per_intent: int
+    slippage_factor:          float
+    ignore_spread_checks:     bool
+
+
+@dataclass(frozen=True)
+class PmccConfig:
+    underlying_symbol: str
+    max_units:         int
+    leap:              PmccLeapConfig
+    short:             PmccShortConfig
+    roll:              PmccRollConfig
+    liquidity:         PmccLiquidityConfig
+    risk:              PmccRiskConfig
+
+
+@dataclass(frozen=True)
+class StrategySpec:
+    name: str
+    pmcc: Optional[PmccConfig] = None
+
+
+@dataclass(frozen=True)
+class GlobalRiskConfig:
+    enable_open_order_dedupe: bool = True
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    config_path:     Path
+    default_dry_run: bool
+    cycle_seconds:   float
+    risk:            GlobalRiskConfig
+    strategies:      List[StrategySpec]
+
+
+_SEARCH_PATHS = [
+    Path("config/config.yaml"),
+    Path("config.yaml"),
+    Path("../config/config.yaml"),
+]
+
+
+def load_app_config(path: Optional[Path] = None) -> AppConfig:
+    if path is None:
+        for candidate in _SEARCH_PATHS:
+            if candidate.exists():
+                path = candidate
+                break
+    if path is None or not path.exists():
+        raise FileNotFoundError(f"config.yaml not found. Searched: {_SEARCH_PATHS}")
+
+    raw = yaml.safe_load(path.read_text())
+
+    risk_raw    = raw.get("risk", {})
+    global_risk = GlobalRiskConfig(
+        enable_open_order_dedupe=bool(risk_raw.get("enable_open_order_dedupe", True)),
+    )
+
+    strategies: List[StrategySpec] = []
+    for s in raw.get("strategies", []):
+        name = s.get("name")
+        pmcc: Optional[PmccConfig] = None
+        if name == "pmcc" and "pmcc" in s:
+            p    = s["pmcc"]
+            pmcc = PmccConfig(
+                underlying_symbol=p["underlying_symbol"],
+                max_units=int(p["max_units"]),
+                leap=PmccLeapConfig(**p["leap"]),
+                short=PmccShortConfig(**p["short"]),
+                roll=PmccRollConfig(**p["roll"]),
+                liquidity=PmccLiquidityConfig(**p["liquidity"]),
+                risk=PmccRiskConfig(**p["risk"]),
+            )
+        strategies.append(StrategySpec(name=name, pmcc=pmcc))
+
+    return AppConfig(
+        config_path=path,
+        default_dry_run=bool(raw.get("default_dry_run", False)),
+        cycle_seconds=float(raw.get("cycle_seconds", 60)),
+        risk=global_risk,
+        strategies=strategies,
+    )
+
+
+============================================================
+FILE: .\src\config\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\domain\intents.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional, Tuple
+
+from src.domain.orders import OptionContract, TimeInForce
+from src.domain.types import IntentId, StrategyId, Symbol
+
+
+class PositionIntent(str, Enum):
+    BUY_TO_OPEN   = "BTO"
+    BUY_TO_CLOSE  = "BTC"
+    SELL_TO_OPEN  = "STO"
+    SELL_TO_CLOSE = "STC"
+
+
+class IntentPayloadABC(ABC):
+    """Marker base — every intent payload type extends this."""
+
+
+@dataclass(frozen=True)
+class SingleOptionLeg:
+    contract_symbol:  str
+    position_intent:  PositionIntent
+    qty:              Optional[int]
+
+
+@dataclass(frozen=True)
+class OptionIntentPayload(IntentPayloadABC):
+    """Single-leg management intent (sell NEAR, buy-back NEAR, etc.)."""
+    underlying_symbol: Symbol
+    leg:               SingleOptionLeg
+
+
+@dataclass(frozen=True)
+class SelectedOption:
+    option_symbol: str
+    contract:      OptionContract
+
+
+@dataclass(frozen=True)
+class PmccIntentPayload(IntentPayloadABC):
+    """PMCC entry intent — carries both legs so the sizer knows which is LEAP/NEAR."""
+    underlying_symbol: Symbol
+    leap_leg:          SelectedOption
+    near_leg:          SelectedOption
+
+
+def _make_intent_id(strategy_id: str, symbol: str) -> IntentId:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return IntentId(f"{strategy_id}:{symbol}:{ts}")
+
+
+@dataclass(frozen=True)
+class TradeIntent:
+    intent_id:     IntentId
+    strategy_id:   StrategyId
+    symbol:        Symbol
+    payload:       IntentPayloadABC
+    time_in_force: TimeInForce          = TimeInForce.DAY
+    tags:          Tuple[str, ...]      = field(default_factory=tuple)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        strategy_id:   StrategyId,
+        symbol:        Symbol,
+        payload:       IntentPayloadABC,
+        time_in_force: TimeInForce = TimeInForce.DAY,
+        tags:          Tuple[str, ...] = (),
+    ) -> "TradeIntent":
+        return cls(
+            intent_id=_make_intent_id(str(strategy_id), str(symbol)),
+            strategy_id=strategy_id,
+            symbol=symbol,
+            payload=payload,
+            time_in_force=time_in_force,
+            tags=tags,
+        )
+
+
+============================================================
+FILE: .\src\domain\orders.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+from typing import Sequence
+
+from src.domain.types import ClientOrderId, Symbol
+
+
+class TimeInForce(str, Enum):
+    DAY = "day"
+    GTC = "gtc"
+
+
+class OrderSide(str, Enum):
+    BUY  = "buy"
+    SELL = "sell"
+
+
+class OptionRight(str, Enum):
+    CALL = "call"
+    PUT  = "put"
+
+
+class OrderABC(ABC):
+    """Root type for all domain orders."""
+
+
+@dataclass(frozen=True)
+class OptionContract:
+    underlying:    str
+    expiry:        datetime
+    strike:        Decimal
+    right:         OptionRight
+    option_symbol: str
+
+
+@dataclass(frozen=True)
+class OptionLeg:
+    contract: OptionContract
+    side:     OrderSide
+    ratio:    int = 1
+
+
+@dataclass(frozen=True)
+class MultiLegLimitOrder(OrderABC):
+    client_order_id: ClientOrderId
+    underlying:      Symbol
+    legs:            Sequence[OptionLeg]
+    quantity:        int
+    limit_price:     Decimal
+    time_in_force:   TimeInForce = TimeInForce.DAY
+
+
+@dataclass(frozen=True)
+class MarketOrder(OrderABC):
+    client_order_id: ClientOrderId
+    symbol:          str
+    side:            OrderSide
+    quantity:        int
+    time_in_force:   TimeInForce = TimeInForce.DAY
+
+
+============================================================
+FILE: .\src\domain\signals.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Mapping
+
+
+class RegimeLabel(str, Enum):
+    UNKNOWN = "unknown"
+    BULL    = "bull"
+    BEAR    = "bear"
+    WHIPSAW = "whipsaw"
+
+
+@dataclass(frozen=True)
+class SignalSnapshot:
+    as_of_utc:         datetime
+    regime:            RegimeLabel         = RegimeLabel.UNKNOWN
+    regime_confidence: float               = 0.0
+    scalar_signals:    Mapping[str, float] = field(default_factory=dict)
+    iv_forecast:       Mapping[str, float] = field(default_factory=dict)
+
+    @classmethod
+    def empty(cls, *, as_of_utc: datetime) -> "SignalSnapshot":
+        return cls(as_of_utc=as_of_utc)
+
+
+============================================================
+FILE: .\src\domain\types.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import NewType, Optional
+
+IntentId      = NewType("IntentId",      str)
+StrategyId    = NewType("StrategyId",    str)
+ClientOrderId = NewType("ClientOrderId", str)
+Symbol        = NewType("Symbol",        str)
+
+
+def normalise_symbol(value: str) -> Symbol:
+    if not isinstance(value, str):
+        raise TypeError("Symbol must be a str")
+    cleaned = value.strip().upper()
+    if not cleaned:
+        raise ValueError("Symbol must not be empty")
+    return Symbol(cleaned)
+
+
+@dataclass(frozen=True, slots=True)
+class AssetQuote:
+    symbol:        str
+    bid:           Optional[float]
+    ask:           Optional[float]
+    mid:           Optional[float]
+    timestamp_utc: Optional[datetime]
+
+
+@dataclass(frozen=True)
+class OptionChainRequest:
+    underlying:          str
+    request_id:          str
+    include_calls:       bool           = True
+    include_puts:        bool           = False
+    feed:                str            = "indicative"
+    limit:               int            = 0
+    strike_price_gte:    Optional[float]    = None
+    strike_price_lte:    Optional[float]    = None
+    expiration_date:     Optional[date]     = None
+    expiration_date_gte: Optional[date]     = None
+    expiration_date_lte: Optional[date]     = None
+    root_symbol:         Optional[str]      = None
+    updated_since:       Optional[datetime] = None
+
+
+============================================================
+FILE: .\src\domain\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\execution\default_execution_policy.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from typing import List
+from uuid import uuid4
+
+from src.domain.orders import (
+    MarketOrder,
+    MultiLegLimitOrder,
+    OptionContract,
+    OptionLeg,
+    OptionRight,
+    OrderABC,
+    OrderSide,
+    TimeInForce,
+)
+from src.execution.execution_policy_interface import ExecutionPolicyABC
+from src.execution.order_specs import OptionMarketOrderSpec, PmccOrderSpec
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.risk.decisions import ApprovedIntent
+from src.risk.pmcc_sizer import parse_osi
+from src.utilities.logger import setup_logger
+from src.utilities.logging_utils import log_scope
+
+logger = setup_logger("DefaultExecutionPolicy")
+
+
+@dataclass(frozen=True)
+class DefaultExecutionPolicy(ExecutionPolicyABC):
+
+    def to_orders(self, approvals: List[ApprovedIntent]) -> List[OrderABC]:
+        orders: List[OrderABC] = []
+
+        for approval in approvals:
+            spec = approval.approval_payload
+
+            with log_scope("execution_policy.to_orders", logger, extra=type(spec).__name__):
+                if isinstance(spec, PmccOrderSpec):
+                    order = self._pmcc_to_mleg(spec)
+                    orders.append(order)
+
+                elif isinstance(spec, OptionMarketOrderSpec):
+                    order = self._option_spec_to_market(spec)
+                    orders.append(order)
+
+                else:
+                    logger.warning("No order builder for spec type=%s — skipping", type(spec).__name__)
+
+        return orders
+
+    # ------------------------------------------------------------------
+
+    def _pmcc_to_mleg(self, spec: PmccOrderSpec) -> MultiLegLimitOrder:
+        leap_parsed = parse_osi(spec.leap.option_symbol)
+        near_parsed = parse_osi(spec.near.option_symbol)
+
+        leap_contract = OptionContract(
+            underlying=str(spec.underlying),
+            expiry=leap_parsed.expiry,
+            strike=leap_parsed.strike,
+            right=OptionRight.CALL,
+            option_symbol=spec.leap.option_symbol,
+        )
+        near_contract = OptionContract(
+            underlying=str(spec.underlying),
+            expiry=near_parsed.expiry,
+            strike=near_parsed.strike,
+            right=OptionRight.CALL,
+            option_symbol=spec.near.option_symbol,
+        )
+
+        return MultiLegLimitOrder(
+            client_order_id=f"pmcc-{uuid4().hex[:12]}",
+            underlying=spec.underlying,
+            legs=[
+                OptionLeg(contract=leap_contract, side=OrderSide.BUY,  ratio=1),
+                OptionLeg(contract=near_contract, side=OrderSide.SELL, ratio=1),
+            ],
+            quantity=spec.quantity,
+            limit_price=spec.limit_price,
+            time_in_force=spec.time_in_force,
+        )
+
+    def _option_spec_to_market(self, spec: OptionMarketOrderSpec) -> MarketOrder:
+        intent = spec.position_intent.upper()
+        side   = OrderSide.BUY if intent in ("BTO", "BTC") else OrderSide.SELL
+
+        return MarketOrder(
+            client_order_id=f"opt-{uuid4().hex[:12]}",
+            symbol=spec.option_symbol,
+            side=side,
+            quantity=spec.quantity,
+            time_in_force=spec.time_in_force,
+        )
+
+
+============================================================
+FILE: .\src\execution\execution_policy_interface.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import List
+
+from src.domain.orders import OrderABC
+from src.risk.decisions import ApprovedIntent
+
+
+class ExecutionPolicyABC(ABC):
+    @abstractmethod
+    def to_orders(self, approvals: List[ApprovedIntent]) -> List[OrderABC]:
+        raise NotImplementedError
+
+
+============================================================
+FILE: .\src\execution\order_specs.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional
+
+from src.domain.intents import SelectedOption
+from src.domain.orders import TimeInForce
+from src.domain.types import Symbol
+
+
+@dataclass(frozen=True)
+class PmccOrderSpec:
+    underlying:    Symbol
+    leap:          SelectedOption
+    near:          SelectedOption
+    quantity:      int
+    limit_price:   Decimal
+    time_in_force: TimeInForce = TimeInForce.DAY
+
+
+@dataclass(frozen=True)
+class OptionMarketOrderSpec:
+    underlying:       Symbol
+    option_symbol:    str
+    quantity:         int
+    position_intent:  str          # "BTO" | "BTC" | "STO" | "STC"
+    time_in_force:    TimeInForce  = TimeInForce.DAY
+    limit_price:      Optional[Decimal] = None
+
+
+============================================================
+FILE: .\src\execution\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\orchestration\cycle_snapshot.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any, Dict, List, Mapping, Tuple
+
+from src.domain.signals import SignalSnapshot
+from src.domain.types import AssetQuote, Symbol
+
+
+class CycleSnapshotABC(ABC):
+    @abstractmethod
+    def as_of_utc(self) -> datetime:            raise NotImplementedError
+    @abstractmethod
+    def equity(self) -> float:                  raise NotImplementedError
+    @abstractmethod
+    def option_buying_power(self) -> float:     raise NotImplementedError
+    @abstractmethod
+    def positions(self) -> List[Dict[str, Any]]: raise NotImplementedError
+    @abstractmethod
+    def open_orders(self) -> List[Dict[str, Any]]: raise NotImplementedError
+    @abstractmethod
+    def asset_quotes(self) -> Mapping[Symbol, AssetQuote]: raise NotImplementedError
+    @abstractmethod
+    def option_chains(self) -> Mapping[Tuple[Symbol, str], List[Dict[str, Any]]]: raise NotImplementedError
+    @abstractmethod
+    def signals(self) -> SignalSnapshot:        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class CycleSnapshot(CycleSnapshotABC):
+    _as_of_utc:           datetime
+    _equity:              float
+    _option_buying_power: float
+    _positions:           List[Dict[str, Any]]
+    _open_orders:         List[Dict[str, Any]]
+    _asset_quotes:        Dict[Symbol, AssetQuote]
+    _option_chains:       Dict[Tuple[Symbol, str], List[Dict[str, Any]]]
+    _signals:             SignalSnapshot
+
+    def as_of_utc(self) -> datetime:                  return self._as_of_utc
+    def equity(self) -> float:                        return float(self._equity)
+    def option_buying_power(self) -> float:           return float(self._option_buying_power)
+    def positions(self) -> List[Dict[str, Any]]:      return list(self._positions)
+    def open_orders(self) -> List[Dict[str, Any]]:    return list(self._open_orders)
+    def asset_quotes(self) -> Mapping[Symbol, AssetQuote]: return dict(self._asset_quotes)
+    def option_chains(self) -> Mapping[Tuple[Symbol, str], List[Dict[str, Any]]]: return dict(self._option_chains)
+    def signals(self) -> SignalSnapshot:              return self._signals
+
+    def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshot":
+        return replace(self, _signals=signals)
+
+
+============================================================
+FILE: .\src\orchestration\cycle_snapshot_builder.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
+
+from src.brokers.interfaces import BrokerABC
+from src.domain.signals import SignalSnapshot
+from src.domain.types import AssetQuote, OptionChainRequest, Symbol
+from src.orchestration.cycle_snapshot import CycleSnapshot
+
+
+class CycleSnapshotBuilderABC(ABC):
+    @abstractmethod
+    def build_snapshot(
+        self,
+        *,
+        universe: List[Symbol],
+        option_chain_requests: List[OptionChainRequest],
+    ) -> CycleSnapshot:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
+    broker: BrokerABC
+
+    def build_snapshot(
+        self,
+        *,
+        universe: List[Symbol],
+        option_chain_requests: List[OptionChainRequest],
+    ) -> CycleSnapshot:
+        as_of       = datetime.now(timezone.utc)
+        equity      = float(self.broker.get_equity())
+        opt_bp      = float(self.broker.get_option_buying_power())
+        positions   = list(self.broker.get_positions())
+        open_orders = list(self.broker.get_open_orders())
+
+        quotes: Dict[Symbol, AssetQuote] = {
+            sym: self.broker.get_asset_quote(str(sym))
+            for sym in universe
+        }
+
+        chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]] = {}
+        for req in option_chain_requests:
+            chains[(Symbol(req.underlying), req.request_id)] = self.broker.get_option_chain(
+                req.underlying,
+                include_calls=req.include_calls,
+                include_puts=req.include_puts,
+                feed=req.feed,
+                limit=req.limit,
+                expiration_date_gte=req.expiration_date_gte,
+                expiration_date_lte=req.expiration_date_lte,
+            )
+
+        return CycleSnapshot(
+            _as_of_utc=as_of,
+            _equity=equity,
+            _option_buying_power=opt_bp,
+            _positions=positions,
+            _open_orders=open_orders,
+            _asset_quotes=quotes,
+            _option_chains=chains,
+            _signals=SignalSnapshot.empty(as_of_utc=as_of),
+        )
+
+
+============================================================
+FILE: .\src\orchestration\orchestrator.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from src.brokers.interfaces import BrokerABC
+from src.domain.intents import TradeIntent
+from src.domain.orders import OrderABC
+from src.domain.types import OptionChainRequest, Symbol
+from src.execution.execution_policy_interface import ExecutionPolicyABC
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC
+from src.orchestration.orchestrator_interface import CycleRunResult, OrchestratorABC
+from src.risk.risk_engine import RiskEngine
+from src.signals.signal_pipeline import SignalPipelineABC
+from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
+from src.utilities.logger import setup_logger
+from src.utilities.logging_utils import log_scope
+
+logger = setup_logger("TradingOrchestrator")
+
+
+@dataclass
+class TradingOrchestrator(OrchestratorABC):
+    broker:           BrokerABC
+    strategies:       List[StrategyABC]
+    risk_engine:      RiskEngine
+    execution_policy: ExecutionPolicyABC
+    snapshot_builder: CycleSnapshotBuilderABC
+    signal_pipeline:  SignalPipelineABC
+    dry_run:          bool = False
+
+    # ------------------------------------------------------------------
+    # Template Method: fixed skeleton, swappable steps
+    # ------------------------------------------------------------------
+
+    def run_cycle(self) -> CycleRunResult:
+        with log_scope("orchestrator.run_cycle", logger):
+            universe       = self._collect_universe()
+            pre_snapshot   = self.snapshot_builder.build_snapshot(universe=universe, option_chain_requests=[])
+            signals        = self.signal_pipeline.compute(pre_snapshot)
+            pre_snapshot   = pre_snapshot.with_signals(signals)
+            chain_requests = self._collect_chain_requests(pre_snapshot)
+            snapshot       = self.snapshot_builder.build_snapshot(universe=universe, option_chain_requests=chain_requests)
+            snapshot       = snapshot.with_signals(signals)
+            intents        = self._collect_intents(snapshot)
+            decisions      = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
+            orders         = self.execution_policy.to_orders(approvals=decisions.approved)
+            submitted      = self._submit_orders(orders)
+
+        return CycleRunResult(
+            orders_submitted=submitted,
+            intents_generated=len(intents),
+            intents_approved=len(decisions.approved),
+            intents_rejected=len(decisions.rejected),
+        )
+
+    # ------------------------------------------------------------------
+    # Steps
+    # ------------------------------------------------------------------
+
+    def _collect_universe(self) -> List[Symbol]:
+        symbols: List[Symbol] = []
+        for strategy in self.strategies:
+            for sym in strategy.get_symbols():
+                if sym not in symbols:
+                    symbols.append(sym)
+        return symbols
+
+    def _collect_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+        requests: List[OptionChainRequest] = []
+        for strategy in self.strategies:
+            if isinstance(strategy, OptionChainConsumerABC):
+                requests.extend(strategy.get_option_chain_requests(snapshot))
+        return requests
+
+    def _collect_intents(self, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+        intents: List[TradeIntent] = []
+        for strategy in self.strategies:
+            intents.extend(strategy.generate_intents(snapshot))
+        return intents
+
+    def _submit_orders(self, orders: List[OrderABC]) -> int:
+        if not orders:
+            return 0
+        if self.dry_run:
+            logger.info("DRY RUN — skipping %d orders", len(orders))
+            return 0
+        submitted = 0
+        for order in orders:
+            try:
+                self.broker.submit_order(order)
+                submitted += 1
+                logger.info("Order submitted | type=%s", type(order).__name__)
+            except Exception:
+                logger.exception("Order submission failed | type=%s", type(order).__name__)
+        return submitted
+
+
+============================================================
+FILE: .\src\orchestration\orchestrator_interface.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CycleRunResult:
+    orders_submitted: int
+    intents_generated: int
+    intents_approved: int
+    intents_rejected: int
+
+
+class OrchestratorABC(ABC):
+    @abstractmethod
+    def run_cycle(self) -> CycleRunResult:
+        raise NotImplementedError
+
+
+============================================================
+FILE: .\src\orchestration\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\risk\decisions.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, List
+
+
+@dataclass(frozen=True)
+class ApprovedIntent:
+    intent_id:        str
+    approval_payload: Any   # PmccOrderSpec | OptionMarketOrderSpec
+
+
+@dataclass(frozen=True)
+class RejectedIntent:
+    intent_id: str
+    reason:    str
+
+
+@dataclass(frozen=True)
+class RiskDecisionBatch:
+    approved: List[ApprovedIntent]
+    rejected: List[RejectedIntent]
+
+
+============================================================
+FILE: .\src\risk\evaluators.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional
+
+from src.domain.intents import (
+    OptionIntentPayload,
+    PmccIntentPayload,
+    TradeIntent,
+)
+from src.execution.order_specs import OptionMarketOrderSpec, PmccOrderSpec
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.risk.decisions import ApprovedIntent, RejectedIntent
+from src.risk.pmcc_sizer import PmccSizer
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("IntentEvaluators")
+
+
+class IntentEvaluatorABC(ABC):
+    @abstractmethod
+    def evaluate(
+        self,
+        snapshot: CycleSnapshotABC,
+        intent:   TradeIntent,
+    ) -> "EvaluatorResult":
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class EvaluatorResult:
+    approved: Optional[ApprovedIntent]
+    rejected: Optional[RejectedIntent]
+
+    @classmethod
+    def approve(cls, intent_id: str, payload) -> "EvaluatorResult":
+        return cls(
+            approved=ApprovedIntent(intent_id=intent_id, approval_payload=payload),
+            rejected=None,
+        )
+
+    @classmethod
+    def reject(cls, intent_id: str, reason: str) -> "EvaluatorResult":
+        return cls(
+            approved=None,
+            rejected=RejectedIntent(intent_id=intent_id, reason=reason),
+        )
+
+
+@dataclass
+class PmccIntentEvaluator(IntentEvaluatorABC):
+    sizer:     PmccSizer
+    max_units: int
+
+    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> EvaluatorResult:
+        payload = intent.payload
+        if not isinstance(payload, PmccIntentPayload):
+            return EvaluatorResult.reject(str(intent.intent_id), "Wrong payload type for PmccIntentEvaluator")
+
+        # Count existing PMCC units for this underlying
+        sym        = str(intent.symbol).upper()
+        positions  = snapshot.positions()
+        unit_count = sum(
+            1 for p in positions
+            if str(p.get("underlying_symbol", "")).upper() == sym
+            and p.get("asset_class") == "us_option"
+            and str(p.get("position_intent", "")).upper() == "BTO"
+        )
+
+        if unit_count >= self.max_units:
+            return EvaluatorResult.reject(
+                str(intent.intent_id),
+                f"Max PMCC units ({self.max_units}) already open for {sym}",
+            )
+
+        # Get quotes for sizing
+        quotes = snapshot.asset_quotes()
+        sym_key = next((k for k in quotes if str(k).upper() == sym), None)
+        equity  = snapshot.equity()
+        opt_bp  = snapshot.option_buying_power()
+
+        # Rough sizing: use mid prices from chain if available, otherwise skip
+        leap_ask: Optional[float] = None
+        near_bid: Optional[float] = None
+
+        chains = snapshot.option_chains()
+        for chain_data in chains.values():
+            for row in chain_data:
+                cs = str(row.get("contract_symbol", "")).upper()
+                if cs == payload.leap_leg.option_symbol.upper():
+                    ask = row.get("latestQuote", {}).get("ap")
+                    if ask:
+                        leap_ask = float(ask)
+                if cs == payload.near_leg.option_symbol.upper():
+                    bid = row.get("latestQuote", {}).get("bp")
+                    if bid:
+                        near_bid = float(bid)
+
+        if leap_ask is None or near_bid is None:
+            return EvaluatorResult.reject(str(intent.intent_id), "Could not find prices for sizing")
+
+        qty = self.sizer.size(
+            equity=equity,
+            option_buying_power=opt_bp,
+            leap_ask=leap_ask,
+            near_bid=near_bid,
+        )
+
+        if qty is None or qty < 1:
+            return EvaluatorResult.reject(str(intent.intent_id), "Sizer returned 0 — insufficient capital")
+
+        net_debit = Decimal(str(leap_ask - near_bid)).quantize(Decimal("0.01"))
+
+        spec = PmccOrderSpec(
+            underlying=intent.symbol,
+            leap=payload.leap_leg,
+            near=payload.near_leg,
+            quantity=qty,
+            limit_price=net_debit,
+            time_in_force=intent.time_in_force,
+        )
+
+        logger.info("PMCC approved | symbol=%s qty=%d debit=%.2f", sym, qty, net_debit)
+        return EvaluatorResult.approve(str(intent.intent_id), spec)
+
+
+@dataclass
+class OptionIntentEvaluator(IntentEvaluatorABC):
+
+    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> EvaluatorResult:
+        payload = intent.payload
+        if not isinstance(payload, OptionIntentPayload):
+            return EvaluatorResult.reject(str(intent.intent_id), "Wrong payload type for OptionIntentEvaluator")
+
+        leg = payload.leg
+        qty = leg.qty if leg.qty is not None and leg.qty > 0 else 1
+
+        spec = OptionMarketOrderSpec(
+            underlying=intent.symbol,
+            option_symbol=leg.contract_symbol,
+            quantity=qty,
+            position_intent=leg.position_intent.value,
+            time_in_force=intent.time_in_force,
+        )
+
+        logger.info(
+            "Option approved | symbol=%s intent=%s qty=%d",
+            intent.symbol, leg.position_intent.value, qty,
+        )
+        return EvaluatorResult.approve(str(intent.intent_id), spec)
+
+
+============================================================
+FILE: .\src\risk\pmcc_sizer.py
+============================================================
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class OsiParsed:
+    underlying: str
+    expiry:     datetime
+    right:      str   # "C" | "P"
+    strike:     Decimal
+
+
+_OSI_RE = re.compile(
+    r"^(?P<sym>[A-Z]+)"
+    r"(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})"
+    r"(?P<right>[CP])"
+    r"(?P<strike>\d{8})$"
+)
+
+
+def parse_osi(symbol: str) -> OsiParsed:
+    m = _OSI_RE.match(symbol.strip().upper())
+    if not m:
+        raise ValueError(f"Cannot parse OSI symbol: {symbol!r}")
+    yy    = int(m["yy"])
+    year  = 2000 + yy if yy < 50 else 1900 + yy
+    expiry = datetime(year, int(m["mm"]), int(m["dd"]))
+    strike = Decimal(m["strike"]) / Decimal("1000")
+    return OsiParsed(
+        underlying=m["sym"],
+        expiry=expiry,
+        right=m["right"],
+        strike=strike,
+    )
+
+
+@dataclass(frozen=True)
+class PmccSizingConfig:
+    equity_budget_pct:        float = 0.05
+    max_option_bp_fraction:   float = 0.25
+    max_debit_per_spread_usd: float = 5000.0
+    max_contracts_per_intent: int   = 5
+    slippage_factor:          float = 1.02
+
+
+@dataclass
+class PmccSizer:
+    config: PmccSizingConfig
+
+    def size(
+        self,
+        *,
+        equity:              float,
+        option_buying_power: float,
+        leap_ask:            float,
+        near_bid:            float,
+    ) -> Optional[int]:
+        if leap_ask <= 0 or near_bid < 0:
+            return None
+
+        net_debit_per_contract = (leap_ask - near_bid) * 100
+        if net_debit_per_contract <= 0:
+            return None
+
+        net_debit_with_slip = net_debit_per_contract * self.config.slippage_factor
+
+        budget_equity = equity * self.config.equity_budget_pct
+        budget_bp     = option_buying_power * self.config.max_option_bp_fraction
+        budget        = min(budget_equity, budget_bp, self.config.max_debit_per_spread_usd)
+
+        if budget <= 0:
+            return None
+
+        contracts = int(budget // net_debit_with_slip)
+        contracts = min(contracts, self.config.max_contracts_per_intent)
+        return contracts if contracts > 0 else None
+
+
+============================================================
+FILE: .\src\risk\risk_engine.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Type
+
+from src.domain.intents import IntentPayloadABC, TradeIntent
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.risk.decisions import ApprovedIntent, RejectedIntent, RiskDecisionBatch
+from src.risk.evaluators import IntentEvaluatorABC
+from src.risk.rules.risk_rule_interface import RiskRuleABC
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("RiskEngine")
+
+
+@dataclass
+class RiskEngine:
+    rules:      List[RiskRuleABC]                              = field(default_factory=list)
+    _evaluators: Dict[Type[IntentPayloadABC], IntentEvaluatorABC] = field(default_factory=dict, init=False)
+
+    def register(self, payload_type: Type[IntentPayloadABC], evaluator: IntentEvaluatorABC) -> None:
+        self._evaluators[payload_type] = evaluator
+        logger.info("Registered evaluator | payload=%s evaluator=%s",
+                    payload_type.__name__, type(evaluator).__name__)
+
+    def evaluate(
+        self,
+        snapshot: CycleSnapshotABC,
+        intents:  List[TradeIntent],
+    ) -> RiskDecisionBatch:
+        approved: List[ApprovedIntent] = []
+        rejected: List[RejectedIntent] = []
+
+        for intent in intents:
+            # 1 — run chain-of-responsibility rules first
+            rule_rejection = None
+            for rule in self.rules:
+                outcome = rule.evaluate(snapshot, intent)
+                if not outcome.is_pass:
+                    rule_rejection = outcome.reason
+                    break
+
+            if rule_rejection:
+                logger.info("Intent REJECTED by rule | id=%s reason=%s", intent.intent_id, rule_rejection)
+                rejected.append(RejectedIntent(intent_id=str(intent.intent_id), reason=rule_rejection))
+                continue
+
+            # 2 — dispatch to payload-specific evaluator
+            evaluator = self._evaluators.get(type(intent.payload))
+            if evaluator is None:
+                reason = f"No evaluator for payload type {type(intent.payload).__name__}"
+                logger.warning("Intent REJECTED — %s", reason)
+                rejected.append(RejectedIntent(intent_id=str(intent.intent_id), reason=reason))
+                continue
+
+            result = evaluator.evaluate(snapshot, intent)
+            if result.approved is not None:
+                approved.append(result.approved)
+            elif result.rejected is not None:
+                rejected.append(result.rejected)
+
+        logger.info("Risk evaluation complete | approved=%d rejected=%d", len(approved), len(rejected))
+        return RiskDecisionBatch(approved=approved, rejected=rejected)
+
+
+============================================================
+FILE: .\src\risk\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\risk\rules\open_order_rule.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from src.domain.intents import TradeIntent
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.risk.rules.risk_rule_interface import RiskRuleABC, RiskRuleOutcome
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("OpenOrderDedupeRule")
+
+
+def _underlying(order: Dict[str, Any]) -> str:
+    sym = order.get("symbol") or order.get("underlying_symbol") or ""
+    return str(sym).strip().upper()
+
+
+@dataclass
+class OpenOrderDedupeRule(RiskRuleABC):
+    """Reject an intent if there is already an open order for the same underlying."""
+
+    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> RiskRuleOutcome:
+        underlying = str(intent.symbol).strip().upper()
+        open_orders: List[Dict[str, Any]] = list(snapshot.open_orders())
+
+        for order in open_orders:
+            if _underlying(order) == underlying:
+                logger.info(
+                    "OpenOrderDedupe REJECT | symbol=%s intent_id=%s",
+                    underlying, intent.intent_id,
+                )
+                return RiskRuleOutcome.rejected(
+                    f"Open order already exists for {underlying}"
+                )
+
+        return RiskRuleOutcome.passed()
+
+
+============================================================
+FILE: .\src\risk\rules\risk_rule_interface.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+from src.domain.intents import TradeIntent
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+
+
+class RiskRuleOutcomeKind(str, Enum):
+    PASS   = "pass"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True)
+class RiskRuleOutcome:
+    kind:   RiskRuleOutcomeKind
+    reason: Optional[str] = None
+
+    @classmethod
+    def passed(cls) -> "RiskRuleOutcome":
+        return cls(kind=RiskRuleOutcomeKind.PASS)
+
+    @classmethod
+    def rejected(cls, reason: str) -> "RiskRuleOutcome":
+        return cls(kind=RiskRuleOutcomeKind.REJECT, reason=reason)
+
+    @property
+    def is_pass(self) -> bool:
+        return self.kind == RiskRuleOutcomeKind.PASS
+
+
+class RiskRuleABC(ABC):
+    @abstractmethod
+    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> RiskRuleOutcome:
+        raise NotImplementedError
+
+
+============================================================
+FILE: .\src\risk\rules\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\signals\signal_pipeline.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from src.domain.signals import SignalSnapshot
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+
+
+class SignalPipelineABC(ABC):
+    @abstractmethod
+    def compute(self, snapshot: CycleSnapshotABC) -> SignalSnapshot:
+        raise NotImplementedError
+
+
+class DefaultSignalPipeline(SignalPipelineABC):
+    """No-op pipeline — returns empty signals. Replace with real implementation."""
+
+    def compute(self, snapshot: CycleSnapshotABC) -> SignalSnapshot:
+        return SignalSnapshot.empty(as_of_utc=snapshot.as_of_utc())
+
+
+============================================================
+FILE: .\src\signals\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\strategies\interfaces.py
+============================================================
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import List
+
+from src.domain.intents import TradeIntent
+from src.domain.types import OptionChainRequest, Symbol
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+
+
+class StrategyABC(ABC):
+    @abstractmethod
+    def get_symbols(self) -> List[Symbol]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def generate_intents(self, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+        raise NotImplementedError
+
+
+class OptionChainConsumerABC(ABC):
+    """Mixin for strategies that need option chain data."""
+
+    @abstractmethod
+    def get_option_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+        raise NotImplementedError
+
+
+============================================================
+FILE: .\src\strategies\pmcc_selector.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from src.config.yaml_config import PmccLeapConfig, PmccShortConfig
+from src.domain.intents import SelectedOption
+from src.domain.orders import OptionContract, OptionRight
+from src.risk.pmcc_sizer import parse_osi
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("PmccContractSelector")
+
+
+def _dte(expiry: datetime) -> int:
+    return max(0, (expiry - datetime.now(timezone.utc).replace(tzinfo=None)).days)
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class ContractCandidate:
+    option_symbol: str
+    contract:      OptionContract
+    dte:           int
+    delta:         float
+    ask:           float
+    bid:           float
+    mid:           float
+    
+    @property
+    def strike(self) -> float:
+        # Domain strike is Decimal, selector compares to float leap_strike
+        return float(self.contract.strike)
+
+@dataclass
+class PmccContractSelector:
+    leap_cfg:  PmccLeapConfig
+    short_cfg: PmccShortConfig
+
+    def select_leap(
+        self,
+        underlying:   str,
+        chain:        List[Dict[str, Any]],
+        spot_price:   float,
+    ) -> Optional[SelectedOption]:
+        candidates = self._parse_chain(underlying, chain)
+        filtered   = [
+            c for c in candidates
+            if self.leap_cfg.dte_min <= c.dte <= self.leap_cfg.dte_max
+            and abs(c.delta - self.leap_cfg.target_delta) < 0.15
+            and c.ask > 0
+        ]
+        if not filtered:
+            logger.debug("No LEAP candidates for %s", underlying)
+            return None
+        best = min(filtered, key=lambda c: abs(c.delta - self.leap_cfg.target_delta))
+        return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
+
+    def select_near(
+        self,
+        underlying:   str,
+        chain:        List[Dict[str, Any]],
+        leap_strike:  float,
+    ) -> Optional[SelectedOption]:
+        candidates = self._parse_chain(underlying, chain)
+        filtered   = [
+            c for c in candidates
+            if self.short_cfg.dte_min <= c.dte <= self.short_cfg.dte_max
+            and abs(c.delta - self.short_cfg.target_delta) < 0.10
+            and c.strike <= leap_strike   # NEAR strike must be <= LEAP strike
+            and c.bid > 0
+        ]
+        if not filtered:
+            logger.debug("No NEAR candidates for %s", underlying)
+            return None
+        best = min(filtered, key=lambda c: abs(c.delta - self.short_cfg.target_delta))
+        return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
+
+    def _parse_chain(self, underlying: str, chain: List[Dict[str, Any]]) -> List[ContractCandidate]:
+        candidates: List[ContractCandidate] = []
+        for row in chain:
+            sym = str(row.get("contract_symbol", "")).strip().upper()
+            if not sym:
+                continue
+            try:
+                parsed = parse_osi(sym)
+            except ValueError:
+                continue
+            if parsed.right != "C":
+                continue
+
+            greeks = row.get("greeks") or {}
+            quote  = row.get("latestQuote") or {}
+
+            delta  = _safe_float(greeks.get("delta"))
+            ask    = _safe_float(quote.get("ap"))
+            bid    = _safe_float(quote.get("bp"))
+            mid    = (ask + bid) / 2 if ask > 0 and bid > 0 else ask or bid
+            dte    = _dte(parsed.expiry)
+
+            contract = OptionContract(
+                underlying=underlying,
+                expiry=parsed.expiry,
+                strike=parsed.strike,
+                right=OptionRight.CALL,
+                option_symbol=sym,
+            )
+            candidates.append(ContractCandidate(
+                option_symbol=sym,
+                contract=contract,
+                dte=dte,
+                delta=delta,
+                ask=ask,
+                bid=bid,
+                mid=mid,
+            ))
+        return candidates
+
+
+============================================================
+FILE: .\src\strategies\pmcc_state_machine.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class PmccState(str, Enum):
+    FLAT      = "flat"
+    LEAP_ONLY = "leap_only"
+    COVERED   = "covered"
+    NEAR_ONLY = "near_only"   # illegal — should not occur
+    PENDING   = "pending"     # open order blocking action
+
+
+@dataclass(frozen=True)
+class PmccHoldings:
+    state:         PmccState
+    leap_position: Optional[Dict[str, Any]]
+    near_position: Optional[Dict[str, Any]]
+
+
+class PmccStateClassifier:
+    """Derives current PMCC state from the positions + open orders snapshots."""
+
+    def classify(
+        self,
+        *,
+        underlying:   str,
+        positions:    List[Dict[str, Any]],
+        open_orders:  List[Dict[str, Any]],
+    ) -> PmccHoldings:
+        sym        = underlying.strip().upper()
+        opt_pos    = [
+            p for p in positions
+            if str(p.get("underlying_symbol", "")).upper() == sym
+            and p.get("asset_class") == "us_option"
+        ]
+        pending_orders = [
+            o for o in open_orders
+            if str(o.get("underlying_symbol", o.get("symbol", ""))).upper() == sym
+        ]
+
+        leap = next((p for p in opt_pos if self._is_leap(p)), None)
+        near = next((p for p in opt_pos if self._is_near(p)), None)
+
+        if pending_orders:
+            state = PmccState.PENDING
+        elif leap and near:
+            state = PmccState.COVERED
+        elif leap and not near:
+            state = PmccState.LEAP_ONLY
+        elif not leap and near:
+            state = PmccState.NEAR_ONLY
+        else:
+            state = PmccState.FLAT
+
+        return PmccHoldings(state=state, leap_position=leap, near_position=near)
+
+    @staticmethod
+    def _is_leap(position: Dict[str, Any]) -> bool:
+        dte = position.get("dte") or position.get("days_to_expiry")
+        if dte is not None:
+            return int(dte) > 90
+        # Fallback: check OSI symbol expiry
+        sym = str(position.get("symbol", ""))
+        if len(sym) >= 15:
+            try:
+                from src.risk.pmcc_sizer import parse_osi
+                from datetime import datetime
+                parsed = parse_osi(sym)
+                dte_calc = (parsed.expiry - datetime.now()).days
+                return dte_calc > 90
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _is_near(position: Dict[str, Any]) -> bool:
+        dte = position.get("dte") or position.get("days_to_expiry")
+        if dte is not None:
+            return int(dte) <= 90
+        sym = str(position.get("symbol", ""))
+        if len(sym) >= 15:
+            try:
+                from src.risk.pmcc_sizer import parse_osi
+                from datetime import datetime
+                parsed = parse_osi(sym)
+                dte_calc = (parsed.expiry - datetime.now()).days
+                return dte_calc <= 90
+            except Exception:
+                pass
+        return False
+
+
+============================================================
+FILE: .\src\strategies\pmcc_strategy.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
+
+from src.config.yaml_config import PmccConfig
+from src.domain.intents import (
+    OptionIntentPayload,
+    PmccIntentPayload,
+    PositionIntent,
+    SingleOptionLeg,
+    TradeIntent,
+)
+
+from src.domain.types import OptionChainRequest, Symbol
+from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
+from src.strategies.pmcc_selector import PmccContractSelector
+from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("PmccStrategy")
+
+
+@dataclass
+class PmccStrategy(StrategyABC, OptionChainConsumerABC):
+    config:     PmccConfig
+    strategy_id: str                    = "pmcc"
+    _classifier: PmccStateClassifier    = field(default_factory=PmccStateClassifier, init=False)
+    _selector:   PmccContractSelector   = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._selector = PmccContractSelector(
+            leap_cfg=self.config.leap,
+            short_cfg=self.config.short,
+        )
+
+    # ------------------------------------------------------------------
+    # StrategyABC
+    # ------------------------------------------------------------------
+
+    def get_symbols(self) -> List[Symbol]:
+        return [Symbol(self.config.underlying_symbol.strip().upper())]
+
+    def generate_intents(self, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+        sym      = Symbol(self.config.underlying_symbol.strip().upper())
+        holdings = self._classifier.classify(
+            underlying=str(sym),
+            positions=list(snapshot.positions()),
+            open_orders=list(snapshot.open_orders()),
+        )
+
+        logger.info("PMCC state | symbol=%s state=%s", sym, holdings.state.value)
+
+        if holdings.state == PmccState.PENDING:
+            logger.info("PMCC PENDING — skipping cycle | symbol=%s", sym)
+            return []
+
+        if holdings.state == PmccState.FLAT:
+            return self._intents_entry(sym, snapshot)
+
+        if holdings.state == PmccState.LEAP_ONLY:
+            return self._intents_sell_near(sym, snapshot, holdings.leap_position)
+
+        if holdings.state == PmccState.COVERED:
+            return self._intents_manage(sym, snapshot, holdings)
+
+        if holdings.state == PmccState.NEAR_ONLY:
+            logger.warning("PMCC NEAR_ONLY — illegal state | symbol=%s", sym)
+            return self._intents_close_near(sym, holdings.near_position)
+
+        return []
+
+    # ------------------------------------------------------------------
+    # OptionChainConsumerABC
+    # ------------------------------------------------------------------
+
+    def get_option_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+        sym       = self.config.underlying_symbol.strip().upper()
+        today     = date.today()
+        leap_cfg  = self.config.leap
+        short_cfg = self.config.short
+
+        return [
+            OptionChainRequest(
+                underlying=sym,
+                request_id="leaps",
+                include_calls=True,
+                include_puts=False,
+                expiration_date_gte=today + timedelta(days=leap_cfg.dte_min),
+                expiration_date_lte=today + timedelta(days=leap_cfg.dte_max),
+            ),
+            OptionChainRequest(
+                underlying=sym,
+                request_id="shorts",
+                include_calls=True,
+                include_puts=False,
+                expiration_date_gte=today + timedelta(days=short_cfg.dte_min),
+                expiration_date_lte=today + timedelta(days=short_cfg.dte_max),
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # State handlers
+    # ------------------------------------------------------------------
+
+    def _intents_entry(self, sym: Symbol, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+        chains    = snapshot.option_chains()
+        sym_str   = str(sym)
+        leap_key  = _find_key(chains, sym_str, "leaps")
+        short_key = _find_key(chains, sym_str, "shorts")
+
+        if leap_key is None or short_key is None:
+            logger.debug("Entry chains not available | symbol=%s", sym_str)
+            return []
+
+        leap_chain  = list(chains[leap_key])
+        short_chain = list(chains[short_key])
+        spot        = _get_spot(snapshot, sym_str)
+
+        leap_selection = self._selector.select_leap(sym_str, leap_chain, spot)
+        if leap_selection is None:
+            return []
+
+        near_selection = self._selector.select_near(
+            sym_str, short_chain, float(leap_selection.contract.strike)
+        )
+        if near_selection is None:
+            return []
+
+        payload = PmccIntentPayload(
+            underlying_symbol=sym,
+            leap_leg=leap_selection,
+            near_leg=near_selection,
+        )
+
+        return [TradeIntent.create(
+            strategy_id=self.strategy_id,
+            symbol=sym,
+            payload=payload,
+        )]
+
+    def _intents_sell_near(
+        self,
+        sym: Symbol,
+        snapshot: CycleSnapshotABC,
+        leap_position: Optional[Dict[str, Any]],
+    ) -> List[TradeIntent]:
+        chains    = snapshot.option_chains()
+        sym_str   = str(sym)
+        short_key = _find_key(chains, sym_str, "shorts")
+
+        if short_key is None:
+            return []
+
+        leap_strike: Optional[float] = None
+        if leap_position:
+            try:
+                from src.risk.pmcc_sizer import parse_osi
+                leap_strike = float(parse_osi(str(leap_position.get("symbol", ""))).strike)
+            except Exception:
+                pass
+
+        near = self._selector.select_near(sym_str, list(chains[short_key]), leap_strike or 0)
+        if near is None:
+            return []
+
+        payload = OptionIntentPayload(
+            underlying_symbol=sym,
+            leg=SingleOptionLeg(
+                contract_symbol=near.option_symbol,
+                position_intent=PositionIntent.SELL_TO_OPEN,
+                qty=1,
+            ),
+        )
+        return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
+
+    def _intents_manage(
+        self,
+        sym: Symbol,
+        snapshot: CycleSnapshotABC,
+        holdings,
+    ) -> List[TradeIntent]:
+        near = holdings.near_position
+        if near is None:
+            return []
+
+        near_sym = str(near.get("symbol", ""))
+        if not near_sym:
+            return []
+
+        # Check if we should roll the near
+        dte = near.get("dte") or near.get("days_to_expiry")
+        if dte is not None and int(dte) <= self.config.roll.dte_threshold:
+            return self._intents_roll_near(sym, near_sym, snapshot)
+
+        delta = near.get("delta")
+        if delta is not None and abs(float(delta)) >= self.config.roll.delta_threshold:
+            return self._intents_roll_near(sym, near_sym, snapshot)
+
+        return []
+
+    def _intents_roll_near(
+        self,
+        sym: Symbol,
+        near_sym: str,
+        snapshot: CycleSnapshotABC,
+    ) -> List[TradeIntent]:
+        # BTC existing near, then STO new near — two intents
+        btc_payload = OptionIntentPayload(
+            underlying_symbol=sym,
+            leg=SingleOptionLeg(
+                contract_symbol=near_sym,
+                position_intent=PositionIntent.BUY_TO_CLOSE,
+                qty=1,
+            ),
+        )
+        btc = TradeIntent.create(
+            strategy_id=self.strategy_id,
+            symbol=sym,
+            payload=btc_payload,
+            tags=("roll_btc",),
+        )
+
+        chains    = snapshot.option_chains()
+        short_key = _find_key(chains, str(sym), "shorts")
+        if short_key is None:
+            return [btc]
+
+        new_near = self._selector.select_near(str(sym), list(chains[short_key]), 0)
+        if new_near is None:
+            return [btc]
+
+        sto_payload = OptionIntentPayload(
+            underlying_symbol=sym,
+            leg=SingleOptionLeg(
+                contract_symbol=new_near.option_symbol,
+                position_intent=PositionIntent.SELL_TO_OPEN,
+                qty=1,
+            ),
+        )
+        sto = TradeIntent.create(
+            strategy_id=self.strategy_id,
+            symbol=sym,
+            payload=sto_payload,
+            tags=("roll_sto",),
+        )
+        return [btc, sto]
+
+    def _intents_close_near(
+        self,
+        sym: Symbol,
+        near_position: Optional[Dict[str, Any]],
+    ) -> List[TradeIntent]:
+        if near_position is None:
+            return []
+        near_sym = str(near_position.get("symbol", ""))
+        if not near_sym:
+            return []
+        payload = OptionIntentPayload(
+            underlying_symbol=sym,
+            leg=SingleOptionLeg(
+                contract_symbol=near_sym,
+                position_intent=PositionIntent.BUY_TO_CLOSE,
+                qty=1,
+            ),
+        )
+        return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _find_key(chains, sym_str: str, request_id: str):
+    for k in chains:
+        if str(k[0]).upper() == sym_str.upper() and k[1] == request_id:
+            return k
+    return None
+
+
+def _get_spot(snapshot: CycleSnapshotABC, sym_str: str) -> float:
+    quotes = snapshot.asset_quotes()
+    for k, v in quotes.items():
+        if str(k).upper() == sym_str.upper():
+            return v.mid or v.ask or v.bid or 0.0
+    return 0.0
+
+
+============================================================
+FILE: .\src\strategies\registry.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List
+
+from src.config.yaml_config import StrategySpec
+from src.strategies.interfaces import StrategyABC
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("StrategyRegistry")
+
+StrategyBuilder = Callable[[StrategySpec], StrategyABC]
+
+
+@dataclass
+class StrategyBuilderRegistry:
+    _builders: Dict[str, StrategyBuilder] = field(default_factory=dict, init=False)
+
+    def register(self, name: str, builder: StrategyBuilder) -> None:
+        self._builders[name.lower().strip()] = builder
+        logger.info("Registered strategy builder | name=%s", name)
+
+    def build_all(self, specs: List[StrategySpec]) -> List[StrategyABC]:
+        strategies: List[StrategyABC] = []
+        for spec in specs:
+            key = str(spec.name).lower().strip()
+            if key not in self._builders:
+                raise KeyError(f"No strategy builder for '{spec.name}'. Registered: {list(self._builders)}")
+            strategies.append(self._builders[key](spec))
+        return strategies
+
+
+============================================================
+FILE: .\src\strategies\__init__.py
+============================================================
+
+
+
+============================================================
+FILE: .\src\utilities\logger.py
+============================================================
+
+from __future__ import annotations
+
+import logging
+
+
+def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(level)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    ))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+============================================================
+FILE: .\src\utilities\logging_utils.py
+============================================================
+
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+from typing import Iterator, Optional
+
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("LoggingUtils")
+
+
+@contextmanager
+def log_scope(name: str, module_logger, extra: Optional[str] = None) -> Iterator[None]:
+    msg = f"Start {name}" + (f" | {extra}" if extra else "")
+    module_logger.info(msg)
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        module_logger.info(f"End {name} | elapsed={time.monotonic() - t0:.3f}s")
+
+
+============================================================
+FILE: .\src\utilities\__init__.py
+============================================================
+
+

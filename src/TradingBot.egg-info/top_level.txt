@@ -1,1 +1,10 @@
-TradingBot
+app
+brokers
+config
+domain
+execution
+orchestration
+risk
+signals
+strategies
+utilities
