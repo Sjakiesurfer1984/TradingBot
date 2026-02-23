@@ -27,9 +27,24 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    dte_threshold:   int
-    delta_threshold: float
-    profit_pct:      float
+    # NEAR management — any one condition triggers a roll.
+
+    # Roll NEAR when DTE falls to or below this value.
+    dte_threshold: int
+
+    # Roll NEAR when this fraction of original premium has been captured.
+    profit_pct: float
+
+    # Roll NEAR when spot >= near_strike * this value.
+    near_strike_proximity: float
+
+    # LEAP management.
+
+    # Roll LEAP when DTE falls to or below this value.
+    leap_dte_threshold: int
+
+    # Close entire spread when spot <= leap_strike * this value.
+    leap_strike_danger: float
 
 
 @dataclass(frozen=True)
@@ -87,7 +102,7 @@ class StrategySpec:
 # ===========================================================================
 # To add a new strategy:
 #   1. Define its config dataclass(es) above.
-#   2. Write a _parse_<name>_config(raw: dict) -> YourConfig function below.
+#   2. Write a _parse_<n>_config(raw: dict) -> YourConfig function below.
 #   3. Register it in _STRATEGY_CONFIG_PARSERS.
 #   4. That's it — load_app_config() needs no changes.
 #
@@ -103,13 +118,20 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
     p = raw.get("pmcc")
     if not p:
         return None
-    r = p["risk"]
+    r  = p["risk"]
+    ro = p["roll"]
     return PmccConfig(
         underlying_symbol=p["underlying_symbol"],
         max_units=int(p["max_units"]),
         leap=PmccLeapConfig(**p["leap"]),
         short=PmccShortConfig(**p["short"]),
-        roll=PmccRollConfig(**p["roll"]),
+        roll=PmccRollConfig(
+            dte_threshold=int(ro["dte_threshold"]),
+            profit_pct=float(ro["profit_pct"]),
+            near_strike_proximity=float(ro["near_strike_proximity"]),
+            leap_dte_threshold=int(ro["leap_dte_threshold"]),
+            leap_strike_danger=float(ro["leap_strike_danger"]),
+        ),
         liquidity=PmccLiquidityConfig(**p["liquidity"]),
         risk=PmccRiskConfig(
             max_buying_power_fraction=float(r["max_buying_power_fraction"]),

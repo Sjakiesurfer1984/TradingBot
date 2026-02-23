@@ -91,18 +91,26 @@ def _abs_qty(position: Dict[str, Any]) -> int:
 
 def _enrich_position(position: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return a copy of the position dict with two derived fields added:
-      underlying  — ticker from OSI (always a string, never None)
-      derived_dte — days to expiry from OSI (int, -1 if unparseable)
+    Return a copy of the position dict with derived fields added:
+      underlying    — ticker from OSI (always a string, never None)
+      derived_dte   — days to expiry from OSI (int, -1 if unparseable)
+      derived_strike — strike price as float (0.0 if unparseable)
 
     Every downstream caller reads these fields. No one re-derives from
     the raw OSI symbol outside this function.
     """
     osi = str(position.get("symbol", ""))
+    strike = 0.0
+    try:
+        from src.risk.pmcc_sizer import parse_osi
+        strike = float(parse_osi(osi).strike)
+    except Exception:
+        pass
     return {
         **position,
-        "underlying":  _underlying_from_osi(osi),
-        "derived_dte": _dte_from_osi(osi),
+        "underlying":     _underlying_from_osi(osi),
+        "derived_dte":    _dte_from_osi(osi),
+        "derived_strike": strike,
     }
 
 
@@ -274,7 +282,7 @@ class PmccStateClassifier:
     def _is_completing_mleg(order: Dict[str, Any]) -> bool:
         if str(order.get("order_class", "")).lower() != "mleg":
             return False
-        legs  = [l for l in (order.get("legs") or []) if isinstance(l, dict)]
-        buys  = [l for l in legs if str(l.get("side", "")).lower() == "buy"]
-        sells = [l for l in legs if str(l.get("side", "")).lower() == "sell"]
+        legs  = [leg for leg in (order.get("legs") or []) if isinstance(leg, dict)]
+        buys  = [leg for leg in legs if str(leg.get("side", "")).lower() == "buy"]
+        sells = [leg for leg in legs if str(leg.get("side", "")).lower() == "sell"]
         return len(buys) == 1 and len(sells) == 1

@@ -6,7 +6,7 @@ strategies:
 
       # Maximum number of simultaneous PMCC spreads (LEAP + NEAR pairs) to hold.
       # Each "unit" = 1 long LEAP call + 1 short NEAR call.
-      max_units: 1
+      max_units: 5
 
       leap:
         dte_min: 365
@@ -19,9 +19,30 @@ strategies:
         target_delta: 0.20
 
       roll:
+        # NEAR management — any one condition triggers a roll.
+
+        # Roll NEAR when DTE falls to or below this value.
         dte_threshold: 14
-        delta_threshold: 0.35
+
+        # Roll NEAR when this fraction of the original premium has been captured.
+        # e.g. 0.50 = roll when 50% of premium is gone. Higher = more patient.
         profit_pct: 0.50
+
+        # Roll NEAR when spot reaches this fraction of the NEAR strike.
+        # e.g. 0.95 = roll when spot is within 3% of the strike.
+        # Lower = more aggressive protection; higher = more tolerant of ITM risk.
+        near_strike_proximity: 0.95
+
+        # LEAP management — any one condition triggers action.
+
+        # Roll LEAP when DTE falls to or below this value.
+        # At this point theta acceleration makes the LEAP an ineffective hedge.
+        leap_dte_threshold: 90
+
+        # Close the entire spread when spot falls to or below this fraction of
+        # the LEAP strike. The LEAP is going deep OTM and the structure is broken.
+        # e.g. 0.90 = close when spot is 10% below the LEAP strike.
+        leap_strike_danger: 0.90
 
       liquidity:
         max_leap_spread_pct: 0.10
