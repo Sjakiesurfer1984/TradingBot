@@ -1,43 +1,5 @@
 
 ============================================================
-FILE: .\config.yaml
-============================================================
-
-strategies:
-  - name: pmcc
-    pmcc:
-      underlying_symbol: SPY
-      max_units: 1
-
-      leap:
-        dte_min: 365
-        dte_max: 545
-        target_delta: 0.80
-
-      short:
-        dte_min: 21
-        dte_max: 45
-        target_delta: 0.20
-
-      roll:
-        dte_threshold: 14
-        delta_threshold: 0.35
-        profit_pct: 0.50
-
-      liquidity:
-        max_leap_spread_pct: 0.10
-        max_near_spread_pct: 0.10
-
-      risk:
-        equity_budget_pct: 0.05
-        max_option_bp_fraction: 0.50
-        max_debit_per_spread_usd: 1500
-        max_contracts_per_intent: 1
-        slippage_factor: 1.05
-        ignore_spread_checks: false
-
-
-============================================================
 FILE: .\pack_repo.py
 ============================================================
 
@@ -74,17 +36,15 @@ print("Finished! Upload codebase.txt to the AI.")
 FILE: .\config\config.yaml
 ============================================================
 
-default_dry_run: false
-cycle_seconds: 60
-
-risk:
-  enable_open_order_dedupe: true
-
 strategies:
   - name: pmcc
     pmcc:
+      # The underlying equity symbol this PMCC strategy trades on.
       underlying_symbol: SPY
-      max_units: 2
+
+      # Maximum number of simultaneous PMCC spreads (LEAP + NEAR pairs) to hold.
+      # Each "unit" = 1 long LEAP call + 1 short NEAR call.
+      max_units: 1
 
       leap:
         dte_min: 365
@@ -97,22 +57,30 @@ strategies:
         target_delta: 0.20
 
       roll:
-        dte_threshold: 7
+        dte_threshold: 14
         delta_threshold: 0.35
         profit_pct: 0.50
 
       liquidity:
-        max_leap_spread_pct: 0.15
-        max_near_spread_pct: 0.20
+        max_leap_spread_pct: 0.10
+        max_near_spread_pct: 0.10
 
       risk:
-        equity_budget_pct: 0.50
-        max_option_bp_fraction: 0.20
-        max_debit_per_spread_usd: 20000
-        max_contracts_per_intent: 10
+        max_buying_power_fraction: 0.50
+        max_debit_per_spread_usd: 50000
+        max_contracts_per_intent: 3
         slippage_factor: 1.05
         ignore_spread_checks: false
 
+# ---------------------------------------------------------------------------
+# Set to true to run the full cycle (positions, signals, sizing) but skip
+# all order submission. Nothing will be sent to the broker.
+# Use this whenever you're testing logic changes on a live account.
+# ---------------------------------------------------------------------------
+default_dry_run: true
+
+# How long to wait between cycles, in seconds.
+cycle_seconds: 60
 
 ============================================================
 FILE: .\src\__init__.py
@@ -151,6 +119,16 @@ def build_settings_runtime(config_path: Optional[Path] = None) -> SettingsRuntim
 FILE: .\src\app\main.py
 ============================================================
 
+"""
+src/app/main.py
+----------------
+Application entry point. Pure assembler — no strategy-specific logic lives here.
+
+To add a new strategy:
+  1. Implement StrategyPlugin in src/strategies/strategy_plugin.py
+  2. Add its config parser to src/config/yaml_config._STRATEGY_CONFIG_PARSERS
+  3. That's it. This file does not change.
+"""
 from __future__ import annotations
 
 import sys
@@ -159,18 +137,16 @@ from src.app.container import build_settings_runtime
 from src.app.scheduler import Scheduler, SchedulerConfig
 from src.brokers.factory import BrokerFactoryFacade
 from src.brokers.registry import AlpacaBrokerBuilder, BrokerBuilderRegistry
+from src.config.yaml_config import AppConfig, StrategySpec
 from src.execution.default_execution_policy import DefaultExecutionPolicy
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.orchestration.orchestrator import TradingOrchestrator
-from src.risk.evaluators import OptionIntentEvaluator, PmccIntentEvaluator
-from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
 from src.signals.signal_pipeline import DefaultSignalPipeline
-from src.strategies.pmcc_strategy import PmccStrategy
-from src.strategies.registry import StrategyBuilderRegistry
+from src.strategies.interfaces import StrategyABC
+from src.strategies.strategy_plugin import STRATEGY_PLUGINS
 from src.utilities.logger import setup_logger
-from src.domain.intents import PmccIntentPayload, OptionIntentPayload
 
 logger = setup_logger("Main")
 
@@ -181,8 +157,8 @@ def main() -> int:
 
     logger.info("Trading bot starting | config=%s", app_cfg.config_path)
 
-    broker  = _build_broker(settings.env_cfg)
-    strategies = _build_strategies(app_cfg.strategies)
+    broker      = _build_broker(settings.env_cfg)
+    strategies  = _build_strategies(app_cfg.strategies)
     risk_engine = _build_risk_engine(app_cfg)
 
     orchestrator = TradingOrchestrator(
@@ -209,41 +185,50 @@ def _build_broker(env_cfg):
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 
 
-def _build_strategies(specs):
-    registry = StrategyBuilderRegistry()
-    registry.register("pmcc", lambda spec: PmccStrategy(config=spec.pmcc))
-    return registry.build_all(specs)
+def _build_strategies(specs: list[StrategySpec]) -> list[StrategyABC]:
+    """
+    Build all strategy instances via the plugin registry.
+    Each plugin knows how to construct its own strategy from the spec.
+    No strategy-specific logic here.
+    """
+    strategies = []
+    for spec in specs:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin is None:
+            logger.error(
+                "No plugin registered for strategy '%s'. "
+                "Registered plugins: %s. "
+                "Add a StrategyPlugin subclass to strategy_plugin.py.",
+                spec.name, list(STRATEGY_PLUGINS),
+            )
+            sys.exit(1)
+        strategies.append(plugin.build_strategy(spec))
+    return strategies
 
 
-def _build_risk_engine(app_cfg):
-    engine = RiskEngine(rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else [])
-
-    # Find PMCC config for sizer — use first PMCC strategy found
-    pmcc_risk_cfg = next(
-        (s.pmcc.risk for s in app_cfg.strategies if s.pmcc is not None),
-        None,
+def _build_risk_engine(app_cfg: AppConfig) -> RiskEngine:
+    """
+    Build the risk engine and let each plugin register its own evaluators.
+    No strategy-specific logic here — evaluator wiring belongs to the plugin.
+    """
+    engine = RiskEngine(
+        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
     )
-
-    sizing_cfg = PmccSizingConfig(
-        equity_budget_pct=pmcc_risk_cfg.equity_budget_pct            if pmcc_risk_cfg else 0.05,
-        max_option_bp_fraction=pmcc_risk_cfg.max_option_bp_fraction  if pmcc_risk_cfg else 0.25,
-        max_debit_per_spread_usd=pmcc_risk_cfg.max_debit_per_spread_usd if pmcc_risk_cfg else 5000.0,
-        max_contracts_per_intent=pmcc_risk_cfg.max_contracts_per_intent if pmcc_risk_cfg else 5,
-        slippage_factor=pmcc_risk_cfg.slippage_factor                if pmcc_risk_cfg else 1.02,
-    )
-    max_units = next(
-        (s.pmcc.max_units for s in app_cfg.strategies if s.pmcc is not None),
-        2,
-    )
-
-    engine.register(PmccIntentPayload, PmccIntentEvaluator(sizer=PmccSizer(config=sizing_cfg), max_units=max_units))
-    engine.register(OptionIntentPayload, OptionIntentEvaluator())
+    for spec in app_cfg.strategies:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin is None:
+            logger.error(
+                "No plugin registered for strategy '%s'. "
+                "Registered plugins: %s.",
+                spec.name, list(STRATEGY_PLUGINS),
+            )
+            sys.exit(1)
+        plugin.register_evaluators(spec, engine)
     return engine
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
 
 ============================================================
 FILE: .\src\app\scheduler.py
@@ -310,7 +295,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import requests
 from requests import Session
@@ -333,6 +318,11 @@ if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
 
 logger = setup_logger("AlpacaBroker")
+
+
+def _underlying_from_osi(osi_symbol: str) -> str:
+    """Extract the underlying ticker from an OSI option symbol (e.g. SPY270617C00605000 → SPY)."""
+    return "".join(c for c in osi_symbol if c.isalpha()).upper()
 
 
 class AlpacaBroker(BrokerBase, BrokerABC):
@@ -407,6 +397,7 @@ class AlpacaBroker(BrokerBase, BrokerABC):
     # ------------------------------------------------------------------
 
     def get_account_snapshot(self) -> Dict[str, Any]:
+        """Single HTTP call to /account. Returns the raw Alpaca account dict."""
         self._log_io_boundary("get_account_snapshot")
         return self._request_json("GET", "/account")  # type: ignore[return-value]
 
@@ -420,12 +411,14 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         self._log_io_boundary("get_positions")
         data = self._request_json("GET", "/positions")
         positions = [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
-        # Log every position so we can see exactly what Alpaca returns
+
         for p in positions:
+            # Alpaca sometimes omits underlying_symbol — derive it from the OSI symbol as fallback
+            underlying = p.get("underlying_symbol") or _underlying_from_osi(str(p.get("symbol", "")))
             logger.info(
                 "Position | symbol=%s asset_class=%s underlying=%s qty=%s side=%s",
                 p.get("symbol"), p.get("asset_class"),
-                p.get("underlying_symbol"), p.get("qty"), p.get("side"),
+                underlying, p.get("qty"), p.get("side"),
             )
         if not positions:
             logger.info("Positions | none")
@@ -435,16 +428,24 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         self._log_io_boundary("get_open_orders")
         data = self._request_json("GET", "/orders", params={"status": "open"})
         orders = [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
-        # Log every open order so we can see exactly what Alpaca returns
+
         for o in orders:
             legs_info = [
                 f"{leg.get('symbol')}:{leg.get('side')}"
                 for leg in (o.get("legs") or [])
                 if isinstance(leg, dict)
             ]
+            # Alpaca omits underlying_symbol on MLEG orders — derive from legs
+            underlying = o.get("underlying_symbol")
+            if not underlying:
+                for leg in (o.get("legs") or []):
+                    leg_sym = str(leg.get("symbol") or "")
+                    underlying = _underlying_from_osi(leg_sym) or None
+                    if underlying:
+                        break
             logger.info(
                 "OpenOrder | id=%s symbol=%s underlying=%s type=%s status=%s legs=%s",
-                o.get("id"), o.get("symbol"), o.get("underlying_symbol"),
+                o.get("id"), o.get("symbol"), underlying,
                 o.get("order_class"), o.get("status"), legs_info or "n/a",
             )
         if not orders:
@@ -1059,8 +1060,8 @@ def load_env_config() -> EnvConfig:
     _load_root_dotenv()
 
     return EnvConfig(
-        broker_name=_get_env("BROKER_NAME", "alpaca").lower(),
-        alpaca=AlpacaEnvConfig(mode=_get_env("ALPACA_MODE", "paper").lower()),
+        broker_name=_get_env("BROKER_NAME", "alpaca").lower(), # default to alpaca for now since it's the only supported broker. To be set in .env 
+        alpaca=AlpacaEnvConfig(mode=_get_env("ALPACA_MODE", "paper").lower()), # paper mode as default for safety
     )
 
 
@@ -1072,10 +1073,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
+
+# ===========================================================================
+# Strategy config dataclasses
+# ===========================================================================
 
 @dataclass(frozen=True)
 class PmccLeapConfig:
@@ -1106,12 +1111,20 @@ class PmccLiquidityConfig:
 
 @dataclass(frozen=True)
 class PmccRiskConfig:
-    equity_budget_pct:        float
-    max_option_bp_fraction:   float
+    # Maximum fraction of available buying power to use per PMCC entry intent.
+    max_buying_power_fraction: float
+
+    # Hard dollar ceiling on net debit per spread regardless of buying power.
     max_debit_per_spread_usd: float
+
+    # Hard contract ceiling per intent — final safety cap after all other checks.
     max_contracts_per_intent: int
-    slippage_factor:          float
-    ignore_spread_checks:     bool
+
+    # Multiply estimated cost by this before budget checks (e.g. 1.05 = 5% slippage buffer).
+    slippage_factor: float
+
+    # Skip bid-ask spread liquidity checks — only for paper/backtesting diagnostics.
+    ignore_spread_checks: bool
 
 
 @dataclass(frozen=True)
@@ -1125,11 +1138,70 @@ class PmccConfig:
     risk:              PmccRiskConfig
 
 
+# ===========================================================================
+# StrategySpec — generic container for any strategy config
+# ===========================================================================
+
 @dataclass(frozen=True)
 class StrategySpec:
-    name: str
-    pmcc: Optional[PmccConfig] = None
+    name:   str
+    config: Any  # typed config dataclass for the strategy, e.g. PmccConfig
 
+    # Convenience accessor — avoids callers doing isinstance checks everywhere
+    @property
+    def pmcc(self) -> Optional[PmccConfig]:
+        return self.config if isinstance(self.config, PmccConfig) else None
+
+
+# ===========================================================================
+# Strategy config parser registry
+# ===========================================================================
+# To add a new strategy:
+#   1. Define its config dataclass(es) above.
+#   2. Write a _parse_<name>_config(raw: dict) -> YourConfig function below.
+#   3. Register it in _STRATEGY_CONFIG_PARSERS.
+#   4. That's it — load_app_config() needs no changes.
+#
+# Each parser receives the full strategy YAML entry dict (the dict that also
+# contains "name": "pmcc") and returns a typed config object.
+# ===========================================================================
+
+StrategyConfigParser = Callable[[Dict[str, Any]], Any]
+
+
+def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
+    """Parse the 'pmcc:' block from a strategy entry."""
+    p = raw.get("pmcc")
+    if not p:
+        return None
+    r = p["risk"]
+    return PmccConfig(
+        underlying_symbol=p["underlying_symbol"],
+        max_units=int(p["max_units"]),
+        leap=PmccLeapConfig(**p["leap"]),
+        short=PmccShortConfig(**p["short"]),
+        roll=PmccRollConfig(**p["roll"]),
+        liquidity=PmccLiquidityConfig(**p["liquidity"]),
+        risk=PmccRiskConfig(
+            max_buying_power_fraction=float(r["max_buying_power_fraction"]),
+            max_debit_per_spread_usd=float(r["max_debit_per_spread_usd"]),
+            max_contracts_per_intent=int(r["max_contracts_per_intent"]),
+            slippage_factor=float(r["slippage_factor"]),
+            ignore_spread_checks=bool(r.get("ignore_spread_checks", False)),
+        ),
+    )
+
+
+# Registry: strategy name → parser function.
+# Add new strategies here without touching load_app_config().
+_STRATEGY_CONFIG_PARSERS: Dict[str, StrategyConfigParser] = {
+    "pmcc": _parse_pmcc_config,
+}
+
+
+# ===========================================================================
+# App-level config
+# ===========================================================================
 
 @dataclass(frozen=True)
 class GlobalRiskConfig:
@@ -1144,6 +1216,10 @@ class AppConfig:
     risk:            GlobalRiskConfig
     strategies:      List[StrategySpec]
 
+
+# ===========================================================================
+# Loader
+# ===========================================================================
 
 _SEARCH_PATHS = [
     Path("config/config.yaml"),
@@ -1169,21 +1245,15 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
     )
 
     strategies: List[StrategySpec] = []
-    for s in raw.get("strategies", []):
-        name = s.get("name")
-        pmcc: Optional[PmccConfig] = None
-        if name == "pmcc" and "pmcc" in s:
-            p    = s["pmcc"]
-            pmcc = PmccConfig(
-                underlying_symbol=p["underlying_symbol"],
-                max_units=int(p["max_units"]),
-                leap=PmccLeapConfig(**p["leap"]),
-                short=PmccShortConfig(**p["short"]),
-                roll=PmccRollConfig(**p["roll"]),
-                liquidity=PmccLiquidityConfig(**p["liquidity"]),
-                risk=PmccRiskConfig(**p["risk"]),
+    for entry in raw.get("strategies", []):
+        name   = str(entry.get("name", "")).strip().lower()
+        parser = _STRATEGY_CONFIG_PARSERS.get(name)
+        if parser is None:
+            raise KeyError(
+                f"No config parser registered for strategy '{name}'. "
+                f"Registered: {list(_STRATEGY_CONFIG_PARSERS)}"
             )
-        strategies.append(StrategySpec(name=name, pmcc=pmcc))
+        strategies.append(StrategySpec(name=name, config=parser(entry)))
 
     return AppConfig(
         config_path=path,
@@ -1192,7 +1262,6 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
         risk=global_risk,
         strategies=strategies,
     )
-
 
 ============================================================
 FILE: .\src\config\__init__.py
@@ -1708,9 +1777,20 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
         universe: List[Symbol],
         option_chain_requests: List[OptionChainRequest],
     ) -> CycleSnapshot:
-        as_of       = datetime.now(timezone.utc)
-        equity      = float(self.broker.get_equity())
-        opt_bp      = float(self.broker.get_option_buying_power())
+        as_of = datetime.now(timezone.utc)
+
+        # Single HTTP call — derive equity and option BP from the same response.
+        # Previously get_equity() and get_option_buying_power() each independently
+        # called get_account_snapshot(), resulting in 2 redundant /account round-trips.
+        account = self.broker.get_account_snapshot()
+        equity  = float(account.get("equity") or 0.0)
+        opt_bp  = float(account.get("options_buying_power") or 0.0)
+
+        logger.info(
+            "Account snapshot | equity=%.2f options_buying_power=%.2f",
+            equity, opt_bp,
+        )
+
         positions   = list(self.broker.get_positions())
         open_orders = list(self.broker.get_open_orders())
 
@@ -1751,7 +1831,6 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
             _option_chains=chains,
             _signals=SignalSnapshot.empty(as_of_utc=as_of),
         )
-
 
 ============================================================
 FILE: .\src\orchestration\orchestrator.py
@@ -1979,8 +2058,13 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
         if not isinstance(payload, PmccIntentPayload):
             return EvaluatorResult.reject(str(intent.intent_id), "Wrong payload type for PmccIntentEvaluator")
 
-        # Count existing PMCC units for this underlying
-        sym        = str(intent.symbol).upper()
+        sym = str(intent.symbol).upper()
+
+        # ------------------------------------------------------------------
+        # Unit cap: count existing long LEAP positions for this underlying.
+        # Each long option with DTE > 90 counts as one open PMCC unit.
+        # If we're already at max_units, reject — no new entry needed.
+        # ------------------------------------------------------------------
         positions  = snapshot.positions()
         unit_count = sum(
             1 for p in positions
@@ -1995,13 +2079,10 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
                 f"Max PMCC units ({self.max_units}) already open for {sym}",
             )
 
-        # Get quotes for sizing
-        quotes = snapshot.asset_quotes()
-        sym_key = next((k for k in quotes if str(k).upper() == sym), None)
-        equity  = snapshot.equity()
-        opt_bp  = snapshot.option_buying_power()
-
-        # Rough sizing: use mid prices from chain if available, otherwise skip
+        # ------------------------------------------------------------------
+        # Pull prices from the option chain snapshot.
+        # We need leap ask (what we pay) and near bid (what we collect).
+        # ------------------------------------------------------------------
         leap_ask: Optional[float] = None
         near_bid: Optional[float] = None
 
@@ -2021,15 +2102,25 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
         if leap_ask is None or near_bid is None:
             return EvaluatorResult.reject(str(intent.intent_id), "Could not find prices for sizing")
 
+        # ------------------------------------------------------------------
+        # Size the trade using only buying power — not equity.
+        # See PmccSizer.size() docstring for the rationale.
+        # ------------------------------------------------------------------
+        buying_power = snapshot.option_buying_power()
+
+        logger.info(
+            "Sizing | symbol=%s buying_power=%.2f leap_ask=%.2f near_bid=%.2f net_debit_per_contract=%.2f",
+            sym, buying_power, leap_ask, near_bid, (leap_ask - near_bid) * 100,
+        )
+
         qty = self.sizer.size(
-            equity=equity,
-            option_buying_power=opt_bp,
+            buying_power=buying_power,
             leap_ask=leap_ask,
             near_bid=near_bid,
         )
 
         if qty is None or qty < 1:
-            return EvaluatorResult.reject(str(intent.intent_id), "Sizer returned 0 — insufficient capital")
+            return EvaluatorResult.reject(str(intent.intent_id), "Sizer returned 0 — insufficient buying power")
 
         net_debit = Decimal(str(leap_ask - near_bid)).quantize(Decimal("0.01"))
 
@@ -2071,7 +2162,6 @@ class OptionIntentEvaluator(IntentEvaluatorABC):
         )
         return EvaluatorResult.approve(str(intent.intent_id), spec)
 
-
 ============================================================
 FILE: .\src\risk\pmcc_sizer.py
 ============================================================
@@ -2105,8 +2195,8 @@ def parse_osi(symbol: str) -> OsiParsed:
     m = _OSI_RE.match(symbol.strip().upper())
     if not m:
         raise ValueError(f"Cannot parse OSI symbol: {symbol!r}")
-    yy    = int(m["yy"])
-    year  = 2000 + yy if yy < 50 else 1900 + yy
+    yy     = int(m["yy"])
+    year   = 2000 + yy if yy < 50 else 1900 + yy
     expiry = datetime(year, int(m["mm"]), int(m["dd"]))
     strike = Decimal(m["strike"]) / Decimal("1000")
     return OsiParsed(
@@ -2119,11 +2209,33 @@ def parse_osi(symbol: str) -> OsiParsed:
 
 @dataclass(frozen=True)
 class PmccSizingConfig:
-    equity_budget_pct:        float = 0.05
-    max_option_bp_fraction:   float = 0.25
-    max_debit_per_spread_usd: float = 5000.0
-    max_contracts_per_intent: int   = 5
-    slippage_factor:          float = 1.02
+    """
+    All fields are required — no defaults.
+
+    These must be supplied from config.yaml via _build_risk_engine() in main.py.
+    If any are missing, the program will exit at startup with a clear message
+    rather than silently trading with wrong parameters.
+
+    Required config.yaml fields under strategies[*].pmcc.risk:
+        max_buying_power_fraction  (float, e.g. 0.50)
+        max_debit_per_spread_usd   (float, e.g. 14000.0)
+        max_contracts_per_intent   (int,   e.g. 1)
+        slippage_factor            (float, e.g. 1.05)
+    """
+    # Maximum fraction of available buying power to use per PMCC entry.
+    # e.g. 0.50 = never spend more than 50% of buying power on one spread.
+    max_buying_power_fraction: float
+
+    # Hard dollar ceiling on the net debit per spread.
+    # Whichever is lower — bp fraction or this cap — wins.
+    max_debit_per_spread_usd: float
+
+    # Hard contract ceiling per intent — absolute safety cap applied last.
+    max_contracts_per_intent: int
+
+    # Multiply estimated cost by this before checking budgets.
+    # 1.05 = assume fills will be 5% worse than mid price.
+    slippage_factor: float
 
 
 @dataclass
@@ -2133,11 +2245,25 @@ class PmccSizer:
     def size(
         self,
         *,
-        equity:              float,
-        option_buying_power: float,
-        leap_ask:            float,
-        near_bid:            float,
+        buying_power: float,
+        leap_ask:     float,
+        near_bid:     float,
     ) -> Optional[int]:
+        """
+        Return the number of contracts to trade, or None if the trade is not viable.
+
+        Sizing logic (in order):
+          1. Compute net debit per contract (leap ask - near bid) × 100.
+          2. Apply slippage buffer to be conservative on fill cost.
+          3. Compute bp budget = buying_power × max_buying_power_fraction.
+          4. Cap at max_debit_per_spread_usd (hard dollar ceiling).
+          5. Divide budget by slippage-adjusted cost → max contracts.
+          6. Apply max_contracts_per_intent as a final hard cap.
+
+        Sizing is based purely on buying power, not equity. Sizing off equity
+        creates a feedback loop where losses elsewhere shrink the budget here,
+        potentially triggering forced liquidation of the spread mid-cycle.
+        """
         if leap_ask <= 0 or near_bid < 0:
             return None
 
@@ -2145,19 +2271,16 @@ class PmccSizer:
         if net_debit_per_contract <= 0:
             return None
 
-        net_debit_with_slip = net_debit_per_contract * self.config.slippage_factor
-
-        budget_equity = equity * self.config.equity_budget_pct
-        budget_bp     = option_buying_power * self.config.max_option_bp_fraction
-        budget        = min(budget_equity, budget_bp, self.config.max_debit_per_spread_usd)
+        cost_with_slip = net_debit_per_contract * self.config.slippage_factor
+        bp_budget      = buying_power * self.config.max_buying_power_fraction
+        budget         = min(bp_budget, self.config.max_debit_per_spread_usd)
 
         if budget <= 0:
             return None
 
-        contracts = int(budget // net_debit_with_slip)
+        contracts = int(budget // cost_with_slip)
         contracts = min(contracts, self.config.max_contracts_per_intent)
         return contracts if contracts > 0 else None
-
 
 ============================================================
 FILE: .\src\risk\risk_engine.py
@@ -2180,13 +2303,15 @@ logger = setup_logger("RiskEngine")
 
 @dataclass
 class RiskEngine:
-    rules:      List[RiskRuleABC]                              = field(default_factory=list)
+    rules:       List[RiskRuleABC]                                = field(default_factory=list)
     _evaluators: Dict[Type[IntentPayloadABC], IntentEvaluatorABC] = field(default_factory=dict, init=False)
 
     def register(self, payload_type: Type[IntentPayloadABC], evaluator: IntentEvaluatorABC) -> None:
         self._evaluators[payload_type] = evaluator
-        logger.info("Registered evaluator | payload=%s evaluator=%s",
-                    payload_type.__name__, type(evaluator).__name__)
+        logger.info(
+            "Registered evaluator | payload=%s evaluator=%s",
+            payload_type.__name__, type(evaluator).__name__,
+        )
 
     def evaluate(
         self,
@@ -2197,6 +2322,7 @@ class RiskEngine:
         rejected: List[RejectedIntent] = []
 
         for intent in intents:
+
             # 1 — run chain-of-responsibility rules first
             rule_rejection = None
             for rule in self.rules:
@@ -2206,15 +2332,18 @@ class RiskEngine:
                     break
 
             if rule_rejection:
-                logger.info("Intent REJECTED by rule | id=%s reason=%s", intent.intent_id, rule_rejection)
+                logger.info(
+                    "Intent REJECTED by rule | id=%s reason=%s",
+                    intent.intent_id, rule_rejection,
+                )
                 rejected.append(RejectedIntent(intent_id=str(intent.intent_id), reason=rule_rejection))
                 continue
 
             # 2 — dispatch to payload-specific evaluator
             evaluator = self._evaluators.get(type(intent.payload))
             if evaluator is None:
-                reason = f"No evaluator for payload type {type(intent.payload).__name__}"
-                logger.warning("Intent REJECTED — %s", reason)
+                reason = f"No evaluator registered for payload type {type(intent.payload).__name__}"
+                logger.warning("Intent REJECTED | id=%s reason=%s", intent.intent_id, reason)
                 rejected.append(RejectedIntent(intent_id=str(intent.intent_id), reason=reason))
                 continue
 
@@ -2222,11 +2351,18 @@ class RiskEngine:
             if result.approved is not None:
                 approved.append(result.approved)
             elif result.rejected is not None:
+                # Log the reason every time so it's never a mystery
+                logger.info(
+                    "Intent REJECTED by evaluator | id=%s reason=%s",
+                    result.rejected.intent_id, result.rejected.reason,
+                )
                 rejected.append(result.rejected)
 
-        logger.info("Risk evaluation complete | approved=%d rejected=%d", len(approved), len(rejected))
+        logger.info(
+            "Risk evaluation complete | approved=%d rejected=%d",
+            len(approved), len(rejected),
+        )
         return RiskDecisionBatch(approved=approved, rejected=rejected)
-
 
 ============================================================
 FILE: .\src\risk\__init__.py
@@ -2599,7 +2735,7 @@ class PmccState(str, Enum):
     LEAP_ONLY = "leap_only"
     COVERED   = "covered"
     NEAR_ONLY = "near_only"   # illegal — should not occur
-    PENDING   = "pending"     # open order blocking action
+    PENDING   = "pending"     # completing open order blocking action
 
 
 @dataclass(frozen=True)
@@ -2609,8 +2745,64 @@ class PmccHoldings:
     near_position: Optional[Dict[str, Any]]
 
 
+def _underlying_from_osi(osi_symbol: str) -> str:
+    """
+    Extract the underlying ticker from an OSI option symbol.
+
+    OSI format: <TICKER><YYMMDD><C|P><8-digit-strike>
+    e.g. SPY270617C00605000  → SPY
+         AAPL260121C00150000 → AAPL
+
+    We stop at the first digit. Do NOT collect all alpha chars —
+    the C/P right character is also alphabetic, which would give 'SPYC' not 'SPY'.
+    """
+    ticker = []
+    for ch in osi_symbol.strip().upper():
+        if ch.isdigit():
+            break
+        ticker.append(ch)
+    return "".join(ticker)
+
+
+def _underlying_from_position(position: Dict[str, Any]) -> str:
+    """
+    Return the underlying ticker for a position.
+    Alpaca omits underlying_symbol on option positions — fall back to
+    extracting the leading alpha prefix from the OSI symbol.
+    """
+    sym = position.get("underlying_symbol") or ""
+    if sym:
+        return str(sym).strip().upper()
+    osi = str(position.get("symbol", ""))
+    return _underlying_from_osi(osi)
+
+
+def _dte_from_position(position: Dict[str, Any]) -> int:
+    """Derive DTE from the OSI option symbol — Alpaca doesn't return a dte field on positions."""
+    sym = str(position.get("symbol", ""))
+    if len(sym) >= 15:
+        try:
+            from src.risk.pmcc_sizer import parse_osi
+            parsed = parse_osi(sym)
+            return max(0, (parsed.expiry - datetime.now()).days)
+        except Exception as exc:
+            logger.warning("Could not parse DTE from symbol=%s: %s", sym, exc)
+    return -1
+
+
+@dataclass
 class PmccStateClassifier:
-    """Derives current PMCC state from positions + open orders snapshots."""
+    """
+    Derives current PMCC state from positions + open orders.
+
+    leap_dte_min and near_dte_max come directly from config.yaml so that
+    the LEAP/NEAR DTE boundary is never hardcoded here.
+
+      - A position is a LEAP if: qty > 0 AND dte >= leap_dte_min
+      - A position is a NEAR if: qty < 0 AND dte <= near_dte_max
+    """
+    leap_dte_min: int  # from config: leap.dte_min  (e.g. 365)
+    near_dte_max: int  # from config: short.dte_max (e.g. 45)
 
     def classify(
         self,
@@ -2621,14 +2813,20 @@ class PmccStateClassifier:
     ) -> PmccHoldings:
         sym = underlying.strip().upper()
 
-        # ------------------------------------------------------------------
+        # Dump every raw position with derived underlying so we can verify the OSI fix.
+        for p in positions:
+            derived = _underlying_from_position(p)
+            logger.info(
+                "RawPosition | symbol=%s asset_class=%r underlying_symbol=%r qty=%s side=%s derived_underlying=%s",
+                p.get("symbol"), p.get("asset_class"),
+                p.get("underlying_symbol"), p.get("qty"), p.get("side"), derived,
+            )
+
         # Filter option positions for this underlying.
-        # Alpaca returns asset_class="us_option" and underlying_symbol="SPY".
-        # qty can be positive (long) or negative (short).
-        # ------------------------------------------------------------------
+        # underlying_symbol is None on Alpaca option positions — OSI fallback used.
         opt_pos = [
             p for p in positions
-            if str(p.get("underlying_symbol", "")).upper() == sym
+            if _underlying_from_position(p) == sym
             and str(p.get("asset_class", "")).lower() == "us_option"
         ]
 
@@ -2637,45 +2835,50 @@ class PmccStateClassifier:
             sym, len(positions), len(opt_pos),
         )
         for p in opt_pos:
+            dte = _dte_from_position(p)
             logger.info(
-                "  OptionPos | symbol=%s qty=%s side=%s asset_class=%s underlying=%s",
-                p.get("symbol"), p.get("qty"), p.get("side"),
-                p.get("asset_class"), p.get("underlying_symbol"),
+                "  OptionPos | symbol=%s qty=%s side=%s dte=%d asset_class=%s underlying=%s",
+                p.get("symbol"), p.get("qty"), p.get("side"), dte,
+                p.get("asset_class"), _underlying_from_position(p),
             )
 
-        # ------------------------------------------------------------------
-        # Identify LEAP vs NEAR by DTE derived from the OSI symbol.
-        # Alpaca does NOT include a "dte" field on positions — parse from symbol.
-        # ------------------------------------------------------------------
         leap = next((p for p in opt_pos if self._is_leap(p)), None)
         near = next((p for p in opt_pos if self._is_near(p)), None)
 
         logger.info(
-            "Classifier | leap=%s near=%s",
+            "Classifier | leap=%s near=%s leap_dte_min=%d near_dte_max=%d",
             leap.get("symbol") if leap else "none",
             near.get("symbol") if near else "none",
+            self.leap_dte_min, self.near_dte_max,
         )
 
-        # ------------------------------------------------------------------
-        # Check for pending orders that should block action.
-        # MLEG orders have no top-level underlying_symbol — must check legs.
-        # ------------------------------------------------------------------
-        pending_orders = [o for o in open_orders if self._order_is_for(o, sym)]
+        all_pending    = [o for o in open_orders if self._order_is_for(o, sym)]
+        completing     = [o for o in all_pending if self._is_completing_mleg(o)]
+        non_completing = [o for o in all_pending if not self._is_completing_mleg(o)]
 
         logger.info(
-            "Classifier | open_orders_total=%d pending_for_%s=%d",
-            len(open_orders), sym, len(pending_orders),
+            "Classifier | open_orders_total=%d pending_for_%s=%d completing=%d non_completing=%d",
+            len(open_orders), sym, len(all_pending), len(completing), len(non_completing),
         )
-        for o in pending_orders:
+        for o in all_pending:
+            legs_info = [
+                f"{leg.get('symbol')}:{leg.get('side')}"
+                for leg in (o.get("legs") or [])
+                if isinstance(leg, dict)
+            ]
             logger.info(
-                "  PendingOrder | id=%s class=%s status=%s symbol=%s",
-                o.get("id"), o.get("order_class"), o.get("status"), o.get("symbol"),
+                "  PendingOrder | id=%s class=%s status=%s completing=%s legs=%s",
+                o.get("id"), o.get("order_class"), o.get("status"),
+                self._is_completing_mleg(o), legs_info or "n/a",
             )
 
-        # ------------------------------------------------------------------
-        # Derive state
-        # ------------------------------------------------------------------
-        if pending_orders:
+        if non_completing:
+            logger.warning(
+                "Non-completing pending orders found — ignoring | underlying=%s ids=%s",
+                sym, [o.get("id") for o in non_completing],
+            )
+
+        if completing:
             state = PmccState.PENDING
         elif leap and near:
             state = PmccState.COVERED
@@ -2689,81 +2892,54 @@ class PmccStateClassifier:
         logger.info("Classifier | result state=%s", state.value)
         return PmccHoldings(state=state, leap_position=leap, near_position=near)
 
-    @staticmethod
-    def _order_is_for(order: Dict[str, Any], sym: str) -> bool:
+    def _is_leap(self, position: Dict[str, Any]) -> bool:
         """
-        Return True if this open order relates to the given underlying.
-        Handles both simple orders (symbol field) and MLEG orders (legs list).
-        """
-        # Simple order: top-level symbol or underlying_symbol matches
-        top_sym = str(order.get("underlying_symbol") or order.get("symbol") or "").upper()
-        if top_sym == sym:
-            return True
-
-        # MLEG order: check legs for any leg whose underlying matches.
-        # Alpaca MLEG legs have a "symbol" field with the OSI option symbol,
-        # e.g. "SPY270617C00605000" — the underlying is the alpha prefix.
-        for leg in (order.get("legs") or []):
-            if not isinstance(leg, dict):
-                continue
-            leg_sym = str(leg.get("symbol") or "").upper()
-            # Extract underlying from OSI: leading alpha characters
-            underlying_part = ""
-            for ch in leg_sym:
-                if ch.isalpha():
-                    underlying_part += ch
-                else:
-                    break
-            if underlying_part == sym:
-                return True
-
-        return False
-
-    @staticmethod
-    def _is_leap(position: Dict[str, Any]) -> bool:
-        """
-        A LEAP is a long option with DTE > 90 days.
-        qty > 0 means long (bought).
+        A LEAP is a long option (qty > 0) with DTE >= leap_dte_min.
+        leap_dte_min comes from config.yaml leap.dte_min (e.g. 365).
         """
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty <= 0:
-            return False  # short positions are never LEAPs in our PMCC
+            return False
+        return _dte_from_position(position) >= self.leap_dte_min
 
-        return _dte_from_position(position) > 90
-
-    @staticmethod
-    def _is_near(position: Dict[str, Any]) -> bool:
+    def _is_near(self, position: Dict[str, Any]) -> bool:
         """
-        A NEAR is a short option with DTE <= 90 days.
-        qty < 0 means short (sold).
+        A NEAR is a short option (qty < 0) with DTE <= near_dte_max.
+        near_dte_max comes from config.yaml short.dte_max (e.g. 45).
         """
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty >= 0:
-            return False  # long positions are never NEARs in our PMCC
+            return False
+        return _dte_from_position(position) <= self.near_dte_max
 
-        return _dte_from_position(position) <= 90
+    @staticmethod
+    def _order_is_for(order: Dict[str, Any], sym: str) -> bool:
+        top_sym = str(order.get("underlying_symbol") or order.get("symbol") or "").upper()
+        if top_sym == sym:
+            return True
+        for leg in (order.get("legs") or []):
+            if not isinstance(leg, dict):
+                continue
+            leg_sym = str(leg.get("symbol") or "").upper()
+            if _underlying_from_osi(leg_sym) == sym:
+                return True
+        return False
 
-
-def _dte_from_position(position: Dict[str, Any]) -> int:
-    """
-    Derive DTE from the OSI option symbol on the position.
-    Alpaca positions do not carry a dte field directly.
-    """
-    sym = str(position.get("symbol", ""))
-    if len(sym) >= 15:
-        try:
-            from src.risk.pmcc_sizer import parse_osi
-            parsed = parse_osi(sym)
-            return max(0, (parsed.expiry - datetime.now()).days)
-        except Exception as exc:
-            logger.warning("Could not parse DTE from symbol=%s: %s", sym, exc)
-    return -1
+    @staticmethod
+    def _is_completing_mleg(order: Dict[str, Any]) -> bool:
+        """True if this MLEG has exactly 1 buy + 1 sell leg — a valid PMCC entry."""
+        if str(order.get("order_class", "")).lower() != "mleg":
+            return False
+        legs  = [l for l in (order.get("legs") or []) if isinstance(l, dict)]
+        buys  = [l for l in legs if str(l.get("side", "")).lower() == "buy"]
+        sells = [l for l in legs if str(l.get("side", "")).lower() == "sell"]
+        return len(buys) == 1 and len(sells) == 1
 
 ============================================================
 FILE: .\src\strategies\pmcc_strategy.py
@@ -2783,7 +2959,6 @@ from src.domain.intents import (
     SingleOptionLeg,
     TradeIntent,
 )
-
 from src.domain.types import OptionChainRequest, Symbol
 from src.orchestration.cycle_snapshot import CycleSnapshotABC
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
@@ -2796,12 +2971,22 @@ logger = setup_logger("PmccStrategy")
 
 @dataclass
 class PmccStrategy(StrategyABC, OptionChainConsumerABC):
-    config:     PmccConfig
-    strategy_id: str                    = "pmcc"
-    _classifier: PmccStateClassifier    = field(default_factory=PmccStateClassifier, init=False)
-    _selector:   PmccContractSelector   = field(init=False)
+    config:      PmccConfig
+    strategy_id: str = "pmcc"
+
+    # Classifier and selector are built in __post_init__ from config —
+    # they are NOT init params, not defaults, and not hardcoded.
+    _classifier: PmccStateClassifier  = field(init=False)
+    _selector:   PmccContractSelector = field(init=False)
 
     def __post_init__(self) -> None:
+        # Pass DTE boundaries from config so the classifier never has hardcoded values.
+        # leap_dte_min: a position must have DTE >= this to count as a LEAP.
+        # near_dte_max: a position must have DTE <= this to count as a NEAR.
+        self._classifier = PmccStateClassifier(
+            leap_dte_min=self.config.leap.dte_min,
+            near_dte_max=self.config.short.dte_max,
+        )
         self._selector = PmccContractSelector(
             leap_cfg=self.config.leap,
             short_cfg=self.config.short,
@@ -2884,7 +3069,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         short_key = _find_key(chains, sym_str, "shorts")
 
         if leap_key is None or short_key is None:
-            missing = [k for k in ("leaps", "shorts") if _find_key(chains, sym_str, k) is None]
+            missing   = [k for k in ("leaps", "shorts") if _find_key(chains, sym_str, k) is None]
             available = [(str(k[0]), k[1]) for k in chains]
             logger.warning(
                 "Entry chains not in snapshot | symbol=%s missing=%s available=%s",
@@ -2930,12 +3115,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             leap_leg=leap_selection,
             near_leg=near_selection,
         )
-
-        return [TradeIntent.create(
-            strategy_id=self.strategy_id,
-            symbol=sym,
-            payload=payload,
-        )]
+        return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
 
     def _intents_sell_near(
         self,
@@ -2948,7 +3128,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         short_key = _find_key(chains, sym_str, "shorts")
 
         if short_key is None:
-            logger.warning("Shorts chain not in snapshot | symbol=%s available=%s", sym_str, [(str(k[0]), k[1]) for k in chains])
+            logger.warning(
+                "Shorts chain not in snapshot | symbol=%s available=%s",
+                sym_str, [(str(k[0]), k[1]) for k in chains],
+            )
             return []
 
         leap_strike: Optional[float] = None
@@ -2959,7 +3142,11 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             except Exception:
                 pass
 
-        near = self._selector.select_near(sym_str, list(chains[short_key]), leap_strike or 0, spot_price=_get_spot(snapshot, sym_str))
+        near = self._selector.select_near(
+            sym_str, list(chains[short_key]),
+            leap_strike or 0,
+            spot_price=_get_spot(snapshot, sym_str),
+        )
         if near is None:
             logger.warning("No NEAR selected for sell_near | symbol=%s leap_strike=%s", sym_str, leap_strike)
             return []
@@ -2990,7 +3177,6 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         if not near_sym:
             return []
 
-        # Check if we should roll the near
         dte = near.get("dte") or near.get("days_to_expiry")
         if dte is not None and int(dte) <= self.config.roll.dte_threshold:
             logger.info("Rolling NEAR (DTE threshold) | symbol=%s near=%s dte=%s", sym, near_sym, dte)
@@ -3010,7 +3196,6 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         near_sym: str,
         snapshot: CycleSnapshotABC,
     ) -> List[TradeIntent]:
-        # BTC existing near, then STO new near — two intents
         btc_payload = OptionIntentPayload(
             underlying_symbol=sym,
             leg=SingleOptionLeg(
@@ -3020,10 +3205,8 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             ),
         )
         btc = TradeIntent.create(
-            strategy_id=self.strategy_id,
-            symbol=sym,
-            payload=btc_payload,
-            tags=("roll_btc",),
+            strategy_id=self.strategy_id, symbol=sym,
+            payload=btc_payload, tags=("roll_btc",),
         )
 
         chains    = snapshot.option_chains()
@@ -3032,7 +3215,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             logger.warning("Shorts chain missing for roll | symbol=%s", sym)
             return [btc]
 
-        new_near = self._selector.select_near(str(sym), list(chains[short_key]), 0, spot_price=_get_spot(snapshot, str(sym)))
+        new_near = self._selector.select_near(
+            str(sym), list(chains[short_key]), 0,
+            spot_price=_get_spot(snapshot, str(sym)),
+        )
         if new_near is None:
             logger.warning("No new NEAR for roll | symbol=%s", sym)
             return [btc]
@@ -3048,10 +3234,8 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             ),
         )
         sto = TradeIntent.create(
-            strategy_id=self.strategy_id,
-            symbol=sym,
-            payload=sto_payload,
-            tags=("roll_sto",),
+            strategy_id=self.strategy_id, symbol=sym,
+            payload=sto_payload, tags=("roll_sto",),
         )
         return [btc, sto]
 
@@ -3094,7 +3278,6 @@ def _get_spot(snapshot: CycleSnapshotABC, sym_str: str) -> float:
             return v.mid or v.ask or v.bid or 0.0
     return 0.0
 
-
 ============================================================
 FILE: .\src\strategies\registry.py
 ============================================================
@@ -3130,6 +3313,138 @@ class StrategyBuilderRegistry:
             strategies.append(self._builders[key](spec))
         return strategies
 
+
+============================================================
+FILE: .\src\strategies\strategy_plugin.py
+============================================================
+
+"""
+src/strategies/strategy_plugin.py
+-----------------------------------
+A StrategyPlugin is a self-contained bundle that owns both:
+  - the strategy instance (implements StrategyABC)
+  - the risk evaluator registration for that strategy
+
+This is the extension point for new strategies. Adding a new strategy means:
+  1. Implement StrategyABC (and optionally OptionChainConsumerABC).
+  2. Implement StrategyPlugin for that strategy.
+  3. Register the plugin in STRATEGY_PLUGINS in this file.
+  4. Add the strategy config parser to yaml_config._STRATEGY_CONFIG_PARSERS.
+
+main.py never needs to change. RiskEngine never needs to change.
+No other file needs to change.
+"""
+from __future__ import annotations
+
+import sys
+from abc import ABC, abstractmethod
+from typing import Dict, List, Type
+
+from src.config.yaml_config import StrategySpec
+from src.domain.intents import IntentPayloadABC, OptionIntentPayload, PmccIntentPayload
+from src.risk.evaluators import IntentEvaluatorABC, OptionIntentEvaluator, PmccIntentEvaluator
+from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
+from src.risk.risk_engine import RiskEngine
+from src.strategies.interfaces import StrategyABC
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("StrategyPlugin")
+
+
+# ---------------------------------------------------------------------------
+# Abstract base
+# ---------------------------------------------------------------------------
+
+class StrategyPlugin(ABC):
+    """
+    Self-contained strategy bundle.
+
+    Each concrete plugin is responsible for:
+      - building its own StrategyABC instance from the StrategySpec
+      - registering its own evaluators with the RiskEngine
+
+    Adding a new strategy = adding a new StrategyPlugin subclass here.
+    Nothing else in the codebase needs to change.
+    """
+
+    @abstractmethod
+    def build_strategy(self, spec: StrategySpec) -> StrategyABC:
+        """Construct and return the strategy instance."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def register_evaluators(self, spec: StrategySpec, engine: RiskEngine) -> None:
+        """Register all payload evaluators this strategy needs into the engine."""
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# PMCC plugin
+# ---------------------------------------------------------------------------
+
+class PmccStrategyPlugin(StrategyPlugin):
+    """
+    Plugin for the Poor Man's Covered Call strategy.
+
+    Evaluators registered:
+      - PmccIntentPayload  → PmccIntentEvaluator  (entry sizing + unit cap)
+      - OptionIntentPayload → OptionIntentEvaluator (single-leg roll/close)
+    """
+
+    def build_strategy(self, spec: StrategySpec) -> StrategyABC:
+        from src.strategies.pmcc_strategy import PmccStrategy
+        return PmccStrategy(config=spec.pmcc)
+
+    def register_evaluators(self, spec: StrategySpec, engine: RiskEngine) -> None:
+        pmcc_cfg = spec.pmcc
+        if pmcc_cfg is None:
+            logger.error(
+                "PMCC strategy spec is missing its 'pmcc:' config block. "
+                "Required fields under strategies[*].pmcc.risk:\n"
+                "  max_buying_power_fraction: <float>  # e.g. 0.50\n"
+                "  max_debit_per_spread_usd:  <float>  # e.g. 14000.0\n"
+                "  max_contracts_per_intent:  <int>    # e.g. 1\n"
+                "  slippage_factor:           <float>  # e.g. 1.05"
+            )
+            sys.exit(1)
+
+        r = pmcc_cfg.risk
+        sizing_cfg = PmccSizingConfig(
+            max_buying_power_fraction=r.max_buying_power_fraction,
+            max_debit_per_spread_usd=r.max_debit_per_spread_usd,
+            max_contracts_per_intent=r.max_contracts_per_intent,
+            slippage_factor=r.slippage_factor,
+        )
+
+        engine.register(
+            PmccIntentPayload,
+            PmccIntentEvaluator(
+                sizer=PmccSizer(config=sizing_cfg),
+                max_units=pmcc_cfg.max_units,
+            ),
+        )
+        # Single-leg management (roll BTC/STO) uses a generic evaluator
+        # shared across any strategy that emits OptionIntentPayloads.
+        # Only register it once — a second register() call would silently
+        # overwrite the first, which is fine but wasteful.
+        if OptionIntentPayload not in engine._evaluators:
+            engine.register(OptionIntentPayload, OptionIntentEvaluator())
+
+
+# ---------------------------------------------------------------------------
+# Plugin registry
+# ---------------------------------------------------------------------------
+# To add a new strategy (e.g. Wheel):
+#   1. class WheelStrategyPlugin(StrategyPlugin): ...
+#   2. Add "wheel": WheelStrategyPlugin() below.
+#   3. Add its config parser to yaml_config._STRATEGY_CONFIG_PARSERS.
+#   Done. main.py is untouched.
+# ---------------------------------------------------------------------------
+
+STRATEGY_PLUGINS: Dict[str, StrategyPlugin] = {
+    "pmcc": PmccStrategyPlugin(),
+    # "wheel": WheelStrategyPlugin(), # etc. etc.
+}
 
 ============================================================
 FILE: .\src\strategies\__init__.py

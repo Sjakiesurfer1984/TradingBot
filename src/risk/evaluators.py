@@ -59,8 +59,13 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
         if not isinstance(payload, PmccIntentPayload):
             return EvaluatorResult.reject(str(intent.intent_id), "Wrong payload type for PmccIntentEvaluator")
 
-        # Count existing PMCC units for this underlying
-        sym        = str(intent.symbol).upper()
+        sym = str(intent.symbol).upper()
+
+        # ------------------------------------------------------------------
+        # Unit cap: count existing long LEAP positions for this underlying.
+        # Each long option with DTE > 90 counts as one open PMCC unit.
+        # If we're already at max_units, reject — no new entry needed.
+        # ------------------------------------------------------------------
         positions  = snapshot.positions()
         unit_count = sum(
             1 for p in positions
@@ -75,13 +80,10 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
                 f"Max PMCC units ({self.max_units}) already open for {sym}",
             )
 
-        # Get quotes for sizing
-        quotes = snapshot.asset_quotes()
-        sym_key = next((k for k in quotes if str(k).upper() == sym), None)
-        equity  = snapshot.equity()
-        opt_bp  = snapshot.option_buying_power()
-
-        # Rough sizing: use mid prices from chain if available, otherwise skip
+        # ------------------------------------------------------------------
+        # Pull prices from the option chain snapshot.
+        # We need leap ask (what we pay) and near bid (what we collect).
+        # ------------------------------------------------------------------
         leap_ask: Optional[float] = None
         near_bid: Optional[float] = None
 
@@ -101,15 +103,25 @@ class PmccIntentEvaluator(IntentEvaluatorABC):
         if leap_ask is None or near_bid is None:
             return EvaluatorResult.reject(str(intent.intent_id), "Could not find prices for sizing")
 
+        # ------------------------------------------------------------------
+        # Size the trade using only buying power — not equity.
+        # See PmccSizer.size() docstring for the rationale.
+        # ------------------------------------------------------------------
+        buying_power = snapshot.option_buying_power()
+
+        logger.info(
+            "Sizing | symbol=%s buying_power=%.2f leap_ask=%.2f near_bid=%.2f net_debit_per_contract=%.2f",
+            sym, buying_power, leap_ask, near_bid, (leap_ask - near_bid) * 100,
+        )
+
         qty = self.sizer.size(
-            equity=equity,
-            option_buying_power=opt_bp,
+            buying_power=buying_power,
             leap_ask=leap_ask,
             near_bid=near_bid,
         )
 
         if qty is None or qty < 1:
-            return EvaluatorResult.reject(str(intent.intent_id), "Sizer returned 0 — insufficient capital")
+            return EvaluatorResult.reject(str(intent.intent_id), "Sizer returned 0 — insufficient buying power")
 
         net_debit = Decimal(str(leap_ask - near_bid)).quantize(Decimal("0.01"))
 

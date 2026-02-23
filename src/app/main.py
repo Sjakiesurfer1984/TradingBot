@@ -1,3 +1,13 @@
+"""
+src/app/main.py
+----------------
+Application entry point. Pure assembler — no strategy-specific logic lives here.
+
+To add a new strategy:
+  1. Implement StrategyPlugin in src/strategies/strategy_plugin.py
+  2. Add its config parser to src/config/yaml_config._STRATEGY_CONFIG_PARSERS
+  3. That's it. This file does not change.
+"""
 from __future__ import annotations
 
 import sys
@@ -6,18 +16,16 @@ from src.app.container import build_settings_runtime
 from src.app.scheduler import Scheduler, SchedulerConfig
 from src.brokers.factory import BrokerFactoryFacade
 from src.brokers.registry import AlpacaBrokerBuilder, BrokerBuilderRegistry
+from src.config.yaml_config import AppConfig, StrategySpec
 from src.execution.default_execution_policy import DefaultExecutionPolicy
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.orchestration.orchestrator import TradingOrchestrator
-from src.risk.evaluators import OptionIntentEvaluator, PmccIntentEvaluator
-from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
 from src.signals.signal_pipeline import DefaultSignalPipeline
-from src.strategies.pmcc_strategy import PmccStrategy
-from src.strategies.registry import StrategyBuilderRegistry
+from src.strategies.interfaces import StrategyABC
+from src.strategies.strategy_plugin import STRATEGY_PLUGINS
 from src.utilities.logger import setup_logger
-from src.domain.intents import PmccIntentPayload, OptionIntentPayload
 
 logger = setup_logger("Main")
 
@@ -28,8 +36,8 @@ def main() -> int:
 
     logger.info("Trading bot starting | config=%s", app_cfg.config_path)
 
-    broker  = _build_broker(settings.env_cfg)
-    strategies = _build_strategies(app_cfg.strategies)
+    broker      = _build_broker(settings.env_cfg)
+    strategies  = _build_strategies(app_cfg.strategies)
     risk_engine = _build_risk_engine(app_cfg)
 
     orchestrator = TradingOrchestrator(
@@ -56,35 +64,45 @@ def _build_broker(env_cfg):
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 
 
-def _build_strategies(specs):
-    registry = StrategyBuilderRegistry()
-    registry.register("pmcc", lambda spec: PmccStrategy(config=spec.pmcc))
-    return registry.build_all(specs)
+def _build_strategies(specs: list[StrategySpec]) -> list[StrategyABC]:
+    """
+    Build all strategy instances via the plugin registry.
+    Each plugin knows how to construct its own strategy from the spec.
+    No strategy-specific logic here.
+    """
+    strategies = []
+    for spec in specs:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin is None:
+            logger.error(
+                "No plugin registered for strategy '%s'. "
+                "Registered plugins: %s. "
+                "Add a StrategyPlugin subclass to strategy_plugin.py.",
+                spec.name, list(STRATEGY_PLUGINS),
+            )
+            sys.exit(1)
+        strategies.append(plugin.build_strategy(spec))
+    return strategies
 
 
-def _build_risk_engine(app_cfg):
-    engine = RiskEngine(rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else [])
-
-    # Find PMCC config for sizer — use first PMCC strategy found
-    pmcc_risk_cfg = next(
-        (s.pmcc.risk for s in app_cfg.strategies if s.pmcc is not None),
-        None,
+def _build_risk_engine(app_cfg: AppConfig) -> RiskEngine:
+    """
+    Build the risk engine and let each plugin register its own evaluators.
+    No strategy-specific logic here — evaluator wiring belongs to the plugin.
+    """
+    engine = RiskEngine(
+        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
     )
-
-    sizing_cfg = PmccSizingConfig(
-        equity_budget_pct=pmcc_risk_cfg.equity_budget_pct            if pmcc_risk_cfg else 0.05,
-        max_option_bp_fraction=pmcc_risk_cfg.max_option_bp_fraction  if pmcc_risk_cfg else 0.25,
-        max_debit_per_spread_usd=pmcc_risk_cfg.max_debit_per_spread_usd if pmcc_risk_cfg else 5000.0,
-        max_contracts_per_intent=pmcc_risk_cfg.max_contracts_per_intent if pmcc_risk_cfg else 5,
-        slippage_factor=pmcc_risk_cfg.slippage_factor                if pmcc_risk_cfg else 1.02,
-    )
-    max_units = next(
-        (s.pmcc.max_units for s in app_cfg.strategies if s.pmcc is not None),
-        2,
-    )
-
-    engine.register(PmccIntentPayload, PmccIntentEvaluator(sizer=PmccSizer(config=sizing_cfg), max_units=max_units))
-    engine.register(OptionIntentPayload, OptionIntentEvaluator())
+    for spec in app_cfg.strategies:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin is None:
+            logger.error(
+                "No plugin registered for strategy '%s'. "
+                "Registered plugins: %s.",
+                spec.name, list(STRATEGY_PLUGINS),
+            )
+            sys.exit(1)
+        plugin.register_evaluators(spec, engine)
     return engine
 
 
