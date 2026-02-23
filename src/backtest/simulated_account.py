@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+from src.utilities.logger import setup_logger
+
 """
 src/backtest/simulated_account.py
 ----------------------------------
@@ -15,10 +20,6 @@ Design rules:
 - market_value is recomputed each cycle from the current chain snapshot.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-
-from src.utilities.logger import setup_logger
 
 logger = setup_logger("SimulatedAccount")
 

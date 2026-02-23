@@ -1,5 +1,33 @@
 from __future__ import annotations
 
+
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+
+from typing import Any, Dict, List, Optional
+
+import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+from src.backtest.simulated_account import SimulatedAccount
+from src.brokers.broker_base import BrokerBase
+from src.brokers.errors import BrokerConnectionError
+from src.brokers.interfaces import BrokerABC
+from src.domain.orders import (
+    MarketOrder,
+    MultiLegLimitOrder,
+    OrderABC,
+    OrderSide as DomainOrderSide,
+)
+from src.domain.types import AssetQuote
+from src.utilities.logger import setup_logger
+
+
+
+
+
 """
 src/backtest/alpaca_historical_broker.py
 -----------------------------------------
@@ -23,32 +51,6 @@ pass `feed=indicative` and a specific date. We request one date at a time.
 The broker is stateless w.r.t. dates — the BacktestRunner sets the current
 date before each cycle via set_date().
 """
-
-from __future__ import annotations
-
-import os
-import time
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
-from typing import Any, Dict, List, Optional
-
-import requests
-from requests import Session
-from requests.adapters import HTTPAdapter
-
-from src.backtest.simulated_account import SimulatedAccount
-from src.brokers.broker_base import BrokerBase
-from src.brokers.errors import BrokerConnectionError
-from src.brokers.interfaces import BrokerABC
-from src.domain.orders import (
-    MarketOrder,
-    MultiLegLimitOrder,
-    OrderABC,
-    OrderSide as DomainOrderSide,
-)
-from src.domain.types import AssetQuote, Symbol
-from src.utilities.logger import setup_logger
 
 logger = setup_logger("AlpacaHistoricalBroker")
 

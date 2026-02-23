@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+import csv
+import json
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from pathlib import Path
+from typing import List
+
+from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
+from src.orchestration.orchestrator import TradingOrchestrator
+from src.orchestration.orchestrator_interface import CycleRunResult
+from src.utilities.logger import setup_logger
+
+
 """
 src/backtest/backtest_runner.py
 --------------------------------
@@ -14,19 +27,7 @@ Usage:
     See run_backtest.py for the entry point.
 """
 
-from __future__ import annotations
 
-import csv
-import json
-from dataclasses import dataclass, field
-from datetime import date, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
-from src.orchestration.orchestrator import TradingOrchestrator
-from src.orchestration.orchestrator_interface import CycleRunResult
-from src.utilities.logger import setup_logger
 
 logger = setup_logger("BacktestRunner")
 

@@ -1,23 +1,3 @@
-"""
-src/backtest/run_backtest.py
------------------------------
-Entry point for running a backtest. Wire everything together here —
-the same pattern as main.py but using BacktestRunner instead of Scheduler
-and AlpacaHistoricalBroker instead of AlpacaBroker.
-
-Run from the repo root:
-    python -m src.backtest.run_backtest
-
-Environment variables required (same as live):
-    ALPACA_PAPER_API_KEY
-    ALPACA_PAPER_API_SECRET
-
-Optional overrides via env vars:
-    BACKTEST_START_DATE   e.g. 2023-01-01  (default: 1 year ago)
-    BACKTEST_END_DATE     e.g. 2024-01-01  (default: today)
-    BACKTEST_INITIAL_CASH e.g. 100000      (default: 100000)
-    BACKTEST_OUTPUT_DIR   e.g. ./results   (default: ./backtest_results)
-"""
 from __future__ import annotations
 
 import os
@@ -39,6 +19,28 @@ from src.signals.signal_pipeline import DefaultSignalPipeline
 from src.strategies.interfaces import StrategyABC
 from src.strategies.strategy_plugin import STRATEGY_PLUGINS
 from src.utilities.logger import setup_logger
+
+"""
+src/backtest/run_backtest.py
+-----------------------------
+Entry point for running a backtest. Wire everything together here —
+the same pattern as main.py but using BacktestRunner instead of Scheduler
+and AlpacaHistoricalBroker instead of AlpacaBroker.
+
+Run from the repo root:
+    python -m src.backtest.run_backtest
+
+Environment variables required (same as live):
+    ALPACA_PAPER_API_KEY
+    ALPACA_PAPER_API_SECRET
+
+Optional overrides via env vars:
+    BACKTEST_START_DATE   e.g. 2023-01-01  (default: 1 year ago)
+    BACKTEST_END_DATE     e.g. 2024-01-01  (default: today)
+    BACKTEST_INITIAL_CASH e.g. 100000      (default: 100000)
+    BACKTEST_OUTPUT_DIR   e.g. ./results   (default: ./backtest_results)
+"""
+
 
 logger = setup_logger("RunBacktest")
 
