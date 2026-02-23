@@ -35,9 +35,20 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
         universe: List[Symbol],
         option_chain_requests: List[OptionChainRequest],
     ) -> CycleSnapshot:
-        as_of       = datetime.now(timezone.utc)
-        equity      = float(self.broker.get_equity())
-        opt_bp      = float(self.broker.get_option_buying_power())
+        as_of = datetime.now(timezone.utc)
+
+        # Single HTTP call — derive equity and option BP from the same response.
+        # Previously get_equity() and get_option_buying_power() each independently
+        # called get_account_snapshot(), resulting in 2 redundant /account round-trips.
+        account = self.broker.get_account_snapshot()
+        equity  = float(account.get("equity") or 0.0)
+        opt_bp  = float(account.get("options_buying_power") or 0.0)
+
+        logger.info(
+            "Account snapshot | equity=%.2f options_buying_power=%.2f",
+            equity, opt_bp,
+        )
+
         positions   = list(self.broker.get_positions())
         open_orders = list(self.broker.get_open_orders())
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import requests
 from requests import Session
@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from alpaca.trading.client import TradingClient
 
 logger = setup_logger("AlpacaBroker")
+
+
+def _underlying_from_osi(osi_symbol: str) -> str:
+    """Extract the underlying ticker from an OSI option symbol (e.g. SPY270617C00605000 → SPY)."""
+    return "".join(c for c in osi_symbol if c.isalpha()).upper()
 
 
 class AlpacaBroker(BrokerBase, BrokerABC):
@@ -99,6 +104,7 @@ class AlpacaBroker(BrokerBase, BrokerABC):
     # ------------------------------------------------------------------
 
     def get_account_snapshot(self) -> Dict[str, Any]:
+        """Single HTTP call to /account. Returns the raw Alpaca account dict."""
         self._log_io_boundary("get_account_snapshot")
         return self._request_json("GET", "/account")  # type: ignore[return-value]
 
@@ -112,12 +118,14 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         self._log_io_boundary("get_positions")
         data = self._request_json("GET", "/positions")
         positions = [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
-        # Log every position so we can see exactly what Alpaca returns
+
         for p in positions:
+            # Alpaca sometimes omits underlying_symbol — derive it from the OSI symbol as fallback
+            underlying = p.get("underlying_symbol") or _underlying_from_osi(str(p.get("symbol", "")))
             logger.info(
                 "Position | symbol=%s asset_class=%s underlying=%s qty=%s side=%s",
                 p.get("symbol"), p.get("asset_class"),
-                p.get("underlying_symbol"), p.get("qty"), p.get("side"),
+                underlying, p.get("qty"), p.get("side"),
             )
         if not positions:
             logger.info("Positions | none")
@@ -127,16 +135,24 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         self._log_io_boundary("get_open_orders")
         data = self._request_json("GET", "/orders", params={"status": "open"})
         orders = [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
-        # Log every open order so we can see exactly what Alpaca returns
+
         for o in orders:
             legs_info = [
                 f"{leg.get('symbol')}:{leg.get('side')}"
                 for leg in (o.get("legs") or [])
                 if isinstance(leg, dict)
             ]
+            # Alpaca omits underlying_symbol on MLEG orders — derive from legs
+            underlying = o.get("underlying_symbol")
+            if not underlying:
+                for leg in (o.get("legs") or []):
+                    leg_sym = str(leg.get("symbol") or "")
+                    underlying = _underlying_from_osi(leg_sym) or None
+                    if underlying:
+                        break
             logger.info(
                 "OpenOrder | id=%s symbol=%s underlying=%s type=%s status=%s legs=%s",
-                o.get("id"), o.get("symbol"), o.get("underlying_symbol"),
+                o.get("id"), o.get("symbol"), underlying,
                 o.get("order_class"), o.get("status"), legs_info or "n/a",
             )
         if not orders:

@@ -50,6 +50,6 @@ def load_env_config() -> EnvConfig:
     _load_root_dotenv()
 
     return EnvConfig(
-        broker_name=_get_env("BROKER_NAME", "alpaca").lower(),
-        alpaca=AlpacaEnvConfig(mode=_get_env("ALPACA_MODE", "paper").lower()),
+        broker_name=_get_env("BROKER_NAME", "alpaca").lower(), # default to alpaca for now since it's the only supported broker. To be set in .env 
+        alpaca=AlpacaEnvConfig(mode=_get_env("ALPACA_MODE", "paper").lower()), # paper mode as default for safety
     )

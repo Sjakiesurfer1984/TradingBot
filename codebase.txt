@@ -336,10 +336,6 @@ logger = setup_logger("AlpacaBroker")
 
 
 class AlpacaBroker(BrokerBase, BrokerABC):
-    """
-    Adapter: wraps the Alpaca REST API behind BrokerABC.
-    All Alpaca-specific SDK knowledge is contained here.
-    """
 
     def __init__(
         self,
@@ -355,7 +351,7 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         self._paper             = paper
         self._request_timeout   = request_timeout_seconds
         self._connect_timeout   = connect_timeout_seconds
-        self._session: Optional[Session]          = None
+        self._session: Optional[Session]               = None
         self._trading_client: Optional["TradingClient"] = None
 
     # ------------------------------------------------------------------
@@ -423,12 +419,37 @@ class AlpacaBroker(BrokerBase, BrokerABC):
     def get_positions(self) -> List[Dict[str, Any]]:
         self._log_io_boundary("get_positions")
         data = self._request_json("GET", "/positions")
-        return [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
+        positions = [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
+        # Log every position so we can see exactly what Alpaca returns
+        for p in positions:
+            logger.info(
+                "Position | symbol=%s asset_class=%s underlying=%s qty=%s side=%s",
+                p.get("symbol"), p.get("asset_class"),
+                p.get("underlying_symbol"), p.get("qty"), p.get("side"),
+            )
+        if not positions:
+            logger.info("Positions | none")
+        return positions
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         self._log_io_boundary("get_open_orders")
         data = self._request_json("GET", "/orders", params={"status": "open"})
-        return [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
+        orders = [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
+        # Log every open order so we can see exactly what Alpaca returns
+        for o in orders:
+            legs_info = [
+                f"{leg.get('symbol')}:{leg.get('side')}"
+                for leg in (o.get("legs") or [])
+                if isinstance(leg, dict)
+            ]
+            logger.info(
+                "OpenOrder | id=%s symbol=%s underlying=%s type=%s status=%s legs=%s",
+                o.get("id"), o.get("symbol"), o.get("underlying_symbol"),
+                o.get("order_class"), o.get("status"), legs_info or "n/a",
+            )
+        if not orders:
+            logger.info("OpenOrders | none")
+        return orders
 
     def submit_order(self, order: OrderABC) -> Any:
         self._log_io_boundary("submit_order")
@@ -597,7 +618,6 @@ class AlpacaBroker(BrokerBase, BrokerABC):
             side=AlpacaSide.BUY if order.side == DomainOrderSide.BUY else AlpacaSide.SELL,
             time_in_force=AlpacaTIF.DAY if order.time_in_force == DomainTIF.DAY else AlpacaTIF.GTC,
         )
-
 
 ============================================================
 FILE: .\src\brokers\alpaca_factory.py
@@ -1662,6 +1682,9 @@ from src.brokers.interfaces import BrokerABC
 from src.domain.signals import SignalSnapshot
 from src.domain.types import AssetQuote, OptionChainRequest, Symbol
 from src.orchestration.cycle_snapshot import CycleSnapshot
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("CycleSnapshotBuilder")
 
 
 class CycleSnapshotBuilderABC(ABC):
@@ -1698,7 +1721,12 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
 
         chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]] = {}
         for req in option_chain_requests:
-            chains[(Symbol(req.underlying), req.request_id)] = self.broker.get_option_chain(
+            logger.info(
+                "Fetching option chain | underlying=%s id=%s expiry=[%s → %s]",
+                req.underlying, req.request_id,
+                req.expiration_date_gte, req.expiration_date_lte,
+            )
+            result = self.broker.get_option_chain(
                 req.underlying,
                 include_calls=req.include_calls,
                 include_puts=req.include_puts,
@@ -1707,6 +1735,11 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
                 expiration_date_gte=req.expiration_date_gte,
                 expiration_date_lte=req.expiration_date_lte,
             )
+            logger.info(
+                "Option chain received | underlying=%s id=%s contracts=%d",
+                req.underlying, req.request_id, len(result),
+            )
+            chains[(Symbol(req.underlying), req.request_id)] = result
 
         return CycleSnapshot(
             _as_of_utc=as_of,
@@ -2367,7 +2400,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from src.config.yaml_config import PmccLeapConfig, PmccShortConfig
+from src.config.yaml_config import PmccLeapConfig, PmccLiquidityConfig, PmccShortConfig
 from src.domain.intents import SelectedOption
 from src.domain.orders import OptionContract, OptionRight
 from src.risk.pmcc_sizer import parse_osi
@@ -2387,6 +2420,14 @@ def _safe_float(v, default: float = 0.0) -> float:
         return default
 
 
+def _spread_pct(bid: float, ask: float) -> Optional[float]:
+    """Bid-ask spread as a fraction of mid. Returns None if prices are unusable."""
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2.0
+    return (ask - bid) / mid if mid > 0 else None
+
+
 @dataclass(frozen=True)
 class ContractCandidate:
     option_symbol: str
@@ -2396,54 +2437,104 @@ class ContractCandidate:
     ask:           float
     bid:           float
     mid:           float
-    
+
     @property
     def strike(self) -> float:
-        # Domain strike is Decimal, selector compares to float leap_strike
         return float(self.contract.strike)
+
+    @property
+    def spread_pct(self) -> Optional[float]:
+        return _spread_pct(self.bid, self.ask)
+
 
 @dataclass
 class PmccContractSelector:
-    leap_cfg:  PmccLeapConfig
-    short_cfg: PmccShortConfig
+    leap_cfg:      PmccLeapConfig
+    short_cfg:     PmccShortConfig
+    liquidity_cfg: PmccLiquidityConfig
 
     def select_leap(
         self,
-        underlying:   str,
-        chain:        List[Dict[str, Any]],
-        spot_price:   float,
+        underlying: str,
+        chain:      List[Dict[str, Any]],
+        spot_price: float,
     ) -> Optional[SelectedOption]:
         candidates = self._parse_chain(underlying, chain)
-        filtered   = [
-            c for c in candidates
-            if self.leap_cfg.dte_min <= c.dte <= self.leap_cfg.dte_max
-            and abs(c.delta - self.leap_cfg.target_delta) < 0.15
-            and c.ask > 0
-        ]
-        if not filtered:
-            logger.debug("No LEAP candidates for %s", underlying)
+
+        dte_ok    = [c for c in candidates
+                     if self.leap_cfg.dte_min <= c.dte <= self.leap_cfg.dte_max]
+        delta_ok  = [c for c in dte_ok
+                     if abs(c.delta - self.leap_cfg.target_delta) < 0.15]
+        ask_ok    = [c for c in delta_ok if c.ask > 0]
+        liquid_ok = [c for c in ask_ok
+                     if c.spread_pct is not None
+                     and c.spread_pct <= self.liquidity_cfg.max_leap_spread_pct]
+
+        if not liquid_ok:
+            logger.warning(
+                "No LEAP candidates | underlying=%s parsed=%d dte_ok=%d delta_ok=%d "
+                "ask_ok=%d liquid_ok=%d | dte=[%d,%d] target_delta=%.2f "
+                "max_spread_pct=%.2f spot=%.2f",
+                underlying, len(candidates), len(dte_ok), len(delta_ok),
+                len(ask_ok), len(liquid_ok),
+                self.leap_cfg.dte_min, self.leap_cfg.dte_max,
+                self.leap_cfg.target_delta,
+                self.liquidity_cfg.max_leap_spread_pct,
+                spot_price,
+            )
             return None
-        best = min(filtered, key=lambda c: abs(c.delta - self.leap_cfg.target_delta))
+
+        best = min(liquid_ok, key=lambda c: abs(c.delta - self.leap_cfg.target_delta))
+        logger.info(
+            "LEAP selected | underlying=%s symbol=%s dte=%d delta=%.3f "
+            "ask=%.2f bid=%.2f spread_pct=%.3f strike=%.2f",
+            underlying, best.option_symbol, best.dte, best.delta,
+            best.ask, best.bid, best.spread_pct or 0.0, best.strike,
+        )
         return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
 
     def select_near(
         self,
-        underlying:   str,
-        chain:        List[Dict[str, Any]],
-        leap_strike:  float,
+        underlying:  str,
+        chain:       List[Dict[str, Any]],
+        leap_strike: float,
+        spot_price:  float = 0.0,
     ) -> Optional[SelectedOption]:
         candidates = self._parse_chain(underlying, chain)
-        filtered   = [
-            c for c in candidates
-            if self.short_cfg.dte_min <= c.dte <= self.short_cfg.dte_max
-            and abs(c.delta - self.short_cfg.target_delta) < 0.10
-            and c.strike <= leap_strike   # NEAR strike must be <= LEAP strike
-            and c.bid > 0
-        ]
-        if not filtered:
-            logger.debug("No NEAR candidates for %s", underlying)
+
+        # PMCC rule: NEAR strike must be >= LEAP strike.
+        # The short call must sit above the long LEAP call or it becomes a debit spread.
+        dte_ok    = [c for c in candidates
+                     if self.short_cfg.dte_min <= c.dte <= self.short_cfg.dte_max]
+        delta_ok  = [c for c in dte_ok
+                     if abs(c.delta - self.short_cfg.target_delta) < 0.10]
+        strike_ok = [c for c in delta_ok if c.strike >= leap_strike]
+        bid_ok    = [c for c in strike_ok if c.bid > 0]
+        liquid_ok = [c for c in bid_ok
+                     if c.spread_pct is not None
+                     and c.spread_pct <= self.liquidity_cfg.max_near_spread_pct]
+
+        if not liquid_ok:
+            logger.warning(
+                "No NEAR candidates | underlying=%s parsed=%d dte_ok=%d delta_ok=%d "
+                "strike_ok=%d bid_ok=%d liquid_ok=%d | dte=[%d,%d] target_delta=%.2f "
+                "leap_strike=%.2f spot=%.2f max_spread_pct=%.2f",
+                underlying, len(candidates), len(dte_ok), len(delta_ok),
+                len(strike_ok), len(bid_ok), len(liquid_ok),
+                self.short_cfg.dte_min, self.short_cfg.dte_max,
+                self.short_cfg.target_delta,
+                leap_strike, spot_price,
+                self.liquidity_cfg.max_near_spread_pct,
+            )
             return None
-        best = min(filtered, key=lambda c: abs(c.delta - self.short_cfg.target_delta))
+
+        best = min(liquid_ok, key=lambda c: abs(c.delta - self.short_cfg.target_delta))
+        logger.info(
+            "NEAR selected | underlying=%s symbol=%s dte=%d delta=%.3f "
+            "bid=%.2f ask=%.2f spread_pct=%.3f strike=%.2f",
+            underlying, best.option_symbol, best.dte, best.delta,
+            best.bid, best.ask, best.spread_pct or 0.0, best.strike,
+        )
         return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
 
     def _parse_chain(self, underlying: str, chain: List[Dict[str, Any]]) -> List[ContractCandidate]:
@@ -2462,11 +2553,11 @@ class PmccContractSelector:
             greeks = row.get("greeks") or {}
             quote  = row.get("latestQuote") or {}
 
-            delta  = _safe_float(greeks.get("delta"))
-            ask    = _safe_float(quote.get("ap"))
-            bid    = _safe_float(quote.get("bp"))
-            mid    = (ask + bid) / 2 if ask > 0 and bid > 0 else ask or bid
-            dte    = _dte(parsed.expiry)
+            delta = _safe_float(greeks.get("delta"))
+            ask   = _safe_float(quote.get("ap"))
+            bid   = _safe_float(quote.get("bp"))
+            mid   = (ask + bid) / 2.0 if ask > 0 and bid > 0 else ask or bid
+            dte   = _dte(parsed.expiry)
 
             contract = OptionContract(
                 underlying=underlying,
@@ -2494,8 +2585,13 @@ FILE: .\src\strategies\pmcc_state_machine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("PmccStateClassifier")
 
 
 class PmccState(str, Enum):
@@ -2514,29 +2610,71 @@ class PmccHoldings:
 
 
 class PmccStateClassifier:
-    """Derives current PMCC state from the positions + open orders snapshots."""
+    """Derives current PMCC state from positions + open orders snapshots."""
 
     def classify(
         self,
         *,
-        underlying:   str,
-        positions:    List[Dict[str, Any]],
-        open_orders:  List[Dict[str, Any]],
+        underlying:  str,
+        positions:   List[Dict[str, Any]],
+        open_orders: List[Dict[str, Any]],
     ) -> PmccHoldings:
-        sym        = underlying.strip().upper()
-        opt_pos    = [
+        sym = underlying.strip().upper()
+
+        # ------------------------------------------------------------------
+        # Filter option positions for this underlying.
+        # Alpaca returns asset_class="us_option" and underlying_symbol="SPY".
+        # qty can be positive (long) or negative (short).
+        # ------------------------------------------------------------------
+        opt_pos = [
             p for p in positions
             if str(p.get("underlying_symbol", "")).upper() == sym
-            and p.get("asset_class") == "us_option"
-        ]
-        pending_orders = [
-            o for o in open_orders
-            if str(o.get("underlying_symbol", o.get("symbol", ""))).upper() == sym
+            and str(p.get("asset_class", "")).lower() == "us_option"
         ]
 
+        logger.info(
+            "Classifier | underlying=%s total_positions=%d option_positions=%d",
+            sym, len(positions), len(opt_pos),
+        )
+        for p in opt_pos:
+            logger.info(
+                "  OptionPos | symbol=%s qty=%s side=%s asset_class=%s underlying=%s",
+                p.get("symbol"), p.get("qty"), p.get("side"),
+                p.get("asset_class"), p.get("underlying_symbol"),
+            )
+
+        # ------------------------------------------------------------------
+        # Identify LEAP vs NEAR by DTE derived from the OSI symbol.
+        # Alpaca does NOT include a "dte" field on positions — parse from symbol.
+        # ------------------------------------------------------------------
         leap = next((p for p in opt_pos if self._is_leap(p)), None)
         near = next((p for p in opt_pos if self._is_near(p)), None)
 
+        logger.info(
+            "Classifier | leap=%s near=%s",
+            leap.get("symbol") if leap else "none",
+            near.get("symbol") if near else "none",
+        )
+
+        # ------------------------------------------------------------------
+        # Check for pending orders that should block action.
+        # MLEG orders have no top-level underlying_symbol — must check legs.
+        # ------------------------------------------------------------------
+        pending_orders = [o for o in open_orders if self._order_is_for(o, sym)]
+
+        logger.info(
+            "Classifier | open_orders_total=%d pending_for_%s=%d",
+            len(open_orders), sym, len(pending_orders),
+        )
+        for o in pending_orders:
+            logger.info(
+                "  PendingOrder | id=%s class=%s status=%s symbol=%s",
+                o.get("id"), o.get("order_class"), o.get("status"), o.get("symbol"),
+            )
+
+        # ------------------------------------------------------------------
+        # Derive state
+        # ------------------------------------------------------------------
         if pending_orders:
             state = PmccState.PENDING
         elif leap and near:
@@ -2548,43 +2686,84 @@ class PmccStateClassifier:
         else:
             state = PmccState.FLAT
 
+        logger.info("Classifier | result state=%s", state.value)
         return PmccHoldings(state=state, leap_position=leap, near_position=near)
 
     @staticmethod
-    def _is_leap(position: Dict[str, Any]) -> bool:
-        dte = position.get("dte") or position.get("days_to_expiry")
-        if dte is not None:
-            return int(dte) > 90
-        # Fallback: check OSI symbol expiry
-        sym = str(position.get("symbol", ""))
-        if len(sym) >= 15:
-            try:
-                from src.risk.pmcc_sizer import parse_osi
-                from datetime import datetime
-                parsed = parse_osi(sym)
-                dte_calc = (parsed.expiry - datetime.now()).days
-                return dte_calc > 90
-            except Exception:
-                pass
+    def _order_is_for(order: Dict[str, Any], sym: str) -> bool:
+        """
+        Return True if this open order relates to the given underlying.
+        Handles both simple orders (symbol field) and MLEG orders (legs list).
+        """
+        # Simple order: top-level symbol or underlying_symbol matches
+        top_sym = str(order.get("underlying_symbol") or order.get("symbol") or "").upper()
+        if top_sym == sym:
+            return True
+
+        # MLEG order: check legs for any leg whose underlying matches.
+        # Alpaca MLEG legs have a "symbol" field with the OSI option symbol,
+        # e.g. "SPY270617C00605000" — the underlying is the alpha prefix.
+        for leg in (order.get("legs") or []):
+            if not isinstance(leg, dict):
+                continue
+            leg_sym = str(leg.get("symbol") or "").upper()
+            # Extract underlying from OSI: leading alpha characters
+            underlying_part = ""
+            for ch in leg_sym:
+                if ch.isalpha():
+                    underlying_part += ch
+                else:
+                    break
+            if underlying_part == sym:
+                return True
+
         return False
 
     @staticmethod
-    def _is_near(position: Dict[str, Any]) -> bool:
-        dte = position.get("dte") or position.get("days_to_expiry")
-        if dte is not None:
-            return int(dte) <= 90
-        sym = str(position.get("symbol", ""))
-        if len(sym) >= 15:
-            try:
-                from src.risk.pmcc_sizer import parse_osi
-                from datetime import datetime
-                parsed = parse_osi(sym)
-                dte_calc = (parsed.expiry - datetime.now()).days
-                return dte_calc <= 90
-            except Exception:
-                pass
-        return False
+    def _is_leap(position: Dict[str, Any]) -> bool:
+        """
+        A LEAP is a long option with DTE > 90 days.
+        qty > 0 means long (bought).
+        """
+        try:
+            qty = float(position.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            return False  # short positions are never LEAPs in our PMCC
 
+        return _dte_from_position(position) > 90
+
+    @staticmethod
+    def _is_near(position: Dict[str, Any]) -> bool:
+        """
+        A NEAR is a short option with DTE <= 90 days.
+        qty < 0 means short (sold).
+        """
+        try:
+            qty = float(position.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty >= 0:
+            return False  # long positions are never NEARs in our PMCC
+
+        return _dte_from_position(position) <= 90
+
+
+def _dte_from_position(position: Dict[str, Any]) -> int:
+    """
+    Derive DTE from the OSI option symbol on the position.
+    Alpaca positions do not carry a dte field directly.
+    """
+    sym = str(position.get("symbol", ""))
+    if len(sym) >= 15:
+        try:
+            from src.risk.pmcc_sizer import parse_osi
+            parsed = parse_osi(sym)
+            return max(0, (parsed.expiry - datetime.now()).days)
+        except Exception as exc:
+            logger.warning("Could not parse DTE from symbol=%s: %s", sym, exc)
+    return -1
 
 ============================================================
 FILE: .\src\strategies\pmcc_strategy.py
@@ -2626,6 +2805,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         self._selector = PmccContractSelector(
             leap_cfg=self.config.leap,
             short_cfg=self.config.short,
+            liquidity_cfg=self.config.liquidity,
         )
 
     # ------------------------------------------------------------------
@@ -2704,22 +2884,46 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         short_key = _find_key(chains, sym_str, "shorts")
 
         if leap_key is None or short_key is None:
-            logger.debug("Entry chains not available | symbol=%s", sym_str)
+            missing = [k for k in ("leaps", "shorts") if _find_key(chains, sym_str, k) is None]
+            available = [(str(k[0]), k[1]) for k in chains]
+            logger.warning(
+                "Entry chains not in snapshot | symbol=%s missing=%s available=%s",
+                sym_str, missing, available,
+            )
             return []
 
         leap_chain  = list(chains[leap_key])
         short_chain = list(chains[short_key])
         spot        = _get_spot(snapshot, sym_str)
 
+        logger.info(
+            "PMCC entry attempt | symbol=%s spot=%.2f leap_chain=%d short_chain=%d",
+            sym_str, spot, len(leap_chain), len(short_chain),
+        )
+
         leap_selection = self._selector.select_leap(sym_str, leap_chain, spot)
         if leap_selection is None:
+            logger.warning(
+                "No LEAP selected — no intent generated | symbol=%s spot=%.2f leap_chain=%d",
+                sym_str, spot, len(leap_chain),
+            )
             return []
 
         near_selection = self._selector.select_near(
-            sym_str, short_chain, float(leap_selection.contract.strike)
+            sym_str, short_chain, float(leap_selection.contract.strike), spot_price=spot,
         )
         if near_selection is None:
+            logger.warning(
+                "No NEAR selected — no intent generated | symbol=%s leap=%s leap_strike=%.2f spot=%.2f short_chain=%d",
+                sym_str, leap_selection.option_symbol,
+                float(leap_selection.contract.strike), spot, len(short_chain),
+            )
             return []
+
+        logger.info(
+            "PMCC entry intent created | symbol=%s leap=%s near=%s spot=%.2f",
+            sym_str, leap_selection.option_symbol, near_selection.option_symbol, spot,
+        )
 
         payload = PmccIntentPayload(
             underlying_symbol=sym,
@@ -2744,6 +2948,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         short_key = _find_key(chains, sym_str, "shorts")
 
         if short_key is None:
+            logger.warning("Shorts chain not in snapshot | symbol=%s available=%s", sym_str, [(str(k[0]), k[1]) for k in chains])
             return []
 
         leap_strike: Optional[float] = None
@@ -2754,9 +2959,12 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             except Exception:
                 pass
 
-        near = self._selector.select_near(sym_str, list(chains[short_key]), leap_strike or 0)
+        near = self._selector.select_near(sym_str, list(chains[short_key]), leap_strike or 0, spot_price=_get_spot(snapshot, sym_str))
         if near is None:
+            logger.warning("No NEAR selected for sell_near | symbol=%s leap_strike=%s", sym_str, leap_strike)
             return []
+
+        logger.info("NEAR sell intent created | symbol=%s near=%s", sym_str, near.option_symbol)
 
         payload = OptionIntentPayload(
             underlying_symbol=sym,
@@ -2785,12 +2993,15 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         # Check if we should roll the near
         dte = near.get("dte") or near.get("days_to_expiry")
         if dte is not None and int(dte) <= self.config.roll.dte_threshold:
+            logger.info("Rolling NEAR (DTE threshold) | symbol=%s near=%s dte=%s", sym, near_sym, dte)
             return self._intents_roll_near(sym, near_sym, snapshot)
 
         delta = near.get("delta")
         if delta is not None and abs(float(delta)) >= self.config.roll.delta_threshold:
+            logger.info("Rolling NEAR (delta threshold) | symbol=%s near=%s delta=%s", sym, near_sym, delta)
             return self._intents_roll_near(sym, near_sym, snapshot)
 
+        logger.info("PMCC covered, no action needed | symbol=%s near=%s dte=%s delta=%s", sym, near_sym, dte, delta)
         return []
 
     def _intents_roll_near(
@@ -2818,11 +3029,15 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         chains    = snapshot.option_chains()
         short_key = _find_key(chains, str(sym), "shorts")
         if short_key is None:
+            logger.warning("Shorts chain missing for roll | symbol=%s", sym)
             return [btc]
 
-        new_near = self._selector.select_near(str(sym), list(chains[short_key]), 0)
+        new_near = self._selector.select_near(str(sym), list(chains[short_key]), 0, spot_price=_get_spot(snapshot, str(sym)))
         if new_near is None:
+            logger.warning("No new NEAR for roll | symbol=%s", sym)
             return [btc]
+
+        logger.info("Roll intents created | symbol=%s btc=%s sto=%s", sym, near_sym, new_near.option_symbol)
 
         sto_payload = OptionIntentPayload(
             underlying_symbol=sym,
