@@ -2623,9 +2623,10 @@ class PmccContractSelector:
         best = min(liquid_ok, key=lambda c: abs(c.delta - self.leap_cfg.target_delta))
         logger.info(
             "LEAP selected | underlying=%s symbol=%s dte=%d delta=%.3f "
-            "ask=%.2f bid=%.2f spread_pct=%.3f strike=%.2f",
+            "ask=%.2f bid=%.2f spread_pct=%.3f strike=%.2f expiry=%s",
             underlying, best.option_symbol, best.dte, best.delta,
             best.ask, best.bid, best.spread_pct or 0.0, best.strike,
+            best.contract.expiry.date(),
         )
         return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
 
@@ -2635,11 +2636,10 @@ class PmccContractSelector:
         chain:       List[Dict[str, Any]],
         leap_strike: float,
         spot_price:  float = 0.0,
+        leap_expiry: Optional[datetime] = None,  # NEAR must expire BEFORE this
     ) -> Optional[SelectedOption]:
         candidates = self._parse_chain(underlying, chain)
 
-        # PMCC rule: NEAR strike must be >= LEAP strike.
-        # The short call must sit above the long LEAP call or it becomes a debit spread.
         dte_ok    = [c for c in candidates
                      if self.short_cfg.dte_min <= c.dte <= self.short_cfg.dte_max]
         delta_ok  = [c for c in dte_ok
@@ -2650,16 +2650,37 @@ class PmccContractSelector:
                      if c.spread_pct is not None
                      and c.spread_pct <= self.liquidity_cfg.max_near_spread_pct]
 
+        # Safety: the NEAR must expire strictly before the LEAP.
+        # If the NEAR outlives the LEAP, you'd be naked short after LEAP expiry.
+        if leap_expiry is not None:
+            before_leap = [c for c in liquid_ok if c.contract.expiry < leap_expiry]
+            if len(before_leap) < len(liquid_ok):
+                rejected = len(liquid_ok) - len(before_leap)
+                logger.info(
+                    "NEAR expiry filter | underlying=%s rejected=%d contracts "
+                    "that expire on or after LEAP expiry=%s",
+                    underlying, rejected, leap_expiry.date(),
+                )
+            liquid_ok = before_leap
+        else:
+            logger.warning(
+                "select_near called without leap_expiry — "
+                "cannot enforce NEAR-before-LEAP constraint | underlying=%s",
+                underlying,
+            )
+
         if not liquid_ok:
             logger.warning(
                 "No NEAR candidates | underlying=%s parsed=%d dte_ok=%d delta_ok=%d "
                 "strike_ok=%d bid_ok=%d liquid_ok=%d | dte=[%d,%d] target_delta=%.2f "
-                "leap_strike=%.2f spot=%.2f max_spread_pct=%.2f",
+                "leap_strike=%.2f leap_expiry=%s spot=%.2f max_spread_pct=%.2f",
                 underlying, len(candidates), len(dte_ok), len(delta_ok),
                 len(strike_ok), len(bid_ok), len(liquid_ok),
                 self.short_cfg.dte_min, self.short_cfg.dte_max,
                 self.short_cfg.target_delta,
-                leap_strike, spot_price,
+                leap_strike,
+                leap_expiry.date() if leap_expiry else "none",
+                spot_price,
                 self.liquidity_cfg.max_near_spread_pct,
             )
             return None
@@ -2667,9 +2688,11 @@ class PmccContractSelector:
         best = min(liquid_ok, key=lambda c: abs(c.delta - self.short_cfg.target_delta))
         logger.info(
             "NEAR selected | underlying=%s symbol=%s dte=%d delta=%.3f "
-            "bid=%.2f ask=%.2f spread_pct=%.3f strike=%.2f",
+            "bid=%.2f ask=%.2f spread_pct=%.3f strike=%.2f expiry=%s leap_expiry=%s",
             underlying, best.option_symbol, best.dte, best.delta,
             best.bid, best.ask, best.spread_pct or 0.0, best.strike,
+            best.contract.expiry.date(),
+            leap_expiry.date() if leap_expiry else "none",
         )
         return SelectedOption(option_symbol=best.option_symbol, contract=best.contract)
 
@@ -2713,7 +2736,6 @@ class PmccContractSelector:
             ))
         return candidates
 
-
 ============================================================
 FILE: .\src\strategies\pmcc_state_machine.py
 ============================================================
@@ -2731,30 +2753,48 @@ logger = setup_logger("PmccStateClassifier")
 
 
 class PmccState(str, Enum):
-    FLAT      = "flat"
-    LEAP_ONLY = "leap_only"
-    COVERED   = "covered"
-    NEAR_ONLY = "near_only"   # illegal — should not occur
-    PENDING   = "pending"     # completing open order blocking action
+    FLAT      = "flat"       # no positions at all
+    LEAP_ONLY = "leap_only"  # long LEAP contracts > short NEAR contracts
+    COVERED   = "covered"    # long contracts == short contracts (fully paired)
+    NEAR_ONLY = "near_only"  # short NEAR with no LEAP — illegal, must close
+    PENDING   = "pending"    # a completing MLEG entry order is in-flight
 
 
 @dataclass(frozen=True)
 class PmccHoldings:
-    state:         PmccState
-    leap_position: Optional[Dict[str, Any]]
-    near_position: Optional[Dict[str, Any]]
+    state:           PmccState
+    leap_positions:  List[Dict[str, Any]]  # enriched LEAP position dicts
+    near_positions:  List[Dict[str, Any]]  # enriched NEAR position dicts
+    long_contracts:  int                   # total long LEAP contracts (sum of abs(qty))
+    short_contracts: int                   # total short NEAR contracts (sum of abs(qty))
+    uncovered:       int                   # long_contracts - short_contracts
 
+    @property
+    def leap_position(self) -> Optional[Dict[str, Any]]:
+        return self.leap_positions[0] if self.leap_positions else None
+
+    @property
+    def near_position(self) -> Optional[Dict[str, Any]]:
+        return self.near_positions[0] if self.near_positions else None
+
+
+# ---------------------------------------------------------------------------
+# Single source of truth: underlying and DTE from OSI symbol
+# ---------------------------------------------------------------------------
 
 def _underlying_from_osi(osi_symbol: str) -> str:
     """
-    Extract the underlying ticker from an OSI option symbol.
+    Underlying ticker = all chars before the first digit in the OSI symbol.
 
     OSI format: <TICKER><YYMMDD><C|P><8-digit-strike>
-    e.g. SPY270617C00605000  → SPY
-         AAPL260121C00150000 → AAPL
+      SPY270617C00605000  → SPY
+      AAPL260121C00150000 → AAPL
 
-    We stop at the first digit. Do NOT collect all alpha chars —
-    the C/P right character is also alphabetic, which would give 'SPYC' not 'SPY'.
+    Never use 'all alpha chars' — the C/P right char is also alphabetic
+    and would give 'SPYC' instead of 'SPY'.
+
+    This is the ONLY place the underlying is derived from a position.
+    Alpaca never populates underlying_symbol on option positions.
     """
     ticker = []
     for ch in osi_symbol.strip().upper():
@@ -2764,22 +2804,15 @@ def _underlying_from_osi(osi_symbol: str) -> str:
     return "".join(ticker)
 
 
-def _underlying_from_position(position: Dict[str, Any]) -> str:
+def _dte_from_osi(osi_symbol: str) -> int:
     """
-    Return the underlying ticker for a position.
-    Alpaca omits underlying_symbol on option positions — fall back to
-    extracting the leading alpha prefix from the OSI symbol.
+    DTE = days until expiry, derived from the OSI symbol date portion.
+
+    This is the ONLY place DTE is derived for a position.
+    Alpaca does not return a dte field on position objects.
+    Returns -1 if the symbol cannot be parsed.
     """
-    sym = position.get("underlying_symbol") or ""
-    if sym:
-        return str(sym).strip().upper()
-    osi = str(position.get("symbol", ""))
-    return _underlying_from_osi(osi)
-
-
-def _dte_from_position(position: Dict[str, Any]) -> int:
-    """Derive DTE from the OSI option symbol — Alpaca doesn't return a dte field on positions."""
-    sym = str(position.get("symbol", ""))
+    sym = str(osi_symbol).strip()
     if len(sym) >= 15:
         try:
             from src.risk.pmcc_sizer import parse_osi
@@ -2790,19 +2823,56 @@ def _dte_from_position(position: Dict[str, Any]) -> int:
     return -1
 
 
+def _abs_qty(position: Dict[str, Any]) -> int:
+    """Number of contracts in a position, always positive."""
+    try:
+        return abs(int(float(position.get("qty") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _enrich_position(position: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a copy of the position dict with two derived fields added:
+      underlying  — ticker from OSI (always a string, never None)
+      derived_dte — days to expiry from OSI (int, -1 if unparseable)
+
+    Every downstream caller reads these fields. No one re-derives from
+    the raw OSI symbol outside this function.
+    """
+    osi = str(position.get("symbol", ""))
+    return {
+        **position,
+        "underlying":  _underlying_from_osi(osi),
+        "derived_dte": _dte_from_osi(osi),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Classifier
+# ---------------------------------------------------------------------------
+
 @dataclass
 class PmccStateClassifier:
     """
-    Derives current PMCC state from positions + open orders.
+    Derives PMCC state from positions and open orders.
 
-    leap_dte_min and near_dte_max come directly from config.yaml so that
-    the LEAP/NEAR DTE boundary is never hardcoded here.
+    Key design decisions:
+    - DTE boundaries come from config, never hardcoded here.
+    - Underlying is always derived from the OSI symbol (_underlying_from_osi).
+    - Contract counts use abs(qty), not position count.
+      A single position with qty=2 means 2 long contracts.
+      2 long contracts vs 1 short contract → LEAP_ONLY (1 uncovered).
 
-      - A position is a LEAP if: qty > 0 AND dte >= leap_dte_min
-      - A position is a NEAR if: qty < 0 AND dte <= near_dte_max
+    State transitions:
+      long > short  → LEAP_ONLY  (uncovered = long - short)
+      long == short → COVERED    (fully paired, nothing to sell)
+      long == 0, short > 0 → NEAR_ONLY (illegal — close the short)
+      long == 0, short == 0 → FLAT (no positions)
+      completing MLEG order exists → PENDING (wait for fill)
     """
-    leap_dte_min: int  # from config: leap.dte_min  (e.g. 365)
-    near_dte_max: int  # from config: short.dte_max (e.g. 45)
+    leap_dte_min: int   # from config: leap.dte_min  e.g. 365
+    near_dte_max: int   # from config: short.dte_max e.g. 45
 
     def classify(
         self,
@@ -2813,52 +2883,59 @@ class PmccStateClassifier:
     ) -> PmccHoldings:
         sym = underlying.strip().upper()
 
-        # Dump every raw position with derived underlying so we can verify the OSI fix.
-        for p in positions:
-            derived = _underlying_from_position(p)
+        enriched = [_enrich_position(p) for p in positions]
+
+        # Log every position with the derived fields — not the raw None fields
+        for p in enriched:
             logger.info(
-                "RawPosition | symbol=%s asset_class=%r underlying_symbol=%r qty=%s side=%s derived_underlying=%s",
+                "RawPosition | symbol=%s asset_class=%r qty=%s side=%s "
+                "underlying=%s dte=%d",
                 p.get("symbol"), p.get("asset_class"),
-                p.get("underlying_symbol"), p.get("qty"), p.get("side"), derived,
+                p.get("qty"), p.get("side"),
+                p["underlying"], p["derived_dte"],
             )
 
-        # Filter option positions for this underlying.
-        # underlying_symbol is None on Alpaca option positions — OSI fallback used.
         opt_pos = [
-            p for p in positions
-            if _underlying_from_position(p) == sym
+            p for p in enriched
+            if p["underlying"] == sym
             and str(p.get("asset_class", "")).lower() == "us_option"
         ]
 
-        logger.info(
-            "Classifier | underlying=%s total_positions=%d option_positions=%d",
-            sym, len(positions), len(opt_pos),
-        )
-        for p in opt_pos:
-            dte = _dte_from_position(p)
-            logger.info(
-                "  OptionPos | symbol=%s qty=%s side=%s dte=%d asset_class=%s underlying=%s",
-                p.get("symbol"), p.get("qty"), p.get("side"), dte,
-                p.get("asset_class"), _underlying_from_position(p),
-            )
+        leaps = [p for p in opt_pos if self._is_leap(p)]
+        nears = [p for p in opt_pos if self._is_near(p)]
 
-        leap = next((p for p in opt_pos if self._is_leap(p)), None)
-        near = next((p for p in opt_pos if self._is_near(p)), None)
+        # Count contracts (qty), not positions.
+        # qty=2 on one LEAP position = 2 long contracts, not 1.
+        long_contracts  = sum(_abs_qty(p) for p in leaps)
+        short_contracts = sum(_abs_qty(p) for p in nears)
+        uncovered       = max(0, long_contracts - short_contracts)
 
         logger.info(
-            "Classifier | leap=%s near=%s leap_dte_min=%d near_dte_max=%d",
-            leap.get("symbol") if leap else "none",
-            near.get("symbol") if near else "none",
+            "Classifier | underlying=%s total_positions=%d option_positions=%d "
+            "leap_positions=%d near_positions=%d "
+            "long_contracts=%d short_contracts=%d uncovered=%d "
+            "leap_dte_min=%d near_dte_max=%d",
+            sym, len(enriched), len(opt_pos),
+            len(leaps), len(nears),
+            long_contracts, short_contracts, uncovered,
             self.leap_dte_min, self.near_dte_max,
         )
+        for p in opt_pos:
+            logger.info(
+                "  OptionPos | symbol=%s qty=%s dte=%d is_leap=%s is_near=%s",
+                p.get("symbol"), p.get("qty"), p["derived_dte"],
+                self._is_leap(p), self._is_near(p),
+            )
 
         all_pending    = [o for o in open_orders if self._order_is_for(o, sym)]
         completing     = [o for o in all_pending if self._is_completing_mleg(o)]
         non_completing = [o for o in all_pending if not self._is_completing_mleg(o)]
 
         logger.info(
-            "Classifier | open_orders_total=%d pending_for_%s=%d completing=%d non_completing=%d",
-            len(open_orders), sym, len(all_pending), len(completing), len(non_completing),
+            "Classifier | open_orders_total=%d pending_for_%s=%d "
+            "completing=%d non_completing=%d",
+            len(open_orders), sym, len(all_pending),
+            len(completing), len(non_completing),
         )
         for o in all_pending:
             legs_info = [
@@ -2871,69 +2948,72 @@ class PmccStateClassifier:
                 o.get("id"), o.get("order_class"), o.get("status"),
                 self._is_completing_mleg(o), legs_info or "n/a",
             )
-
         if non_completing:
             logger.warning(
-                "Non-completing pending orders found — ignoring | underlying=%s ids=%s",
+                "Non-completing pending orders — ignoring | underlying=%s ids=%s",
                 sym, [o.get("id") for o in non_completing],
             )
 
         if completing:
             state = PmccState.PENDING
-        elif leap and near:
-            state = PmccState.COVERED
-        elif leap and not near:
+        elif long_contracts > short_contracts:
             state = PmccState.LEAP_ONLY
-        elif not leap and near:
+        elif long_contracts > 0 and long_contracts == short_contracts:
+            state = PmccState.COVERED
+        elif long_contracts == 0 and short_contracts > 0:
             state = PmccState.NEAR_ONLY
         else:
             state = PmccState.FLAT
 
-        logger.info("Classifier | result state=%s", state.value)
-        return PmccHoldings(state=state, leap_position=leap, near_position=near)
+        logger.info(
+            "Classifier | result state=%s long_contracts=%d short_contracts=%d uncovered=%d",
+            state.value, long_contracts, short_contracts, uncovered,
+        )
+
+        return PmccHoldings(
+            state=state,
+            leap_positions=leaps,
+            near_positions=nears,
+            long_contracts=long_contracts,
+            short_contracts=short_contracts,
+            uncovered=uncovered,
+        )
 
     def _is_leap(self, position: Dict[str, Any]) -> bool:
-        """
-        A LEAP is a long option (qty > 0) with DTE >= leap_dte_min.
-        leap_dte_min comes from config.yaml leap.dte_min (e.g. 365).
-        """
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty <= 0:
             return False
-        return _dte_from_position(position) >= self.leap_dte_min
+        return position.get("derived_dte", -1) >= self.leap_dte_min
 
     def _is_near(self, position: Dict[str, Any]) -> bool:
-        """
-        A NEAR is a short option (qty < 0) with DTE <= near_dte_max.
-        near_dte_max comes from config.yaml short.dte_max (e.g. 45).
-        """
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty >= 0:
             return False
-        return _dte_from_position(position) <= self.near_dte_max
+        dte = position.get("derived_dte", -1)
+        return 0 <= dte <= self.near_dte_max
 
     @staticmethod
     def _order_is_for(order: Dict[str, Any], sym: str) -> bool:
-        top_sym = str(order.get("underlying_symbol") or order.get("symbol") or "").upper()
+        top_sym = str(
+            order.get("underlying_symbol") or order.get("symbol") or ""
+        ).upper()
         if top_sym == sym:
             return True
         for leg in (order.get("legs") or []):
             if not isinstance(leg, dict):
                 continue
-            leg_sym = str(leg.get("symbol") or "").upper()
-            if _underlying_from_osi(leg_sym) == sym:
+            if _underlying_from_osi(str(leg.get("symbol") or "").upper()) == sym:
                 return True
         return False
 
     @staticmethod
     def _is_completing_mleg(order: Dict[str, Any]) -> bool:
-        """True if this MLEG has exactly 1 buy + 1 sell leg — a valid PMCC entry."""
         if str(order.get("order_class", "")).lower() != "mleg":
             return False
         legs  = [l for l in (order.get("legs") or []) if isinstance(l, dict)]
@@ -2948,7 +3028,7 @@ FILE: .\src\strategies\pmcc_strategy.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from src.config.yaml_config import PmccConfig
@@ -2974,15 +3054,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     config:      PmccConfig
     strategy_id: str = "pmcc"
 
-    # Classifier and selector are built in __post_init__ from config —
-    # they are NOT init params, not defaults, and not hardcoded.
     _classifier: PmccStateClassifier  = field(init=False)
     _selector:   PmccContractSelector = field(init=False)
 
     def __post_init__(self) -> None:
-        # Pass DTE boundaries from config so the classifier never has hardcoded values.
-        # leap_dte_min: a position must have DTE >= this to count as a LEAP.
-        # near_dte_max: a position must have DTE <= this to count as a NEAR.
         self._classifier = PmccStateClassifier(
             leap_dte_min=self.config.leap.dte_min,
             near_dte_max=self.config.short.dte_max,
@@ -3008,7 +3083,12 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             open_orders=list(snapshot.open_orders()),
         )
 
-        logger.info("PMCC state | symbol=%s state=%s", sym, holdings.state.value)
+        logger.info(
+            "PMCC state | symbol=%s state=%s long_contracts=%d "
+            "short_contracts=%d uncovered=%d",
+            sym, holdings.state.value,
+            holdings.long_contracts, holdings.short_contracts, holdings.uncovered,
+        )
 
         if holdings.state == PmccState.PENDING:
             logger.info("PMCC PENDING — skipping cycle | symbol=%s", sym)
@@ -3018,45 +3098,107 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return self._intents_entry(sym, snapshot)
 
         if holdings.state == PmccState.LEAP_ONLY:
-            return self._intents_sell_near(sym, snapshot, holdings.leap_position)
+            # uncovered = number of LEAP contracts with no matching short NEAR.
+            # We sell one NEAR per uncovered contract.
+            # All uncovered contracts share the same LEAP position object (qty=N),
+            # so we use the same leap_position for strike reference each time.
+            logger.info(
+                "PMCC LEAP_ONLY — selling %d NEAR(s) | symbol=%s",
+                holdings.uncovered, sym,
+            )
+            intents = []
+            for _ in range(holdings.uncovered):
+                intents.extend(
+                    self._intents_sell_near(sym, snapshot, holdings.leap_position)
+                )
+            return intents
 
         if holdings.state == PmccState.COVERED:
             return self._intents_manage(sym, snapshot, holdings)
 
         if holdings.state == PmccState.NEAR_ONLY:
-            logger.warning("PMCC NEAR_ONLY — illegal state | symbol=%s", sym)
-            return self._intents_close_near(sym, holdings.near_position)
+            logger.warning("PMCC NEAR_ONLY — illegal state, closing NEAR | symbol=%s", sym)
+            return self._intents_close_near(sym, holdings.near_positions[0])
 
         return []
 
     # ------------------------------------------------------------------
-    # OptionChainConsumerABC
+    # OptionChainConsumerABC — called during the PRE-snapshot phase
     # ------------------------------------------------------------------
 
     def get_option_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+        """
+        Declare which option chains we need BEFORE the full snapshot is built.
+
+        The orchestrator calls this on the pre-snapshot (positions + orders,
+        no chains). We classify state here so we only fetch what we actually
+        need — skipping the ~4s chain fetch entirely when covered and stable.
+
+        Chain requirements by state:
+          FLAT      → leaps + shorts  (need both legs for a new entry)
+          LEAP_ONLY → shorts only     (have the LEAP, need to sell a NEAR)
+          COVERED   → shorts only IF a near is within roll DTE, else nothing
+          NEAR_ONLY → nothing         (close the near at market, no chain needed)
+          PENDING   → nothing         (order in-flight, skip everything)
+        """
         sym       = self.config.underlying_symbol.strip().upper()
         today     = date.today()
         leap_cfg  = self.config.leap
         short_cfg = self.config.short
 
-        return [
-            OptionChainRequest(
-                underlying=sym,
-                request_id="leaps",
-                include_calls=True,
-                include_puts=False,
-                expiration_date_gte=today + timedelta(days=leap_cfg.dte_min),
-                expiration_date_lte=today + timedelta(days=leap_cfg.dte_max),
-            ),
-            OptionChainRequest(
-                underlying=sym,
-                request_id="shorts",
-                include_calls=True,
-                include_puts=False,
-                expiration_date_gte=today + timedelta(days=short_cfg.dte_min),
-                expiration_date_lte=today + timedelta(days=short_cfg.dte_max),
-            ),
-        ]
+        holdings = self._classifier.classify(
+            underlying=sym,
+            positions=list(snapshot.positions()),
+            open_orders=list(snapshot.open_orders()),
+        )
+
+        leap_req = OptionChainRequest(
+            underlying=sym,
+            request_id="leaps",
+            include_calls=True,
+            include_puts=False,
+            expiration_date_gte=today + timedelta(days=leap_cfg.dte_min),
+            expiration_date_lte=today + timedelta(days=leap_cfg.dte_max),
+        )
+        short_req = OptionChainRequest(
+            underlying=sym,
+            request_id="shorts",
+            include_calls=True,
+            include_puts=False,
+            expiration_date_gte=today + timedelta(days=short_cfg.dte_min),
+            expiration_date_lte=today + timedelta(days=short_cfg.dte_max),
+        )
+
+        if holdings.state in (PmccState.PENDING, PmccState.NEAR_ONLY):
+            logger.info(
+                "Chain fetch skipped — state=%s needs no chains | symbol=%s",
+                holdings.state.value, sym,
+            )
+            return []
+
+        if holdings.state == PmccState.FLAT:
+            return [leap_req, short_req]
+
+        if holdings.state == PmccState.LEAP_ONLY:
+            return [short_req]
+
+        if holdings.state == PmccState.COVERED:
+            roll_needed = any(
+                (p.get("derived_dte") or 999) <= self.config.roll.dte_threshold
+                for p in holdings.near_positions
+            )
+            if roll_needed:
+                logger.info(
+                    "COVERED but near(s) within roll threshold — "
+                    "fetching shorts chain | symbol=%s", sym,
+                )
+                return [short_req]
+            logger.info(
+                "COVERED, no roll needed — chain fetch skipped | symbol=%s", sym,
+            )
+            return []
+
+        return []
 
     # ------------------------------------------------------------------
     # State handlers
@@ -3088,25 +3230,25 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
 
         leap_selection = self._selector.select_leap(sym_str, leap_chain, spot)
         if leap_selection is None:
-            logger.warning(
-                "No LEAP selected — no intent generated | symbol=%s spot=%.2f leap_chain=%d",
-                sym_str, spot, len(leap_chain),
-            )
+            logger.warning("No LEAP selected | symbol=%s", sym_str)
             return []
 
         near_selection = self._selector.select_near(
-            sym_str, short_chain, float(leap_selection.contract.strike), spot_price=spot,
+            sym_str, short_chain,
+            float(leap_selection.contract.strike),
+            spot_price=spot,
+            leap_expiry=leap_selection.contract.expiry,
         )
         if near_selection is None:
             logger.warning(
-                "No NEAR selected — no intent generated | symbol=%s leap=%s leap_strike=%.2f spot=%.2f short_chain=%d",
+                "No NEAR selected | symbol=%s leap=%s leap_strike=%.2f",
                 sym_str, leap_selection.option_symbol,
-                float(leap_selection.contract.strike), spot, len(short_chain),
+                float(leap_selection.contract.strike),
             )
             return []
 
         logger.info(
-            "PMCC entry intent created | symbol=%s leap=%s near=%s spot=%.2f",
+            "PMCC entry intent | symbol=%s leap=%s near=%s spot=%.2f",
             sym_str, leap_selection.option_symbol, near_selection.option_symbol, spot,
         )
 
@@ -3135,10 +3277,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
 
         leap_strike: Optional[float] = None
+        leap_expiry: Optional[datetime] = None
         if leap_position:
             try:
                 from src.risk.pmcc_sizer import parse_osi
-                leap_strike = float(parse_osi(str(leap_position.get("symbol", ""))).strike)
+                parsed_leap = parse_osi(str(leap_position.get("symbol", "")))
+                leap_strike = float(parsed_leap.strike)
+                leap_expiry = parsed_leap.expiry
             except Exception:
                 pass
 
@@ -3146,12 +3291,16 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             sym_str, list(chains[short_key]),
             leap_strike or 0,
             spot_price=_get_spot(snapshot, sym_str),
+            leap_expiry=leap_expiry,
         )
         if near is None:
-            logger.warning("No NEAR selected for sell_near | symbol=%s leap_strike=%s", sym_str, leap_strike)
+            logger.warning(
+                "No NEAR selected for sell_near | symbol=%s leap_strike=%s",
+                sym_str, leap_strike,
+            )
             return []
 
-        logger.info("NEAR sell intent created | symbol=%s near=%s", sym_str, near.option_symbol)
+        logger.info("NEAR sell intent | symbol=%s near=%s", sym_str, near.option_symbol)
 
         payload = OptionIntentPayload(
             underlying_symbol=sym,
@@ -3169,44 +3318,67 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         snapshot: CycleSnapshotABC,
         holdings,
     ) -> List[TradeIntent]:
-        near = holdings.near_position
-        if near is None:
-            return []
+        """
+        Check each NEAR for roll triggers.
 
-        near_sym = str(near.get("symbol", ""))
-        if not near_sym:
-            return []
+        derived_dte is set by _enrich_position in the classifier — it is
+        derived from the OSI symbol and is the single source of truth for DTE.
+        Alpaca does not return a dte field on position objects.
 
-        dte = near.get("dte") or near.get("days_to_expiry")
-        if dte is not None and int(dte) <= self.config.roll.dte_threshold:
-            logger.info("Rolling NEAR (DTE threshold) | symbol=%s near=%s dte=%s", sym, near_sym, dte)
-            return self._intents_roll_near(sym, near_sym, snapshot)
+        Delta-based rolling would require matching the position to a live
+        chain row. That requires chain data. We only fetch the shorts chain
+        when derived_dte indicates a roll is needed (see get_option_chain_requests).
+        Once fetched, we could match by symbol to get current delta — not yet
+        implemented; for now we roll on DTE only.
+        """
+        intents = []
+        for near in holdings.near_positions:
+            near_sym = str(near.get("symbol", ""))
+            if not near_sym:
+                continue
 
-        delta = near.get("delta")
-        if delta is not None and abs(float(delta)) >= self.config.roll.delta_threshold:
-            logger.info("Rolling NEAR (delta threshold) | symbol=%s near=%s delta=%s", sym, near_sym, delta)
-            return self._intents_roll_near(sym, near_sym, snapshot)
+            dte = near.get("derived_dte")
 
-        logger.info("PMCC covered, no action needed | symbol=%s near=%s dte=%s delta=%s", sym, near_sym, dte, delta)
-        return []
+            if dte is not None and dte <= self.config.roll.dte_threshold:
+                logger.info(
+                    "Rolling NEAR — DTE %d <= threshold %d | symbol=%s near=%s",
+                    dte, self.config.roll.dte_threshold, sym, near_sym,
+                )
+                leap_expiry: Optional[datetime] = None
+                if holdings.leap_position:
+                    try:
+                        from src.risk.pmcc_sizer import parse_osi
+                        leap_expiry = parse_osi(
+                            str(holdings.leap_position.get("symbol", ""))
+                        ).expiry
+                    except Exception:
+                        pass
+                intents.extend(self._intents_roll_near(sym, near_sym, snapshot, leap_expiry))
+            else:
+                logger.info(
+                    "NEAR stable — no roll needed | symbol=%s near=%s dte=%s threshold=%d",
+                    sym, near_sym, dte, self.config.roll.dte_threshold,
+                )
+        return intents
 
     def _intents_roll_near(
         self,
         sym: Symbol,
         near_sym: str,
         snapshot: CycleSnapshotABC,
+        leap_expiry: Optional[datetime] = None,
     ) -> List[TradeIntent]:
-        btc_payload = OptionIntentPayload(
-            underlying_symbol=sym,
-            leg=SingleOptionLeg(
-                contract_symbol=near_sym,
-                position_intent=PositionIntent.BUY_TO_CLOSE,
-                qty=1,
-            ),
-        )
         btc = TradeIntent.create(
             strategy_id=self.strategy_id, symbol=sym,
-            payload=btc_payload, tags=("roll_btc",),
+            payload=OptionIntentPayload(
+                underlying_symbol=sym,
+                leg=SingleOptionLeg(
+                    contract_symbol=near_sym,
+                    position_intent=PositionIntent.BUY_TO_CLOSE,
+                    qty=1,
+                ),
+            ),
+            tags=("roll_btc",),
         )
 
         chains    = snapshot.option_chains()
@@ -3218,51 +3390,52 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         new_near = self._selector.select_near(
             str(sym), list(chains[short_key]), 0,
             spot_price=_get_spot(snapshot, str(sym)),
+            leap_expiry=leap_expiry,
         )
         if new_near is None:
             logger.warning("No new NEAR for roll | symbol=%s", sym)
             return [btc]
 
-        logger.info("Roll intents created | symbol=%s btc=%s sto=%s", sym, near_sym, new_near.option_symbol)
+        logger.info("Roll | symbol=%s btc=%s sto=%s", sym, near_sym, new_near.option_symbol)
 
-        sto_payload = OptionIntentPayload(
-            underlying_symbol=sym,
-            leg=SingleOptionLeg(
-                contract_symbol=new_near.option_symbol,
-                position_intent=PositionIntent.SELL_TO_OPEN,
-                qty=1,
-            ),
-        )
         sto = TradeIntent.create(
             strategy_id=self.strategy_id, symbol=sym,
-            payload=sto_payload, tags=("roll_sto",),
+            payload=OptionIntentPayload(
+                underlying_symbol=sym,
+                leg=SingleOptionLeg(
+                    contract_symbol=new_near.option_symbol,
+                    position_intent=PositionIntent.SELL_TO_OPEN,
+                    qty=1,
+                ),
+            ),
+            tags=("roll_sto",),
         )
         return [btc, sto]
 
     def _intents_close_near(
         self,
         sym: Symbol,
-        near_position: Optional[Dict[str, Any]],
+        near_position: Dict[str, Any],
     ) -> List[TradeIntent]:
-        if near_position is None:
-            return []
         near_sym = str(near_position.get("symbol", ""))
         if not near_sym:
             return []
-        payload = OptionIntentPayload(
-            underlying_symbol=sym,
-            leg=SingleOptionLeg(
-                contract_symbol=near_sym,
-                position_intent=PositionIntent.BUY_TO_CLOSE,
-                qty=1,
+        return [TradeIntent.create(
+            strategy_id=self.strategy_id, symbol=sym,
+            payload=OptionIntentPayload(
+                underlying_symbol=sym,
+                leg=SingleOptionLeg(
+                    contract_symbol=near_sym,
+                    position_intent=PositionIntent.BUY_TO_CLOSE,
+                    qty=1,
+                ),
             ),
-        )
-        return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
+        )]
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Module helpers
+# ---------------------------------------------------------------------------
 
 def _find_key(chains, sym_str: str, request_id: str):
     for k in chains:
@@ -3272,8 +3445,7 @@ def _find_key(chains, sym_str: str, request_id: str):
 
 
 def _get_spot(snapshot: CycleSnapshotABC, sym_str: str) -> float:
-    quotes = snapshot.asset_quotes()
-    for k, v in quotes.items():
+    for k, v in snapshot.asset_quotes().items():
         if str(k).upper() == sym_str.upper():
             return v.mid or v.ask or v.bid or 0.0
     return 0.0

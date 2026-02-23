@@ -59,7 +59,7 @@ def main() -> int:
 
 
 def _build_broker(env_cfg):
-    registry = BrokerBuilderRegistry()
+    registry = BrokerBuilderRegistry() # The registry is where we register all broker builders, and the factory facade uses it to construct brokers from config.
     registry.register("alpaca", AlpacaBrokerBuilder())
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 

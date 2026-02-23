@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from src.config.yaml_config import PmccConfig
@@ -210,6 +210,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             sym_str, short_chain,
             float(leap_selection.contract.strike),
             spot_price=spot,
+            leap_expiry=leap_selection.contract.expiry,
         )
         if near_selection is None:
             logger.warning(
@@ -249,10 +250,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
 
         leap_strike: Optional[float] = None
+        leap_expiry: Optional[datetime] = None
         if leap_position:
             try:
                 from src.risk.pmcc_sizer import parse_osi
-                leap_strike = float(parse_osi(str(leap_position.get("symbol", ""))).strike)
+                parsed_leap = parse_osi(str(leap_position.get("symbol", "")))
+                leap_strike = float(parsed_leap.strike)
+                leap_expiry = parsed_leap.expiry
             except Exception:
                 pass
 
@@ -260,6 +264,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             sym_str, list(chains[short_key]),
             leap_strike or 0,
             spot_price=_get_spot(snapshot, sym_str),
+            leap_expiry=leap_expiry,
         )
         if near is None:
             logger.warning(
@@ -312,7 +317,16 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     "Rolling NEAR — DTE %d <= threshold %d | symbol=%s near=%s",
                     dte, self.config.roll.dte_threshold, sym, near_sym,
                 )
-                intents.extend(self._intents_roll_near(sym, near_sym, snapshot))
+                leap_expiry: Optional[datetime] = None
+                if holdings.leap_position:
+                    try:
+                        from src.risk.pmcc_sizer import parse_osi
+                        leap_expiry = parse_osi(
+                            str(holdings.leap_position.get("symbol", ""))
+                        ).expiry
+                    except Exception:
+                        pass
+                intents.extend(self._intents_roll_near(sym, near_sym, snapshot, leap_expiry))
             else:
                 logger.info(
                     "NEAR stable — no roll needed | symbol=%s near=%s dte=%s threshold=%d",
@@ -325,6 +339,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         sym: Symbol,
         near_sym: str,
         snapshot: CycleSnapshotABC,
+        leap_expiry: Optional[datetime] = None,
     ) -> List[TradeIntent]:
         btc = TradeIntent.create(
             strategy_id=self.strategy_id, symbol=sym,
@@ -348,6 +363,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         new_near = self._selector.select_near(
             str(sym), list(chains[short_key]), 0,
             spot_price=_get_spot(snapshot, str(sym)),
+            leap_expiry=leap_expiry,
         )
         if new_near is None:
             logger.warning("No new NEAR for roll | symbol=%s", sym)
