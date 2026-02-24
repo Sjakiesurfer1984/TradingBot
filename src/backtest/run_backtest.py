@@ -2,153 +2,118 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 from src.app.container import build_settings_runtime
 from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
 from src.backtest.backtest_runner import BacktestRunner
+from src.backtest.backtest_snapshot_builder import BacktestSnapshotBuilder
 from src.backtest.simulated_account import SimulatedAccount
-from src.config.yaml_config import AppConfig, StrategySpec
 from src.execution.default_execution_policy import DefaultExecutionPolicy
-from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
 from src.signals.signal_pipeline import DefaultSignalPipeline
-from src.strategies.interfaces import StrategyABC
 from src.strategies.strategy_plugin import STRATEGY_PLUGINS
 from src.utilities.logger import setup_logger
 
 """
-src/backtest/run_backtest.py
------------------------------
-Entry point for running a backtest. Wire everything together here —
-the same pattern as main.py but using BacktestRunner instead of Scheduler
-and AlpacaHistoricalBroker instead of AlpacaBroker.
+Entry point for backtests.
 
-Run from the repo root:
+Run from repo root:
     python -m src.backtest.run_backtest
 
-Environment variables required (same as live):
+Required env vars:
     ALPACA_PAPER_API_KEY
     ALPACA_PAPER_API_SECRET
 
-Optional overrides via env vars:
-    BACKTEST_START_DATE   e.g. 2023-01-01  (default: 1 year ago)
-    BACKTEST_END_DATE     e.g. 2024-01-01  (default: today)
-    BACKTEST_INITIAL_CASH e.g. 100000      (default: 100000)
-    BACKTEST_OUTPUT_DIR   e.g. ./results   (default: ./backtest_results)
+All backtest parameters come from config.yaml [backtest] section.
+Env vars override yaml:
+    BACKTEST_START_DATE  BACKTEST_END_DATE
+    BACKTEST_INITIAL_CASH  BACKTEST_OUTPUT_DIR  BACKTEST_LOG_MODE
 """
 
-
 logger = setup_logger("RunBacktest")
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _build_broker(app_cfg: AppConfig) -> AlpacaHistoricalBroker:
-    api_key    = _env("ALPACA_PAPER_API_KEY")
-    api_secret = _env("ALPACA_PAPER_API_SECRET")
-    if not api_key or not api_secret:
-        logger.error(
-            "Missing Alpaca credentials. Set ALPACA_PAPER_API_KEY and "
-            "ALPACA_PAPER_API_SECRET in your .env or environment."
-        )
-        sys.exit(1)
-
-    initial_cash = float(_env("BACKTEST_INITIAL_CASH", "100000"))
-    account      = SimulatedAccount(initial_cash=initial_cash)
-
-    return AlpacaHistoricalBroker(
-        account=account,
-        api_key=api_key,
-        api_secret=api_secret,
-    )
-
-
-def _build_strategies(specs: list[StrategySpec]) -> list[StrategyABC]:
-    strategies = []
-    for spec in specs:
-        plugin = STRATEGY_PLUGINS.get(spec.name)
-        if plugin is None:
-            logger.error("No plugin for strategy '%s'", spec.name)
-            sys.exit(1)
-        strategies.append(plugin.build_strategy(spec))
-    return strategies
-
-
-def _build_risk_engine(app_cfg: AppConfig, broker) -> RiskEngine:
-    engine = RiskEngine(
-        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
-    )
-    for spec in app_cfg.strategies:
-        plugin = STRATEGY_PLUGINS.get(spec.name)
-        if plugin:
-            plugin.register_evaluators(spec, engine)
-    return engine
 
 
 def main() -> int:
     settings = build_settings_runtime()
     app_cfg  = settings.app_cfg
+    bt_cfg   = app_cfg.backtest
 
-    # ------------------------------------------------------------------
-    # Date range
-    # ------------------------------------------------------------------
-    start_str = _env("BACKTEST_START_DATE")
-    end_str   = _env("BACKTEST_END_DATE")
-
-    start_date = (
-        date.fromisoformat(start_str)
-        if start_str else
-        date.today() - timedelta(days=365)
-    )
-    end_date = (
-        date.fromisoformat(end_str)
-        if end_str else
-        date.today()
-    )
-
-    if start_date >= end_date:
-        logger.error("BACKTEST_START_DATE must be before BACKTEST_END_DATE")
+    if bt_cfg is None:
+        logger.error("No [backtest] section in config.yaml")
         return 1
 
-    output_dir = Path(_env("BACKTEST_OUTPUT_DIR", "backtest_results"))
+    api_key    = os.getenv("ALPACA_PAPER_API_KEY", "").strip()
+    api_secret = os.getenv("ALPACA_PAPER_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        print(
+            "\n[ERROR] Missing Alpaca credentials.\n"
+            "  Set ALPACA_PAPER_API_KEY and ALPACA_PAPER_API_SECRET\n"
+            "  in your .env file or environment before running a backtest.\n",
+            file=sys.stderr,
+        )
+        return 1
 
     logger.info(
-        "Backtest config | start=%s end=%s output=%s",
-        start_date, end_date, output_dir,
+        "Backtest config | start=%s end=%s capital=$%.0f output=%s mode=%s",
+        bt_cfg.start_date, bt_cfg.end_date,
+        bt_cfg.initial_cash, bt_cfg.output_dir, bt_cfg.log_mode,
     )
 
-    # ------------------------------------------------------------------
-    # Wire everything together
-    # ------------------------------------------------------------------
-    broker      = _build_broker(app_cfg)
-    strategies  = _build_strategies(app_cfg.strategies)
-    risk_engine = _build_risk_engine(app_cfg, broker)
+    broker = AlpacaHistoricalBroker(
+        account=SimulatedAccount(initial_cash=bt_cfg.initial_cash),
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+
+    strategies = [
+        STRATEGY_PLUGINS[spec.name].build_strategy(spec)
+        for spec in app_cfg.strategies
+        if spec.name in STRATEGY_PLUGINS
+    ]
+
+    risk_engine = RiskEngine(
+        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
+    )
+    for spec in app_cfg.strategies:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin:
+            plugin.register_evaluators(spec, risk_engine)
 
     orchestrator = TradingOrchestrator(
         broker=broker,
         strategies=strategies,
         risk_engine=risk_engine,
         execution_policy=DefaultExecutionPolicy(),
-        snapshot_builder=CycleSnapshotBuilder(broker=broker),
+        snapshot_builder=BacktestSnapshotBuilder(broker=broker),  # ← key fix
         signal_pipeline=DefaultSignalPipeline(),
-        dry_run=False,   # backtest always executes fills
+        dry_run=False,
     )
 
     runner = BacktestRunner(
         orchestrator=orchestrator,
         broker=broker,
-        start_date=start_date,
-        end_date=end_date,
-        output_dir=output_dir,
+        start_date=bt_cfg.start_date,
+        end_date=bt_cfg.end_date,
+        output_dir=bt_cfg.output_dir,
+        log_mode=bt_cfg.log_mode,
     )
 
-    runner.run()
+    results = runner.run()
+
+    try:
+        from src.backtest.plot_results import plot_backtest
+        chart_path = plot_backtest(
+            day_results=results,
+            trade_log=broker.account.trade_log(),
+            output_dir=bt_cfg.output_dir,
+        )
+        print(f"\n  Chart saved → {chart_path}")
+    except Exception as exc:
+        logger.warning("Chart generation failed: %s", exc)
+
     return 0
 
 

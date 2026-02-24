@@ -116,7 +116,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                         no trigger         → nothing
         """
         sym       = self.config.underlying_symbol.strip().upper()
-        today     = date.today()
+        today     = _snapshot_date(snapshot)
         leap_cfg  = self.config.leap
         short_cfg = self.config.short
         roll_cfg  = self.config.roll
@@ -748,3 +748,21 @@ def _get_spot(snapshot: CycleSnapshotABC, sym_str: str) -> float:
         if str(k).upper() == sym_str.upper():
             return v.mid or v.ask or v.bid or 0.0
     return 0.0
+
+
+def _snapshot_date(snapshot: CycleSnapshotABC) -> date:
+    """
+    Return the date the snapshot represents.
+
+    During live trading this is today. During backtesting the broker is set
+    to a historical date, and snapshot.as_of_utc() reflects that date because
+    CycleSnapshotBuilder stamps it at build time with datetime.now() — but
+    in the backtest broker, set_date() is called before build_snapshot(), so
+    the snapshot timestamp reflects the backtest cycle date.
+
+    Using this instead of date.today() makes all chain request expiry windows
+    correct during backtests. Without this fix, date.today() during a 2025-03-01
+    backtest cycle would request LEAPs expiring 2027-02-24 to 2027-08-27 —
+    contracts that don't exist in Alpaca's historical chain for that date.
+    """
+    return snapshot.as_of_utc().date()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,24 +29,11 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    # NEAR management — any one condition triggers a roll.
-
-    # Roll NEAR when DTE falls to or below this value.
-    dte_threshold: int
-
-    # Roll NEAR when this fraction of original premium has been captured.
-    profit_pct: float
-
-    # Roll NEAR when spot >= near_strike * this value.
+    dte_threshold:         int
+    profit_pct:            float
     near_strike_proximity: float
-
-    # LEAP management.
-
-    # Roll LEAP when DTE falls to or below this value.
-    leap_dte_threshold: int
-
-    # Close entire spread when spot <= leap_strike * this value.
-    leap_strike_danger: float
+    leap_dte_threshold:    int
+    leap_strike_danger:    float
 
 
 @dataclass(frozen=True)
@@ -55,20 +44,11 @@ class PmccLiquidityConfig:
 
 @dataclass(frozen=True)
 class PmccRiskConfig:
-    # Maximum fraction of available buying power to use per PMCC entry intent.
     max_buying_power_fraction: float
-
-    # Hard dollar ceiling on net debit per spread regardless of buying power.
-    max_debit_per_spread_usd: float
-
-    # Hard contract ceiling per intent — final safety cap after all other checks.
-    max_contracts_per_intent: int
-
-    # Multiply estimated cost by this before budget checks (e.g. 1.05 = 5% slippage buffer).
-    slippage_factor: float
-
-    # Skip bid-ask spread liquidity checks — only for paper/backtesting diagnostics.
-    ignore_spread_checks: bool
+    max_debit_per_spread_usd:  float
+    max_contracts_per_intent:  int
+    slippage_factor:           float
+    ignore_spread_checks:      bool
 
 
 @dataclass(frozen=True)
@@ -83,38 +63,40 @@ class PmccConfig:
 
 
 # ===========================================================================
-# StrategySpec — generic container for any strategy config
+# StrategySpec
 # ===========================================================================
 
 @dataclass(frozen=True)
 class StrategySpec:
     name:   str
-    config: Any  # typed config dataclass for the strategy, e.g. PmccConfig
+    config: Any
 
-    # Convenience accessor — avoids callers doing isinstance checks everywhere
     @property
     def pmcc(self) -> Optional[PmccConfig]:
         return self.config if isinstance(self.config, PmccConfig) else None
 
 
 # ===========================================================================
-# Strategy config parser registry
+# Backtest config
 # ===========================================================================
-# To add a new strategy:
-#   1. Define its config dataclass(es) above.
-#   2. Write a _parse_<n>_config(raw: dict) -> YourConfig function below.
-#   3. Register it in _STRATEGY_CONFIG_PARSERS.
-#   4. That's it — load_app_config() needs no changes.
-#
-# Each parser receives the full strategy YAML entry dict (the dict that also
-# contains "name": "pmcc") and returns a typed config object.
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    initial_cash: float
+    start_date:   date
+    end_date:     date
+    output_dir:   Path
+    log_mode:     str   # "progress" | "verbose"
+
+
+# ===========================================================================
+# Strategy config parser registry
 # ===========================================================================
 
 StrategyConfigParser = Callable[[Dict[str, Any]], Any]
 
 
 def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
-    """Parse the 'pmcc:' block from a strategy entry."""
     p = raw.get("pmcc")
     if not p:
         return None
@@ -143,8 +125,6 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
     )
 
 
-# Registry: strategy name → parser function.
-# Add new strategies here without touching load_app_config().
 _STRATEGY_CONFIG_PARSERS: Dict[str, StrategyConfigParser] = {
     "pmcc": _parse_pmcc_config,
 }
@@ -166,6 +146,7 @@ class AppConfig:
     cycle_seconds:   float
     risk:            GlobalRiskConfig
     strategies:      List[StrategySpec]
+    backtest:        Optional[BacktestConfig] = None
 
 
 # ===========================================================================
@@ -188,7 +169,7 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
     if path is None or not path.exists():
         raise FileNotFoundError(f"config.yaml not found. Searched: {_SEARCH_PATHS}")
 
-    raw = yaml.safe_load(path.read_text())
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     risk_raw    = raw.get("risk", {})
     global_risk = GlobalRiskConfig(
@@ -206,10 +187,23 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
             )
         strategies.append(StrategySpec(name=name, config=parser(entry)))
 
+    bt_raw         = raw.get("backtest") or {}
+    _default_start = (date.today() - timedelta(days=365)).isoformat()
+    _default_end   = date.today().isoformat()
+
+    backtest_cfg = BacktestConfig(
+        initial_cash=float(os.getenv("BACKTEST_INITIAL_CASH") or bt_raw.get("initial_cash", 100_000)),
+        start_date=date.fromisoformat(os.getenv("BACKTEST_START_DATE") or bt_raw.get("start_date", _default_start)),
+        end_date=date.fromisoformat(os.getenv("BACKTEST_END_DATE") or bt_raw.get("end_date", _default_end)),
+        output_dir=Path(os.getenv("BACKTEST_OUTPUT_DIR") or bt_raw.get("output_dir", "backtest_results")),
+        log_mode=str(os.getenv("BACKTEST_LOG_MODE") or bt_raw.get("log_mode", "progress")),
+    )
+
     return AppConfig(
         config_path=path,
         default_dry_run=bool(raw.get("default_dry_run", False)),
         cycle_seconds=float(raw.get("cycle_seconds", 60)),
         risk=global_risk,
         strategies=strategies,
+        backtest=backtest_cfg,
     )

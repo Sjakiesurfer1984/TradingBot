@@ -44,7 +44,7 @@ strategies:
 
       # Maximum number of simultaneous PMCC spreads (LEAP + NEAR pairs) to hold.
       # Each "unit" = 1 long LEAP call + 1 short NEAR call.
-      max_units: 1
+      max_units: 5
 
       leap:
         dte_min: 365
@@ -57,9 +57,30 @@ strategies:
         target_delta: 0.20
 
       roll:
+        # NEAR management — any one condition triggers a roll.
+
+        # Roll NEAR when DTE falls to or below this value.
         dte_threshold: 14
-        delta_threshold: 0.35
+
+        # Roll NEAR when this fraction of the original premium has been captured.
+        # e.g. 0.50 = roll when 50% of premium is gone. Higher = more patient.
         profit_pct: 0.50
+
+        # Roll NEAR when spot reaches this fraction of the NEAR strike.
+        # e.g. 0.95 = roll when spot is within 3% of the strike.
+        # Lower = more aggressive protection; higher = more tolerant of ITM risk.
+        near_strike_proximity: 0.95
+
+        # LEAP management — any one condition triggers action.
+
+        # Roll LEAP when DTE falls to or below this value.
+        # At this point theta acceleration makes the LEAP an ineffective hedge.
+        leap_dte_threshold: 90
+
+        # Close the entire spread when spot falls to or below this fraction of
+        # the LEAP strike. The LEAP is going deep OTM and the structure is broken.
+        # e.g. 0.90 = close when spot is 10% below the LEAP strike.
+        leap_strike_danger: 0.90
 
       liquidity:
         max_leap_spread_pct: 0.10
@@ -180,7 +201,7 @@ def main() -> int:
 
 
 def _build_broker(env_cfg):
-    registry = BrokerBuilderRegistry()
+    registry = BrokerBuilderRegistry() # The registry is where we register all broker builders, and the factory facade uses it to construct brokers from config.
     registry.register("alpaca", AlpacaBrokerBuilder())
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 
@@ -288,6 +309,1128 @@ FILE: .\src\app\__init__.py
 
 
 ============================================================
+FILE: .\src\backtest\alpaca_historical_broker.py
+============================================================
+
+from __future__ import annotations
+
+
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+
+from typing import Any, Dict, List, Optional
+
+import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+
+from src.backtest.simulated_account import SimulatedAccount
+from src.brokers.broker_base import BrokerBase
+from src.brokers.errors import BrokerConnectionError
+from src.brokers.interfaces import BrokerABC
+from src.domain.orders import (
+    MarketOrder,
+    MultiLegLimitOrder,
+    OrderABC,
+    OrderSide as DomainOrderSide,
+)
+from src.domain.types import AssetQuote
+from src.utilities.logger import setup_logger
+
+
+
+
+
+"""
+src/backtest/alpaca_historical_broker.py
+-----------------------------------------
+Implements BrokerABC against Alpaca's historical data API and a
+SimulatedAccount for order execution.
+
+Data sources:
+  - Stock quotes:   /v2/stocks/{sym}/bars  (daily OHLCV, use close as mid)
+  - Option chains:  /v1beta1/options/snapshots/{sym}  (same endpoint as live,
+                    but we pass a date parameter to get historical EOD data)
+
+Fill model:
+  - Market orders (BTC/STO single-leg): fill at bid (sells) or ask (buys)
+    from the historical chain snapshot for that date.
+  - MLEG limit orders (PMCC entry): fill at the limit price if
+    (leap_ask - near_bid) <= limit_price, otherwise not filled this cycle.
+
+Alpaca's historical options snapshot endpoint returns EOD data when you
+pass `feed=indicative` and a specific date. We request one date at a time.
+
+The broker is stateless w.r.t. dates — the BacktestRunner sets the current
+date before each cycle via set_date().
+"""
+
+logger = setup_logger("AlpacaHistoricalBroker")
+
+_STOCK_BASE  = "https://data.alpaca.markets/v2"
+_OPTION_BASE = "https://data.alpaca.markets/v1beta1"
+
+
+@dataclass
+class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
+    """
+    BrokerABC implementation for backtesting.
+
+    The runner calls set_date() at the start of each cycle to point the
+    broker at the correct historical date. All data fetches then use that
+    date. Orders are simulated against the same day's prices.
+
+    Rate limiting: Alpaca's data API allows ~200 req/min on free tier.
+    We add a small sleep between chain fetches to stay safe.
+    """
+
+    account:       SimulatedAccount
+    api_key:       str
+    api_secret:    str
+    rate_limit_sleep: float = 0.4   # seconds between API calls
+
+    _current_date: date               = field(init=False, default_factory=date.today)
+    _session:      Optional[Session]  = field(init=False, default=None)
+    # Cache chain data within a single cycle — avoid re-fetching the same
+    # chain multiple times (get_option_chain_requests may request leaps and
+    # shorts separately but they often overlap).
+    _chain_cache:  Dict[str, List[Dict[str, Any]]] = field(default_factory=dict, init=False)
+    _bar_cache:    Dict[str, float]                 = field(default_factory=dict, init=False)
+
+    # ------------------------------------------------------------------
+    # Date control (called by BacktestRunner)
+    # ------------------------------------------------------------------
+
+    def set_date(self, d: date) -> None:
+        self._current_date = d
+        self._chain_cache.clear()
+        self._bar_cache.clear()
+        logger.info("BacktestBroker date set | date=%s", d.isoformat())
+
+    # ------------------------------------------------------------------
+    # HTTP helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_session(self) -> Session:
+        if self._session is None:
+            s = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=2)
+            s.mount("https://", adapter)
+            self._session = s
+        return self._session
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "APCA-API-KEY-ID":     self.api_key,
+            "APCA-API-SECRET-KEY": self.api_secret,
+        }
+
+    def _get(self, url: str, params: Optional[Dict] = None) -> Any:
+        time.sleep(self.rate_limit_sleep)
+        session  = self._ensure_session()
+        response = session.get(url, headers=self._headers(), params=params, timeout=(5, 30))
+        if response.status_code == 429:
+            logger.warning("Rate limited — sleeping 60s")
+            time.sleep(60)
+            response = session.get(url, headers=self._headers(), params=params, timeout=(5, 30))
+        response.raise_for_status()
+        return response.json()
+
+    # ------------------------------------------------------------------
+    # ExecutionBrokerABC
+    # ------------------------------------------------------------------
+
+    def get_account_snapshot(self) -> Dict[str, Any]:
+        return {
+            "equity":               str(self.account.equity),
+            "options_buying_power": str(self.account.option_buying_power),
+            "cash":                 str(self.account.cash),
+        }
+
+    def get_option_buying_power(self) -> float:
+        return self.account.option_buying_power
+
+    def get_equity(self) -> float:
+        return self.account.equity
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return self.account.positions()
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        # In backtest all orders fill same-day — no open orders carry over.
+        return []
+
+    def submit_order(self, order: OrderABC) -> Any:
+        date_str = self._current_date.isoformat()
+
+        if isinstance(order, MultiLegLimitOrder):
+            return self._fill_mleg(order, date_str)
+
+        if isinstance(order, MarketOrder):
+            return self._fill_market(order, date_str)
+
+        raise TypeError(f"Unsupported order type: {type(order).__name__}")
+
+    def cancel_order(self, order_id: str) -> None:
+        pass  # No open orders in backtest
+
+    # ------------------------------------------------------------------
+    # MarketDataProviderABC
+    # ------------------------------------------------------------------
+
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
+        """
+        Return EOD close price for the symbol on _current_date.
+        We use the daily bar close as both bid and ask (no spread model
+        for the underlying — we only need it for spot price in strategy logic).
+        """
+        sym   = symbol.strip().upper()
+        price = self._get_bar_close(sym)
+        return AssetQuote(
+            symbol=sym,
+            bid=price,
+            ask=price,
+            mid=price,
+            timestamp_utc=datetime.combine(
+                self._current_date, datetime.min.time(), tzinfo=timezone.utc
+            ),
+        )
+
+    def get_latest_price(self, symbol: str) -> float:
+        return self._get_bar_close(symbol.strip().upper())
+
+    def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
+        sym   = symbol.strip().upper()
+        end   = self._current_date
+        start = end - timedelta(days=lookback_days + 5)
+        url   = f"{_STOCK_BASE}/stocks/{sym}/bars"
+        return self._get(url, params={
+            "timeframe":  "1Day",
+            "start":      start.isoformat(),
+            "end":        end.isoformat(),
+            "adjustment": "raw",
+            "feed":       "iex",
+            "limit":      1000,
+        })
+
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls:       bool            = True,
+        include_puts:        bool            = False,
+        feed:                str             = "indicative",
+        max_age_seconds:     int             = 30,
+        limit:               int             = 0,
+        strike_price_gte:    Optional[float] = None,
+        strike_price_lte:    Optional[float] = None,
+        expiration_date:     Optional[date]  = None,
+        expiration_date_gte: Optional[date]  = None,
+        expiration_date_lte: Optional[date]  = None,
+        root_symbol:         Optional[str]   = None,
+        updated_since:       Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        sym = underlying.strip().upper()
+        url = f"{_OPTION_BASE}/options/snapshots/{sym}"
+
+        params: Dict[str, Any] = {
+            "feed": "indicative",
+            # Historical EOD snapshot — pass the date so Alpaca returns
+            # end-of-day data rather than live quotes.
+            "date": self._current_date.isoformat(),
+        }
+
+        if include_calls and not include_puts:
+            params["type"] = "call"
+        elif include_puts and not include_calls:
+            params["type"] = "put"
+        if expiration_date is not None:
+            params["expiration_date"] = expiration_date.isoformat()
+        if expiration_date_gte is not None:
+            params["expiration_date_gte"] = expiration_date_gte.isoformat()
+        if expiration_date_lte is not None:
+            params["expiration_date_lte"] = expiration_date_lte.isoformat()
+        if strike_price_gte is not None:
+            params["strike_price_gte"] = strike_price_gte
+        if strike_price_lte is not None:
+            params["strike_price_lte"] = strike_price_lte
+        if root_symbol:
+            params["root_symbol"] = root_symbol.strip().upper()
+
+        # Cache key — same params within a cycle reuse the cached result.
+        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}:" \
+                    f"{params.get('expiration_date_gte','')}:{params.get('expiration_date_lte','')}"
+        if cache_key in self._chain_cache:
+            logger.info("Chain cache hit | key=%s", cache_key)
+            return self._chain_cache[cache_key]
+
+        chain: List[Dict[str, Any]] = []
+        next_page: Optional[str] = None
+
+        while True:
+            p = dict(params)
+            if next_page:
+                p["page_token"] = next_page
+            data = self._get(url, params=p)
+            if not isinstance(data, dict):
+                raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
+            for contract_sym, snap in (data.get("snapshots") or {}).items():
+                if isinstance(snap, dict):
+                    row = dict(snap)
+                    row["contract_symbol"] = contract_sym
+                    chain.append(row)
+                    if 0 < limit <= len(chain):
+                        self._chain_cache[cache_key] = chain
+                        return chain
+            nxt = data.get("next_page_token")
+            next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
+            if not next_page:
+                break
+
+        logger.info(
+            "Historical chain fetched | sym=%s date=%s contracts=%d",
+            sym, self._current_date, len(chain),
+        )
+        self._chain_cache[cache_key] = chain
+        return chain
+
+    # ------------------------------------------------------------------
+    # Fill simulation
+    # ------------------------------------------------------------------
+
+    def _fill_mleg(self, order: MultiLegLimitOrder, date_str: str) -> None:
+        """
+        Fill a PMCC entry (BTO LEAP + STO NEAR) at historical EOD prices.
+
+        We accept the fill if the net debit implied by historical prices
+        is <= the limit price on the order. This matches how a limit order
+        would behave — if the market is worse than the limit, no fill.
+        """
+        underlying = str(order.underlying).upper()
+
+        # Gather fill prices for each leg from the chain cache.
+        leg_fills: List[Dict[str, Any]] = []
+        for leg in order.legs:
+            sym   = str(leg.contract.option_symbol).upper()
+            price = self._get_option_price(sym, leg.side)
+            if price is None:
+                logger.warning(
+                    "MLEG fill skipped — no price for %s on %s", sym, date_str,
+                )
+                return
+            leg_fills.append({
+                "symbol": sym, "side": leg.side, "price": price,
+                "underlying": underlying,
+            })
+
+        # Net debit = buy legs - sell legs (per contract, pre-multiplier)
+        net_debit = sum(
+            f["price"] if f["side"] == DomainOrderSide.BUY else -f["price"]
+            for f in leg_fills
+        )
+
+        limit = float(order.limit_price)
+        if net_debit > limit * 1.02:   # 2% tolerance for EOD vs intraday
+            logger.info(
+                "MLEG fill skipped — net_debit %.2f > limit %.2f | date=%s",
+                net_debit, limit, date_str,
+            )
+            return
+
+        qty = int(order.quantity)
+        for fill in leg_fills:
+            if fill["side"] == DomainOrderSide.BUY:
+                self.account.fill_buy(
+                    symbol=fill["symbol"], underlying=fill["underlying"],
+                    qty=qty, fill_price=fill["price"], date_str=date_str,
+                )
+            else:
+                self.account.fill_sell(
+                    symbol=fill["symbol"], underlying=fill["underlying"],
+                    qty=qty, fill_price=fill["price"], date_str=date_str,
+                )
+
+    def _fill_market(self, order: MarketOrder, date_str: str) -> None:
+        """
+        Fill a single-leg market order (BTC or STO) at historical EOD prices.
+        """
+        sym        = str(order.symbol).upper()
+        underlying = self._underlying_from_osi(sym)
+        price      = self._get_option_price(sym, order.side)
+
+        if price is None:
+            logger.warning(
+                "Market fill skipped — no price for %s on %s", sym, date_str,
+            )
+            return
+
+        qty = int(order.quantity)
+        if order.side == DomainOrderSide.BUY:
+            self.account.fill_buy(
+                symbol=sym, underlying=underlying,
+                qty=qty, fill_price=price, date_str=date_str,
+            )
+        else:
+            self.account.fill_sell(
+                symbol=sym, underlying=underlying,
+                qty=qty, fill_price=price, date_str=date_str,
+            )
+
+    # ------------------------------------------------------------------
+    # Price lookup helpers
+    # ------------------------------------------------------------------
+
+    def _get_option_price(
+        self,
+        osi_symbol: str,
+        side: DomainOrderSide,
+    ) -> Optional[float]:
+        """
+        Find the fill price for an option from the cached chain data.
+        Buys fill at ask; sells fill at bid. Falls back to mid if one
+        side is missing.
+        """
+        for chain_data in self._chain_cache.values():
+            for row in chain_data:
+                if str(row.get("contract_symbol", "")).upper() == osi_symbol:
+                    q   = row.get("latestQuote") or {}
+                    ask = float(q.get("ap") or 0)
+                    bid = float(q.get("bp") or 0)
+                    mid = (ask + bid) / 2.0 if ask > 0 and bid > 0 else ask or bid
+                    if side == DomainOrderSide.BUY:
+                        return ask if ask > 0 else (mid if mid > 0 else None)
+                    else:
+                        return bid if bid > 0 else (mid if mid > 0 else None)
+
+        # Not in any cached chain — fetch directly (rare: only for management
+        # orders where chain wasn't fetched this cycle).
+        logger.warning(
+            "Option not in chain cache — fetching single snapshot | sym=%s", osi_symbol,
+        )
+        underlying = self._underlying_from_osi(osi_symbol)
+        try:
+            chain = self.get_option_chain(underlying)
+            for row in chain:
+                if str(row.get("contract_symbol", "")).upper() == osi_symbol:
+                    q   = row.get("latestQuote") or {}
+                    ask = float(q.get("ap") or 0)
+                    bid = float(q.get("bp") or 0)
+                    mid = (ask + bid) / 2.0 if ask > 0 and bid > 0 else ask or bid
+                    if side == DomainOrderSide.BUY:
+                        return ask if ask > 0 else (mid if mid > 0 else None)
+                    else:
+                        return bid if bid > 0 else (mid if mid > 0 else None)
+        except Exception as e:
+            logger.warning("Failed to fetch price for %s: %s", osi_symbol, e)
+        return None
+
+    def _get_bar_close(self, symbol: str) -> float:
+        """Fetch EOD close for the underlying on _current_date."""
+        if symbol in self._bar_cache:
+            return self._bar_cache[symbol]
+
+        # We request a small window around the target date to handle
+        # weekends/holidays — take the last bar at or before our date.
+        start = (self._current_date - timedelta(days=5)).isoformat()
+        end   = self._current_date.isoformat()
+        url   = f"{_STOCK_BASE}/stocks/{symbol}/bars"
+        data  = self._get(url, params={
+            "timeframe":  "1Day",
+            "start":      start,
+            "end":        end,
+            "adjustment": "raw",
+            "feed":       "iex",
+            "limit":      10,
+        })
+        bars = data.get("bars") or []
+        if not bars:
+            raise BrokerConnectionError(
+                "alpaca-historical",
+                f"No bar data for {symbol} around {self._current_date}",
+            )
+        close = float(bars[-1]["c"])
+        self._bar_cache[symbol] = close
+        logger.info("Bar close | symbol=%s date=%s close=%.2f", symbol, self._current_date, close)
+        return close
+
+    def update_position_market_values(self) -> None:
+        """
+        Revalue all open positions from cached chain prices.
+        Called by the runner at end of each cycle for accurate equity tracking.
+        """
+        prices: Dict[str, float] = {}
+        for chain_data in self._chain_cache.values():
+            for row in chain_data:
+                sym = str(row.get("contract_symbol", "")).upper()
+                if not sym:
+                    continue
+                q   = row.get("latestQuote") or {}
+                ask = float(q.get("ap") or 0)
+                bid = float(q.get("bp") or 0)
+                mid = (ask + bid) / 2.0 if ask > 0 and bid > 0 else ask or bid
+                if mid > 0:
+                    prices[sym] = mid
+        self.account.update_market_values(prices)
+
+    @staticmethod
+    def _underlying_from_osi(osi_symbol: str) -> str:
+        ticker = []
+        for ch in osi_symbol.strip().upper():
+            if ch.isdigit():
+                break
+            ticker.append(ch)
+        return "".join(ticker)
+
+============================================================
+FILE: .\src\backtest\backtest_runner.py
+============================================================
+
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from pathlib import Path
+from typing import List
+
+from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
+from src.orchestration.orchestrator import TradingOrchestrator
+from src.orchestration.orchestrator_interface import CycleRunResult
+from src.utilities.logger import setup_logger
+
+
+"""
+src/backtest/backtest_runner.py
+--------------------------------
+Steps through a date range, calling orchestrator.run_cycle() once per
+trading day. Collects per-cycle results and produces a final summary.
+
+The runner owns the date iteration and hands off to the orchestrator
+exactly as the live Scheduler does — the orchestrator never knows it's
+in a backtest. This is the point: we test the real code, not a replica.
+
+Usage:
+    See run_backtest.py for the entry point.
+"""
+
+
+
+logger = setup_logger("BacktestRunner")
+
+# US market holidays (update annually).
+# A minimal set — any date in here is skipped.
+_HOLIDAYS: set = {
+    # 2023
+    date(2023, 1, 2), date(2023, 1, 16), date(2023, 2, 20), date(2023, 4, 7),
+    date(2023, 5, 29), date(2023, 6, 19), date(2023, 7, 4), date(2023, 9, 4),
+    date(2023, 11, 23), date(2023, 12, 25),
+    # 2024
+    date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
+    date(2024, 5, 27), date(2024, 6, 19), date(2024, 7, 4), date(2024, 9, 2),
+    date(2024, 11, 28), date(2024, 12, 25),
+    # 2025
+    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
+    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
+    date(2025, 11, 27), date(2025, 12, 25),
+}
+
+
+def _is_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in _HOLIDAYS
+
+
+def _trading_days(start: date, end: date) -> List[date]:
+    days = []
+    current = start
+    while current <= end:
+        if _is_trading_day(current):
+            days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
+@dataclass
+class DayResult:
+    date:               str
+    cycle_result:       CycleRunResult
+    equity:             float
+    cash:               float
+    option_buying_power: float
+    open_positions:     int
+
+
+@dataclass
+class BacktestRunner:
+    orchestrator:  TradingOrchestrator
+    broker:        AlpacaHistoricalBroker
+    start_date:    date
+    end_date:      date
+    output_dir:    Path = Path("backtest_results")
+
+    _day_results:  List[DayResult] = field(default_factory=list, init=False)
+
+    def run(self) -> List[DayResult]:
+        days = _trading_days(self.start_date, self.end_date)
+        logger.info(
+            "Backtest starting | from=%s to=%s trading_days=%d",
+            self.start_date, self.end_date, len(days),
+        )
+
+        for d in days:
+            logger.info("--- Cycle date=%s ---", d.isoformat())
+
+            # Point the broker at today's date before the cycle runs.
+            self.broker.set_date(d)
+
+            try:
+                result = self.orchestrator.run_cycle()
+            except Exception:
+                logger.exception("Cycle failed | date=%s — continuing", d.isoformat())
+                result = CycleRunResult(
+                    orders_submitted=0,
+                    intents_generated=0,
+                    intents_approved=0,
+                    intents_rejected=0,
+                )
+
+            # Revalue positions at EOD prices now that chain data is cached.
+            self.broker.update_position_market_values()
+
+            summary = self.broker.account.summary(d.isoformat())
+            day_result = DayResult(
+                date=d.isoformat(),
+                cycle_result=result,
+                equity=summary["equity"],
+                cash=summary["cash"],
+                option_buying_power=summary["option_buying_power"],
+                open_positions=summary["open_positions"],
+            )
+            self._day_results.append(day_result)
+
+            logger.info(
+                "Day complete | date=%s equity=%.2f cash=%.2f positions=%d "
+                "submitted=%d approved=%d rejected=%d",
+                d.isoformat(),
+                day_result.equity, day_result.cash, day_result.open_positions,
+                result.orders_submitted, result.intents_approved, result.intents_rejected,
+            )
+
+        self._write_results()
+        self._print_summary()
+        return self._day_results
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    def _write_results(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Daily equity curve CSV
+        csv_path = self.output_dir / "equity_curve.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "date", "equity", "cash", "option_buying_power",
+                "open_positions", "orders_submitted",
+                "intents_approved", "intents_rejected",
+            ])
+            writer.writeheader()
+            for r in self._day_results:
+                writer.writerow({
+                    "date":                r.date,
+                    "equity":              r.equity,
+                    "cash":               r.cash,
+                    "option_buying_power": r.option_buying_power,
+                    "open_positions":      r.open_positions,
+                    "orders_submitted":    r.cycle_result.orders_submitted,
+                    "intents_approved":    r.cycle_result.intents_approved,
+                    "intents_rejected":    r.cycle_result.intents_rejected,
+                })
+        logger.info("Equity curve written | path=%s", csv_path)
+
+        # Trade log JSON
+        trade_log_path = self.output_dir / "trade_log.json"
+        with open(trade_log_path, "w") as f:
+            json.dump(self.broker.account.trade_log(), f, indent=2)
+        logger.info("Trade log written | path=%s", trade_log_path)
+
+    def _print_summary(self) -> None:
+        if not self._day_results:
+            return
+        first  = self._day_results[0]
+        last   = self._day_results[-1]
+        days   = len(self._day_results)
+        trades = len(self.broker.account.trade_log())
+
+        total_return = (last.equity - first.equity) / first.equity * 100
+        # Annualised return (approximate)
+        ann_return = total_return * (252 / days) if days > 0 else 0.0
+
+        # Max drawdown
+        peak = first.equity
+        max_dd = 0.0
+        for r in self._day_results:
+            peak = max(peak, r.equity)
+            dd   = (peak - r.equity) / peak * 100
+            max_dd = max(max_dd, dd)
+
+        logger.info("=" * 60)
+        logger.info("BACKTEST SUMMARY")
+        logger.info("  Period:          %s → %s (%d days)", first.date, last.date, days)
+        logger.info("  Start equity:    $%.2f", first.equity)
+        logger.info("  End equity:      $%.2f", last.equity)
+        logger.info("  Total return:    %.2f%%", total_return)
+        logger.info("  Ann. return:     %.2f%%", ann_return)
+        logger.info("  Max drawdown:    %.2f%%", max_dd)
+        logger.info("  Total trades:    %d", trades)
+        logger.info("=" * 60)
+
+
+============================================================
+FILE: .\src\backtest\run_backtest.py
+============================================================
+
+from __future__ import annotations
+
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+from src.app.container import build_settings_runtime
+from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
+from src.backtest.backtest_runner import BacktestRunner
+from src.backtest.simulated_account import SimulatedAccount
+from src.config.yaml_config import AppConfig, StrategySpec
+from src.execution.default_execution_policy import DefaultExecutionPolicy
+from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+from src.orchestration.orchestrator import TradingOrchestrator
+from src.risk.risk_engine import RiskEngine
+from src.risk.rules.open_order_rule import OpenOrderDedupeRule
+from src.signals.signal_pipeline import DefaultSignalPipeline
+from src.strategies.interfaces import StrategyABC
+from src.strategies.strategy_plugin import STRATEGY_PLUGINS
+from src.utilities.logger import setup_logger
+
+"""
+src/backtest/run_backtest.py
+-----------------------------
+Entry point for running a backtest. Wire everything together here —
+the same pattern as main.py but using BacktestRunner instead of Scheduler
+and AlpacaHistoricalBroker instead of AlpacaBroker.
+
+Run from the repo root:
+    python -m src.backtest.run_backtest
+
+Environment variables required (same as live):
+    ALPACA_PAPER_API_KEY
+    ALPACA_PAPER_API_SECRET
+
+Optional overrides via env vars:
+    BACKTEST_START_DATE   e.g. 2023-01-01  (default: 1 year ago)
+    BACKTEST_END_DATE     e.g. 2024-01-01  (default: today)
+    BACKTEST_INITIAL_CASH e.g. 100000      (default: 100000)
+    BACKTEST_OUTPUT_DIR   e.g. ./results   (default: ./backtest_results)
+"""
+
+
+logger = setup_logger("RunBacktest")
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _build_broker(app_cfg: AppConfig) -> AlpacaHistoricalBroker:
+    api_key    = _env("ALPACA_PAPER_API_KEY")
+    api_secret = _env("ALPACA_PAPER_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error(
+            "Missing Alpaca credentials. Set ALPACA_PAPER_API_KEY and "
+            "ALPACA_PAPER_API_SECRET in your .env or environment."
+        )
+        sys.exit(1)
+
+    initial_cash = float(_env("BACKTEST_INITIAL_CASH", "100000"))
+    account      = SimulatedAccount(initial_cash=initial_cash)
+
+    return AlpacaHistoricalBroker(
+        account=account,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+
+
+def _build_strategies(specs: list[StrategySpec]) -> list[StrategyABC]:
+    strategies = []
+    for spec in specs:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin is None:
+            logger.error("No plugin for strategy '%s'", spec.name)
+            sys.exit(1)
+        strategies.append(plugin.build_strategy(spec))
+    return strategies
+
+
+def _build_risk_engine(app_cfg: AppConfig, broker) -> RiskEngine:
+    engine = RiskEngine(
+        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
+    )
+    for spec in app_cfg.strategies:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin:
+            plugin.register_evaluators(spec, engine)
+    return engine
+
+
+def main() -> int:
+    settings = build_settings_runtime()
+    app_cfg  = settings.app_cfg
+
+    # ------------------------------------------------------------------
+    # Date range
+    # ------------------------------------------------------------------
+    start_str = _env("BACKTEST_START_DATE")
+    end_str   = _env("BACKTEST_END_DATE")
+
+    start_date = (
+        date.fromisoformat(start_str)
+        if start_str else
+        date.today() - timedelta(days=365)
+    )
+    end_date = (
+        date.fromisoformat(end_str)
+        if end_str else
+        date.today()
+    )
+
+    if start_date >= end_date:
+        logger.error("BACKTEST_START_DATE must be before BACKTEST_END_DATE")
+        return 1
+
+    output_dir = Path(_env("BACKTEST_OUTPUT_DIR", "backtest_results"))
+
+    logger.info(
+        "Backtest config | start=%s end=%s output=%s",
+        start_date, end_date, output_dir,
+    )
+
+    # ------------------------------------------------------------------
+    # Wire everything together
+    # ------------------------------------------------------------------
+    broker      = _build_broker(app_cfg)
+    strategies  = _build_strategies(app_cfg.strategies)
+    risk_engine = _build_risk_engine(app_cfg, broker)
+
+    orchestrator = TradingOrchestrator(
+        broker=broker,
+        strategies=strategies,
+        risk_engine=risk_engine,
+        execution_policy=DefaultExecutionPolicy(),
+        snapshot_builder=CycleSnapshotBuilder(broker=broker),
+        signal_pipeline=DefaultSignalPipeline(),
+        dry_run=False,   # backtest always executes fills
+    )
+
+    runner = BacktestRunner(
+        orchestrator=orchestrator,
+        broker=broker,
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+    )
+
+    runner.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+============================================================
+FILE: .\src\backtest\simulated_account.py
+============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+from src.utilities.logger import setup_logger
+
+"""
+src/backtest/simulated_account.py
+----------------------------------
+Tracks simulated cash, positions, and buying power as the backtest
+processes fills. This is the single source of truth for account state
+during a backtest run.
+
+Design rules:
+- All prices are per-share (options = per contract share, i.e. price * 100 for cost).
+- Positions are stored as a dict keyed by OSI symbol.
+- Buying power = cash (simplified: no margin model, options are cash-settled debit).
+- cost_basis on short positions is stored as negative (credit received).
+- market_value is recomputed each cycle from the current chain snapshot.
+"""
+
+
+logger = setup_logger("SimulatedAccount")
+
+
+@dataclass
+class SimulatedPosition:
+    symbol:         str
+    asset_class:    str           # "us_option"
+    underlying_symbol: str
+    qty:            float         # positive = long, negative = short
+    cost_basis:     float         # total cost basis (negative for credits received)
+    market_value:   float         # updated each cycle from chain
+    side:           str           # "long" | "short"
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a position dict in the same shape AlpacaBroker.get_positions() returns."""
+        return {
+            "symbol":           self.symbol,
+            "asset_class":      self.asset_class,
+            "underlying_symbol": self.underlying_symbol,
+            "qty":              str(self.qty),
+            "side":             self.side,
+            "cost_basis":       str(self.cost_basis),
+            "market_value":     str(self.market_value),
+        }
+
+
+@dataclass
+class SimulatedAccount:
+    """
+    Tracks cash and open positions for the backtest.
+
+    Buying power is modelled simply as cash. Options are assumed to be
+    cash-secured: buying a LEAP debits cash, selling a NEAR credits cash.
+
+    Slippage is applied at fill time: buys fill at ask, sells fill at bid.
+    This is conservative and realistic for SPY options.
+    """
+
+    initial_cash:   float
+    _cash:          float                             = field(init=False)
+    _positions:     Dict[str, SimulatedPosition]      = field(default_factory=dict, init=False)
+    _trade_log:     List[Dict[str, Any]]              = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        self._cash = self.initial_cash
+
+    # ------------------------------------------------------------------
+    # Public accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def cash(self) -> float:
+        return self._cash
+
+    @property
+    def equity(self) -> float:
+        """Cash + sum of all position market values."""
+        return self._cash + sum(p.market_value for p in self._positions.values())
+
+    @property
+    def option_buying_power(self) -> float:
+        """
+        Simplified: buying power = cash.
+        Short positions have already credited cash at fill time.
+        """
+        return max(0.0, self._cash)
+
+    def positions(self) -> List[Dict[str, Any]]:
+        return [p.as_dict() for p in self._positions.values()]
+
+    def trade_log(self) -> List[Dict[str, Any]]:
+        return list(self._trade_log)
+
+    # ------------------------------------------------------------------
+    # Fill processing
+    # ------------------------------------------------------------------
+
+    def fill_buy(
+        self,
+        *,
+        symbol:     str,
+        underlying: str,
+        qty:        int,
+        fill_price: float,   # per-share price (option premium)
+        date_str:   str,
+    ) -> bool:
+        """
+        Process a buy fill (BTO or BTC).
+
+        BTO: opens a new long position, debits cash.
+        BTC: closes an existing short position.
+
+        Returns True if the fill was accepted, False if insufficient cash.
+        """
+        total_cost = fill_price * qty * 100  # options = 100 shares per contract
+
+        if symbol in self._positions and self._positions[symbol].qty < 0:
+            # BTC — closing a short
+            pos = self._positions[symbol]
+            close_cost = fill_price * abs(qty) * 100
+            self._cash -= close_cost  # paying to close
+
+            new_qty = pos.qty + qty
+            if abs(new_qty) < 0.001:
+                # Fully closed
+                realized_pnl = abs(pos.cost_basis) - close_cost
+                logger.info(
+                    "BTC fill | symbol=%s qty=%d fill=%.2f cost=%.2f pnl=%.2f cash=%.2f",
+                    symbol, qty, fill_price, close_cost, realized_pnl, self._cash,
+                )
+                self._trade_log.append({
+                    "date": date_str, "action": "BTC", "symbol": symbol,
+                    "qty": qty, "fill_price": fill_price,
+                    "realized_pnl": realized_pnl,
+                })
+                del self._positions[symbol]
+            else:
+                pos.qty = new_qty
+                pos.cost_basis = pos.cost_basis * (new_qty / pos.qty)
+            return True
+
+        # BTO — opening a long
+        if total_cost > self._cash:
+            logger.warning(
+                "BTO rejected — insufficient cash | symbol=%s cost=%.2f cash=%.2f",
+                symbol, total_cost, self._cash,
+            )
+            return False
+
+        self._cash -= total_cost
+
+        if symbol in self._positions:
+            pos = self._positions[symbol]
+            pos.cost_basis -= total_cost  # debit
+            pos.qty        += qty
+        else:
+            self._positions[symbol] = SimulatedPosition(
+                symbol=symbol,
+                asset_class="us_option",
+                underlying_symbol=underlying,
+                qty=float(qty),
+                cost_basis=-total_cost,  # negative = debit paid
+                market_value=0.0,
+                side="long",
+            )
+
+        logger.info(
+            "BTO fill | symbol=%s qty=%d fill=%.2f cost=%.2f cash=%.2f",
+            symbol, qty, fill_price, total_cost, self._cash,
+        )
+        self._trade_log.append({
+            "date": date_str, "action": "BTO", "symbol": symbol,
+            "qty": qty, "fill_price": fill_price, "cost": total_cost,
+        })
+        return True
+
+    def fill_sell(
+        self,
+        *,
+        symbol:     str,
+        underlying: str,
+        qty:        int,
+        fill_price: float,
+        date_str:   str,
+    ) -> bool:
+        """
+        Process a sell fill (STO or STC).
+
+        STO: opens a new short position, credits cash.
+        STC: closes an existing long position.
+
+        Returns True always (sells are always accepted — you own what you sell).
+        """
+        total_credit = fill_price * qty * 100
+
+        if symbol in self._positions and self._positions[symbol].qty > 0:
+            # STC — closing a long
+            pos = self._positions[symbol]
+            self._cash += total_credit
+
+            new_qty = pos.qty - qty
+            realized_pnl = total_credit + pos.cost_basis  # cost_basis is negative
+            if abs(new_qty) < 0.001:
+                logger.info(
+                    "STC fill | symbol=%s qty=%d fill=%.2f credit=%.2f pnl=%.2f cash=%.2f",
+                    symbol, qty, fill_price, total_credit, realized_pnl, self._cash,
+                )
+                self._trade_log.append({
+                    "date": date_str, "action": "STC", "symbol": symbol,
+                    "qty": qty, "fill_price": fill_price,
+                    "realized_pnl": realized_pnl,
+                })
+                del self._positions[symbol]
+            else:
+                pos.qty = new_qty
+            return True
+
+        # STO — opening a short
+        self._cash += total_credit
+
+        if symbol in self._positions:
+            pos = self._positions[symbol]
+            pos.cost_basis += total_credit  # credit received
+            pos.qty        -= qty
+        else:
+            self._positions[symbol] = SimulatedPosition(
+                symbol=symbol,
+                asset_class="us_option",
+                underlying_symbol=underlying,
+                qty=float(-qty),
+                cost_basis=total_credit,   # positive = credit received
+                market_value=0.0,
+                side="short",
+            )
+
+        logger.info(
+            "STO fill | symbol=%s qty=%d fill=%.2f credit=%.2f cash=%.2f",
+            symbol, qty, fill_price, total_credit, self._cash,
+        )
+        self._trade_log.append({
+            "date": date_str, "action": "STO", "symbol": symbol,
+            "qty": qty, "fill_price": fill_price, "credit": total_credit,
+        })
+        return True
+
+    def update_market_values(self, prices: Dict[str, float]) -> None:
+        """
+        Update market_value on all open positions from current chain prices.
+        prices: { osi_symbol -> current_mid_price }
+        """
+        for sym, pos in self._positions.items():
+            price = prices.get(sym)
+            if price is not None:
+                pos.market_value = price * abs(pos.qty) * 100 * (
+                    1 if pos.qty > 0 else -1
+                )
+
+    def summary(self, date_str: str) -> Dict[str, Any]:
+        return {
+            "date":              date_str,
+            "cash":              round(self._cash, 2),
+            "equity":            round(self.equity, 2),
+            "option_buying_power": round(self.option_buying_power, 2),
+            "open_positions":    len(self._positions),
+        }
+
+
+============================================================
+FILE: .\src\backtest\__init__.py
+============================================================
+
+
+
+============================================================
 FILE: .\src\brokers\alpaca_broker.py
 ============================================================
 
@@ -295,7 +1438,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import requests
 from requests import Session
@@ -754,6 +1897,32 @@ class BrokerFactoryFacade:
         logger.info("Broker built | type=%s", type(broker).__name__)
         return broker
 
+'''
+A factory is a design pattern that provides a way to create objects without specifying 
+the exact class of the object that will be created. In this implementation, the BrokerFactoryFacade 
+serves as a factory for creating broker instances based on the provided environment configuration. 
+It uses a registry of broker builders to construct the appropriate broker instance based on the broker name specified 
+in the environment configuration. This allows for flexibility and extensibility, as new brokers can be added by simply 
+registering new builders in the registry without modifying the factory facade itself.
+
+It also abstracts away the construction logic from the main application code, making it cleaner and more maintainable.
+
+The factory does not contain any broker-specific logic; it simply delegates the construction to the appropriate builder based on the configuration.
+It knows which builder to "call" based on the broker name, but it does not know how the builder constructs the broker.
+The builder in this case is the AlpacaBrokerBuilder, which knows how to construct an Alpaca broker instance from the environment configuration.
+It knows this because it implements the build method defined in the BrokerBuilderABC interface, which is called by the factory facade when building the broker.
+
+So the sequence is:
+- The main application code calls BrokerFactoryFacade.build_broker(env_cfg).
+- The factory facade retrieves the broker name from env_cfg and looks up the corresponding builder in the registry: "Hi, it's FactoryFacade. 
+I need to build a broker. Let me check the registry for the builder registered under the name specified in env_cfg."
+- The registry returns the appropriate builder (e.g., AlpacaBrokerBuilder).
+- The factory facade calls the build method of the retrieved builder, passing in the env_cfg.
+- The builder constructs and returns the broker instance, which is then returned by the factory facade to the main application code.
+This design allows for a clean separation of concerns and adheres to the Open/Closed Principle,
+as new brokers can be added without modifying existing code, and the factory facade remains unchanged regardless of how many brokers are added in the future.
+so: call factory -> factory looks up builder in registry -> factory calls builder.build(env_cfg) -> builder constructs and returns broker instance -> factory returns broker instance to caller.
+'''
 
 ============================================================
 FILE: .\src\brokers\interfaces.py
@@ -803,7 +1972,14 @@ class MarketDataProviderABC(ABC):
     ) -> List[Dict[str, Any]]:
         raise NotImplementedError
     
-
+'''
+The MarketDataProviderABC is an abstract base class that defines the interface for a market data provider.
+It includes methods for retrieving asset quotes, latest prices, daily bars, and option chains.
+By defining this interface, we can ensure that any concrete implementation of a market data provider will adhere to this contract 
+(i.e. implement all the required methods), which allows us to write code that depends on this interface without worrying about the 
+specific details of how the market data is retrieved. This promotes loose coupling and makes it easier to switch out different 
+market data providers or mock them for testing purposes,
+'''
     
 
 class ExecutionBrokerABC(ABC):
@@ -835,7 +2011,12 @@ class ExecutionBrokerABC(ABC):
     @abstractmethod
     def cancel_order(self, order_id: str) -> None:
         raise NotImplementedError
-
+'''
+The ExecutionBrokerABC is an abstract base class that defines the interface for an execution broker.
+It includes methods for retrieving account information such as equity, account snapshot, option buying power, positions, and open orders,
+as well as methods for submitting and canceling orders. By defining this interface, we can ensure that any concrete 
+implementation of an execution broker will adhere to this contract. 
+'''
 
 class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
     """Full broker — composition of market data + execution. Depend on the narrow interface where possible."""
@@ -1098,9 +2279,24 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    dte_threshold:   int
-    delta_threshold: float
-    profit_pct:      float
+    # NEAR management — any one condition triggers a roll.
+
+    # Roll NEAR when DTE falls to or below this value.
+    dte_threshold: int
+
+    # Roll NEAR when this fraction of original premium has been captured.
+    profit_pct: float
+
+    # Roll NEAR when spot >= near_strike * this value.
+    near_strike_proximity: float
+
+    # LEAP management.
+
+    # Roll LEAP when DTE falls to or below this value.
+    leap_dte_threshold: int
+
+    # Close entire spread when spot <= leap_strike * this value.
+    leap_strike_danger: float
 
 
 @dataclass(frozen=True)
@@ -1158,7 +2354,7 @@ class StrategySpec:
 # ===========================================================================
 # To add a new strategy:
 #   1. Define its config dataclass(es) above.
-#   2. Write a _parse_<name>_config(raw: dict) -> YourConfig function below.
+#   2. Write a _parse_<n>_config(raw: dict) -> YourConfig function below.
 #   3. Register it in _STRATEGY_CONFIG_PARSERS.
 #   4. That's it — load_app_config() needs no changes.
 #
@@ -1174,13 +2370,20 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
     p = raw.get("pmcc")
     if not p:
         return None
-    r = p["risk"]
+    r  = p["risk"]
+    ro = p["roll"]
     return PmccConfig(
         underlying_symbol=p["underlying_symbol"],
         max_units=int(p["max_units"]),
         leap=PmccLeapConfig(**p["leap"]),
         short=PmccShortConfig(**p["short"]),
-        roll=PmccRollConfig(**p["roll"]),
+        roll=PmccRollConfig(
+            dte_threshold=int(ro["dte_threshold"]),
+            profit_pct=float(ro["profit_pct"]),
+            near_strike_proximity=float(ro["near_strike_proximity"]),
+            leap_dte_threshold=int(ro["leap_dte_threshold"]),
+            leap_strike_danger=float(ro["leap_strike_danger"]),
+        ),
         liquidity=PmccLiquidityConfig(**p["liquidity"]),
         risk=PmccRiskConfig(
             max_buying_power_fraction=float(r["max_buying_power_fraction"]),
@@ -2833,18 +4036,26 @@ def _abs_qty(position: Dict[str, Any]) -> int:
 
 def _enrich_position(position: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return a copy of the position dict with two derived fields added:
-      underlying  — ticker from OSI (always a string, never None)
-      derived_dte — days to expiry from OSI (int, -1 if unparseable)
+    Return a copy of the position dict with derived fields added:
+      underlying    — ticker from OSI (always a string, never None)
+      derived_dte   — days to expiry from OSI (int, -1 if unparseable)
+      derived_strike — strike price as float (0.0 if unparseable)
 
     Every downstream caller reads these fields. No one re-derives from
     the raw OSI symbol outside this function.
     """
     osi = str(position.get("symbol", ""))
+    strike = 0.0
+    try:
+        from src.risk.pmcc_sizer import parse_osi
+        strike = float(parse_osi(osi).strike)
+    except Exception:
+        pass
     return {
         **position,
-        "underlying":  _underlying_from_osi(osi),
-        "derived_dte": _dte_from_osi(osi),
+        "underlying":     _underlying_from_osi(osi),
+        "derived_dte":    _dte_from_osi(osi),
+        "derived_strike": strike,
     }
 
 
@@ -3016,9 +4227,9 @@ class PmccStateClassifier:
     def _is_completing_mleg(order: Dict[str, Any]) -> bool:
         if str(order.get("order_class", "")).lower() != "mleg":
             return False
-        legs  = [l for l in (order.get("legs") or []) if isinstance(l, dict)]
-        buys  = [l for l in legs if str(l.get("side", "")).lower() == "buy"]
-        sells = [l for l in legs if str(l.get("side", "")).lower() == "sell"]
+        legs  = [leg for leg in (order.get("legs") or []) if isinstance(leg, dict)]
+        buys  = [leg for leg in legs if str(leg.get("side", "")).lower() == "buy"]
+        sells = [leg for leg in legs if str(leg.get("side", "")).lower() == "sell"]
         return len(buys) == 1 and len(sells) == 1
 
 ============================================================
@@ -3098,10 +4309,6 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return self._intents_entry(sym, snapshot)
 
         if holdings.state == PmccState.LEAP_ONLY:
-            # uncovered = number of LEAP contracts with no matching short NEAR.
-            # We sell one NEAR per uncovered contract.
-            # All uncovered contracts share the same LEAP position object (qty=N),
-            # so we use the same leap_position for strike reference each time.
             logger.info(
                 "PMCC LEAP_ONLY — selling %d NEAR(s) | symbol=%s",
                 holdings.uncovered, sym,
@@ -3130,21 +4337,27 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         """
         Declare which option chains we need BEFORE the full snapshot is built.
 
-        The orchestrator calls this on the pre-snapshot (positions + orders,
-        no chains). We classify state here so we only fetch what we actually
-        need — skipping the ~4s chain fetch entirely when covered and stable.
+        Called on the pre-snapshot (positions + orders + account data, no chains).
+        We classify state and evaluate all management conditions here using only
+        data already available — OSI-derived strikes/DTE, market_value, cost_basis,
+        and spot price — so we fetch chains only when there is real work to do.
 
-        Chain requirements by state:
-          FLAT      → leaps + shorts  (need both legs for a new entry)
-          LEAP_ONLY → shorts only     (have the LEAP, need to sell a NEAR)
-          COVERED   → shorts only IF a near is within roll DTE, else nothing
-          NEAR_ONLY → nothing         (close the near at market, no chain needed)
-          PENDING   → nothing         (order in-flight, skip everything)
+        Chain requirements:
+          PENDING   → nothing
+          NEAR_ONLY → nothing         (BTC uses known symbol, no chain needed)
+          FLAT      → leaps + shorts  (only if units < max_units AND buying power > 0)
+          LEAP_ONLY → shorts only
+          COVERED   → evaluated per condition, highest priority wins:
+                        LEAP danger        → nothing (all closes use known symbols)
+                        LEAP roll          → leaps + shorts (rebuild full spread)
+                        NEAR roll trigger  → shorts only
+                        no trigger         → nothing
         """
         sym       = self.config.underlying_symbol.strip().upper()
         today     = date.today()
         leap_cfg  = self.config.leap
         short_cfg = self.config.short
+        roll_cfg  = self.config.roll
 
         holdings = self._classifier.classify(
             underlying=sym,
@@ -3169,32 +4382,138 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             expiration_date_lte=today + timedelta(days=short_cfg.dte_max),
         )
 
+        # ------------------------------------------------------------------ #
+        # States that never need chains                                        #
+        # ------------------------------------------------------------------ #
+
         if holdings.state in (PmccState.PENDING, PmccState.NEAR_ONLY):
             logger.info(
-                "Chain fetch skipped — state=%s needs no chains | symbol=%s",
+                "Chain fetch skipped — state=%s | symbol=%s",
                 holdings.state.value, sym,
             )
             return []
 
+        # ------------------------------------------------------------------ #
+        # FLAT — entry only if capacity and capital exist                      #
+        # ------------------------------------------------------------------ #
+
         if holdings.state == PmccState.FLAT:
+            buying_power = snapshot.option_buying_power()
+
+            units_held = sum(
+                abs(int(float(p.get("qty") or 0)))
+                for p in snapshot.positions()
+                if str(p.get("asset_class", "")).lower() == "us_option"
+                and float(p.get("qty") or 0) > 0
+            )
+
+            if units_held >= self.config.max_units:
+                logger.info(
+                    "Chain fetch skipped — max_units reached (%d/%d) | symbol=%s",
+                    units_held, self.config.max_units, sym,
+                )
+                return []
+
+            if buying_power <= 0:
+                logger.info(
+                    "Chain fetch skipped — no buying power (%.2f) | symbol=%s",
+                    buying_power, sym,
+                )
+                return []
+
+            logger.info(
+                "FLAT — fetching leaps + shorts | symbol=%s units=%d/%d bp=%.2f",
+                sym, units_held, self.config.max_units, buying_power,
+            )
             return [leap_req, short_req]
+
+        # ------------------------------------------------------------------ #
+        # LEAP_ONLY — always need to sell a NEAR                              #
+        # ------------------------------------------------------------------ #
 
         if holdings.state == PmccState.LEAP_ONLY:
             return [short_req]
 
+        # ------------------------------------------------------------------ #
+        # COVERED — evaluate conditions in priority order.                     #
+        #                                                                      #
+        # Priority:                                                            #
+        #   1. LEAP danger  → close everything, no chains needed               #
+        #   2. LEAP roll    → leaps + shorts (full spread rebuild)             #
+        #   3. NEAR roll    → shorts only                                      #
+        #                                                                      #
+        # Higher priority preempts lower — LEAP action and independent NEAR   #
+        # rolls never fire in the same cycle.                                  #
+        # ------------------------------------------------------------------ #
+
         if holdings.state == PmccState.COVERED:
-            roll_needed = any(
-                (p.get("derived_dte") or 999) <= self.config.roll.dte_threshold
-                for p in holdings.near_positions
-            )
-            if roll_needed:
-                logger.info(
-                    "COVERED but near(s) within roll threshold — "
-                    "fetching shorts chain | symbol=%s", sym,
-                )
-                return [short_req]
+            spot = _get_spot(snapshot, sym)
+
+            # Priority 1: LEAP danger
+            for leap in holdings.leap_positions:
+                leap_strike = leap.get("derived_strike") or 0.0
+                if leap_strike > 0 and spot > 0:
+                    if (spot / leap_strike) <= roll_cfg.leap_strike_danger:
+                        logger.info(
+                            "Chain decision: LEAP danger close — spot %.2f <= %.1f%% "
+                            "of strike %.2f | symbol=%s leap=%s",
+                            spot, roll_cfg.leap_strike_danger * 100, leap_strike,
+                            sym, leap.get("symbol"),
+                        )
+                        # All closes use known symbols — no chains needed.
+                        return []
+
+            # Priority 2: LEAP roll
+            for leap in holdings.leap_positions:
+                leap_dte = leap.get("derived_dte") or 999
+                if leap_dte <= roll_cfg.leap_dte_threshold:
+                    logger.info(
+                        "Chain decision: LEAP roll — DTE %d <= %d | symbol=%s leap=%s",
+                        leap_dte, roll_cfg.leap_dte_threshold, sym, leap.get("symbol"),
+                    )
+                    # Need leaps to buy a new LEAP, shorts to re-sell a new NEAR.
+                    return [leap_req, short_req]
+
+            # Priority 3: NEAR roll — only evaluated if no LEAP action needed
+            for near in holdings.near_positions:
+                near_dte    = near.get("derived_dte") or 999
+                near_strike = near.get("derived_strike") or 0.0
+
+                if near_dte <= roll_cfg.dte_threshold:
+                    logger.info(
+                        "Chain decision: NEAR roll — DTE %d <= %d | symbol=%s near=%s",
+                        near_dte, roll_cfg.dte_threshold, sym, near.get("symbol"),
+                    )
+                    return [short_req]
+
+                cost_basis   = float(near.get("cost_basis")   or 0.0)
+                market_value = float(near.get("market_value") or 0.0)
+                if cost_basis < 0:
+                    premium_received = abs(cost_basis)
+                    current_cost     = abs(market_value)
+                    if premium_received > 0:
+                        profit_captured = (premium_received - current_cost) / premium_received
+                        if profit_captured >= roll_cfg.profit_pct:
+                            logger.info(
+                                "Chain decision: NEAR roll — profit %.1f%% >= %.1f%% "
+                                "| symbol=%s near=%s",
+                                profit_captured * 100, roll_cfg.profit_pct * 100,
+                                sym, near.get("symbol"),
+                            )
+                            return [short_req]
+
+                if near_strike > 0 and spot > 0:
+                    if (spot / near_strike) >= roll_cfg.near_strike_proximity:
+                        logger.info(
+                            "Chain decision: NEAR roll — spot %.2f >= %.1f%% of "
+                            "strike %.2f | symbol=%s near=%s",
+                            spot, roll_cfg.near_strike_proximity * 100, near_strike,
+                            sym, near.get("symbol"),
+                        )
+                        return [short_req]
+
             logger.info(
-                "COVERED, no roll needed — chain fetch skipped | symbol=%s", sym,
+                "COVERED, all positions stable — chain fetch skipped | symbol=%s", sym,
             )
             return []
 
@@ -3276,7 +4595,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             )
             return []
 
-        leap_strike: Optional[float] = None
+        leap_strike: Optional[float]    = None
         leap_expiry: Optional[datetime] = None
         if leap_position:
             try:
@@ -3319,46 +4638,264 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         holdings,
     ) -> List[TradeIntent]:
         """
-        Check each NEAR for roll triggers.
+        Emit intents for an existing COVERED position.
 
-        derived_dte is set by _enrich_position in the classifier — it is
-        derived from the OSI symbol and is the single source of truth for DTE.
-        Alpaca does not return a dte field on position objects.
+        Priority order — only one branch fires per cycle:
+          1. LEAP danger   → BTC all NEARs, STC all LEAPs
+          2. LEAP roll     → BTC all NEARs → STC old LEAP → BTO new LEAP → STO new NEAR
+          3. NEAR roll(s)  → BTC expiring NEAR → STO new NEAR (per near that triggers)
 
-        Delta-based rolling would require matching the position to a live
-        chain row. That requires chain data. We only fetch the shorts chain
-        when derived_dte indicates a roll is needed (see get_option_chain_requests).
-        Once fetched, we could match by symbol to get current delta — not yet
-        implemented; for now we roll on DTE only.
+        LEAP conditions preempt NEAR conditions. When the LEAP is being acted on,
+        NEARs are handled as part of that action — not independently.
         """
-        intents = []
+        roll_cfg = self.config.roll
+        spot     = _get_spot(snapshot, str(sym))
+        intents: List[TradeIntent] = []
+
+        # ------------------------------------------------------------------ #
+        # Priority 1: LEAP danger — close everything                          #
+        # ------------------------------------------------------------------ #
+
+        leap_danger = any(
+            (leap.get("derived_strike") or 0.0) > 0
+            and spot > 0
+            and (spot / (leap.get("derived_strike") or 1.0)) <= roll_cfg.leap_strike_danger
+            for leap in holdings.leap_positions
+        )
+
+        if leap_danger:
+            logger.warning(
+                "LEAP danger — closing entire spread | symbol=%s spot=%.2f", sym, spot,
+            )
+            # BTC all NEARs first — must be flat the short before closing the long.
+            for near in holdings.near_positions:
+                near_sym = str(near.get("symbol", ""))
+                if not near_sym:
+                    continue
+                intents.append(TradeIntent.create(
+                    strategy_id=self.strategy_id, symbol=sym,
+                    payload=OptionIntentPayload(
+                        underlying_symbol=sym,
+                        leg=SingleOptionLeg(
+                            contract_symbol=near_sym,
+                            position_intent=PositionIntent.BUY_TO_CLOSE,
+                            qty=abs(int(float(near.get("qty") or 1))),
+                        ),
+                    ),
+                    tags=("danger_close_near",),
+                ))
+            # STC all LEAPs.
+            for leap in holdings.leap_positions:
+                leap_sym = str(leap.get("symbol", ""))
+                if not leap_sym:
+                    continue
+                intents.append(TradeIntent.create(
+                    strategy_id=self.strategy_id, symbol=sym,
+                    payload=OptionIntentPayload(
+                        underlying_symbol=sym,
+                        leg=SingleOptionLeg(
+                            contract_symbol=leap_sym,
+                            position_intent=PositionIntent.SELL_TO_CLOSE,
+                            qty=abs(int(float(leap.get("qty") or 1))),
+                        ),
+                    ),
+                    tags=("danger_close_leap",),
+                ))
+            return intents
+
+        # ------------------------------------------------------------------ #
+        # Priority 2: LEAP roll                                               #
+        # Sequence: BTC all NEARs → STC old LEAP → BTO new LEAP → STO new NEAR
+        # ------------------------------------------------------------------ #
+
+        leap_needs_roll = any(
+            (leap.get("derived_dte") or 999) <= roll_cfg.leap_dte_threshold
+            for leap in holdings.leap_positions
+        )
+
+        if leap_needs_roll:
+            logger.info("LEAP roll — rebuilding entire spread | symbol=%s", sym)
+
+            chains    = snapshot.option_chains()
+            leap_key  = _find_key(chains, str(sym), "leaps")
+            short_key = _find_key(chains, str(sym), "shorts")
+
+            for leap in holdings.leap_positions:
+                leap_sym = str(leap.get("symbol", ""))
+                if not leap_sym:
+                    continue
+                qty = abs(int(float(leap.get("qty") or 1)))
+
+                # Step 1: BTC all NEARs paired with this LEAP
+                for near in holdings.near_positions:
+                    near_sym = str(near.get("symbol", ""))
+                    if not near_sym:
+                        continue
+                    intents.append(TradeIntent.create(
+                        strategy_id=self.strategy_id, symbol=sym,
+                        payload=OptionIntentPayload(
+                            underlying_symbol=sym,
+                            leg=SingleOptionLeg(
+                                contract_symbol=near_sym,
+                                position_intent=PositionIntent.BUY_TO_CLOSE,
+                                qty=abs(int(float(near.get("qty") or 1))),
+                            ),
+                        ),
+                        tags=("leap_roll_btc_near",),
+                    ))
+
+                # Step 2: STC the expiring LEAP
+                intents.append(TradeIntent.create(
+                    strategy_id=self.strategy_id, symbol=sym,
+                    payload=OptionIntentPayload(
+                        underlying_symbol=sym,
+                        leg=SingleOptionLeg(
+                            contract_symbol=leap_sym,
+                            position_intent=PositionIntent.SELL_TO_CLOSE,
+                            qty=qty,
+                        ),
+                    ),
+                    tags=("leap_roll_stc",),
+                ))
+
+                # Step 3: BTO new LEAP
+                if leap_key:
+                    new_leap = self._selector.select_leap(
+                        str(sym), list(chains[leap_key]), spot,
+                    )
+                    if new_leap:
+                        logger.info(
+                            "LEAP roll — new LEAP selected | symbol=%s new=%s",
+                            sym, new_leap.option_symbol,
+                        )
+                        intents.append(TradeIntent.create(
+                            strategy_id=self.strategy_id, symbol=sym,
+                            payload=OptionIntentPayload(
+                                underlying_symbol=sym,
+                                leg=SingleOptionLeg(
+                                    contract_symbol=new_leap.option_symbol,
+                                    position_intent=PositionIntent.BUY_TO_OPEN,
+                                    qty=qty,
+                                ),
+                            ),
+                            tags=("leap_roll_bto",),
+                        ))
+
+                        # Step 4: STO new NEAR against the new LEAP
+                        if short_key:
+                            new_near = self._selector.select_near(
+                                str(sym), list(chains[short_key]),
+                                float(new_leap.contract.strike),
+                                spot_price=spot,
+                                leap_expiry=new_leap.contract.expiry,
+                            )
+                            if new_near:
+                                logger.info(
+                                    "LEAP roll — new NEAR selected | symbol=%s new=%s",
+                                    sym, new_near.option_symbol,
+                                )
+                                intents.append(TradeIntent.create(
+                                    strategy_id=self.strategy_id, symbol=sym,
+                                    payload=OptionIntentPayload(
+                                        underlying_symbol=sym,
+                                        leg=SingleOptionLeg(
+                                            contract_symbol=new_near.option_symbol,
+                                            position_intent=PositionIntent.SELL_TO_OPEN,
+                                            qty=qty,
+                                        ),
+                                    ),
+                                    tags=("leap_roll_sto_near",),
+                                ))
+                            else:
+                                logger.warning(
+                                    "LEAP roll — no new NEAR found; will re-sell next cycle "
+                                    "| symbol=%s", sym,
+                                )
+                        else:
+                            logger.warning(
+                                "LEAP roll — shorts chain missing; cannot re-sell NEAR "
+                                "| symbol=%s", sym,
+                            )
+                    else:
+                        logger.warning(
+                            "LEAP roll — no new LEAP found in chain | symbol=%s", sym,
+                        )
+                else:
+                    logger.warning(
+                        "LEAP roll — leaps chain missing from snapshot | symbol=%s", sym,
+                    )
+
+            # LEAP roll owns the NEARs — do not fall through to NEAR roll logic.
+            return intents
+
+        # ------------------------------------------------------------------ #
+        # Priority 3: NEAR roll(s)                                            #
+        # Only reached when no LEAP action was needed this cycle.             #
+        # ------------------------------------------------------------------ #
+
         for near in holdings.near_positions:
-            near_sym = str(near.get("symbol", ""))
+            near_sym    = str(near.get("symbol", ""))
+            near_dte    = near.get("derived_dte") or 999
+            near_strike = near.get("derived_strike") or 0.0
             if not near_sym:
                 continue
 
-            dte = near.get("derived_dte")
+            roll_near = False
+            reason    = ""
 
-            if dte is not None and dte <= self.config.roll.dte_threshold:
+            # Condition 1: DTE
+            if near_dte <= roll_cfg.dte_threshold:
+                roll_near = True
+                reason    = f"DTE {near_dte} <= {roll_cfg.dte_threshold}"
+
+            # Condition 2: Profit target
+            # cost_basis is negative (credit received when short).
+            # market_value is the current mark (also negative when short).
+            if not roll_near:
+                cost_basis   = float(near.get("cost_basis")   or 0.0)
+                market_value = float(near.get("market_value") or 0.0)
+                if cost_basis < 0:
+                    premium_received = abs(cost_basis)
+                    current_cost     = abs(market_value)
+                    if premium_received > 0:
+                        profit_captured = (premium_received - current_cost) / premium_received
+                        if profit_captured >= roll_cfg.profit_pct:
+                            roll_near = True
+                            reason    = (
+                                f"profit {profit_captured:.1%} >= {roll_cfg.profit_pct:.1%}"
+                            )
+
+            # Condition 3: Spot proximity to NEAR strike
+            if not roll_near and near_strike > 0 and spot > 0:
+                if (spot / near_strike) >= roll_cfg.near_strike_proximity:
+                    roll_near = True
+                    reason    = (
+                        f"spot {spot:.2f} >= {roll_cfg.near_strike_proximity:.1%} "
+                        f"of strike {near_strike:.2f}"
+                    )
+
+            if not roll_near:
                 logger.info(
-                    "Rolling NEAR — DTE %d <= threshold %d | symbol=%s near=%s",
-                    dte, self.config.roll.dte_threshold, sym, near_sym,
+                    "NEAR stable | symbol=%s near=%s dte=%d", sym, near_sym, near_dte,
                 )
-                leap_expiry: Optional[datetime] = None
-                if holdings.leap_position:
-                    try:
-                        from src.risk.pmcc_sizer import parse_osi
-                        leap_expiry = parse_osi(
-                            str(holdings.leap_position.get("symbol", ""))
-                        ).expiry
-                    except Exception:
-                        pass
-                intents.extend(self._intents_roll_near(sym, near_sym, snapshot, leap_expiry))
-            else:
-                logger.info(
-                    "NEAR stable — no roll needed | symbol=%s near=%s dte=%s threshold=%d",
-                    sym, near_sym, dte, self.config.roll.dte_threshold,
-                )
+                continue
+
+            logger.info(
+                "Rolling NEAR | symbol=%s near=%s reason=%s", sym, near_sym, reason,
+            )
+            leap_expiry: Optional[datetime] = None
+            if holdings.leap_position:
+                try:
+                    from src.risk.pmcc_sizer import parse_osi
+                    leap_expiry = parse_osi(
+                        str(holdings.leap_position.get("symbol", ""))
+                    ).expiry
+                except Exception:
+                    pass
+            intents.extend(
+                self._intents_roll_near(sym, near_sym, snapshot, leap_expiry)
+            )
+
         return intents
 
     def _intents_roll_near(

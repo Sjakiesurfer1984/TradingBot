@@ -217,69 +217,109 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        Fetch the full EOD option chain snapshot for the given date, then
+        filter client-side.
+
+        Alpaca's historical snapshot endpoint (/v1beta1/options/snapshots/{sym}
+        with ?date=YYYY-MM-DD) does NOT support expiration_date_gte /
+        expiration_date_lte as query parameters — it returns 400 if you send
+        them. The live endpoint does support them. We handle this by fetching
+        the full chain (paginated) and filtering in Python.
+
+        The full SPY chain for one date is ~5,000-8,000 contracts. We cache
+        the raw full chain keyed by (sym, date, type) so that the leaps and
+        shorts requests within the same cycle share one HTTP fetch.
+        """
         sym = underlying.strip().upper()
         url = f"{_OPTION_BASE}/options/snapshots/{sym}"
 
+        # Only send params the historical endpoint actually supports.
         params: Dict[str, Any] = {
             "feed": "indicative",
-            # Historical EOD snapshot — pass the date so Alpaca returns
-            # end-of-day data rather than live quotes.
             "date": self._current_date.isoformat(),
         }
-
         if include_calls and not include_puts:
             params["type"] = "call"
         elif include_puts and not include_calls:
             params["type"] = "put"
-        if expiration_date is not None:
-            params["expiration_date"] = expiration_date.isoformat()
-        if expiration_date_gte is not None:
-            params["expiration_date_gte"] = expiration_date_gte.isoformat()
-        if expiration_date_lte is not None:
-            params["expiration_date_lte"] = expiration_date_lte.isoformat()
-        if strike_price_gte is not None:
-            params["strike_price_gte"] = strike_price_gte
-        if strike_price_lte is not None:
-            params["strike_price_lte"] = strike_price_lte
-        if root_symbol:
-            params["root_symbol"] = root_symbol.strip().upper()
 
-        # Cache key — same params within a cycle reuse the cached result.
-        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}:" \
-                    f"{params.get('expiration_date_gte','')}:{params.get('expiration_date_lte','')}"
-        if cache_key in self._chain_cache:
+        # Cache the full raw chain — both the leaps and shorts requests
+        # within one cycle hit the same underlying fetch.
+        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}"
+        if cache_key not in self._chain_cache:
+            raw_chain: List[Dict[str, Any]] = []
+            next_page: Optional[str] = None
+            while True:
+                p = dict(params)
+                if next_page:
+                    p["page_token"] = next_page
+                data = self._get(url, params=p)
+                if not isinstance(data, dict):
+                    raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
+                for contract_sym, snap in (data.get("snapshots") or {}).items():
+                    if isinstance(snap, dict):
+                        row = dict(snap)
+                        row["contract_symbol"] = contract_sym
+                        raw_chain.append(row)
+                nxt = data.get("next_page_token")
+                next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
+                if not next_page:
+                    break
+            logger.info(
+                "Historical chain fetched | sym=%s date=%s contracts=%d",
+                sym, self._current_date, len(raw_chain),
+            )
+            self._chain_cache[cache_key] = raw_chain
+        else:
             logger.info("Chain cache hit | key=%s", cache_key)
-            return self._chain_cache[cache_key]
 
-        chain: List[Dict[str, Any]] = []
-        next_page: Optional[str] = None
+        chain = self._chain_cache[cache_key]
 
-        while True:
-            p = dict(params)
-            if next_page:
-                p["page_token"] = next_page
-            data = self._get(url, params=p)
-            if not isinstance(data, dict):
-                raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
-            for contract_sym, snap in (data.get("snapshots") or {}).items():
-                if isinstance(snap, dict):
-                    row = dict(snap)
-                    row["contract_symbol"] = contract_sym
-                    chain.append(row)
-                    if 0 < limit <= len(chain):
-                        self._chain_cache[cache_key] = chain
-                        return chain
-            nxt = data.get("next_page_token")
-            next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
-            if not next_page:
+        # ----------------------------------------------------------------
+        # Client-side filtering — mirrors what the live endpoint does
+        # server-side. Applied after the cache so repeated calls with
+        # different filters reuse the same HTTP fetch.
+        # ----------------------------------------------------------------
+        from src.risk.pmcc_sizer import parse_osi
+
+        filtered = []
+        for row in chain:
+            sym_str = str(row.get("contract_symbol", "")).strip().upper()
+            if not sym_str:
+                continue
+            try:
+                parsed = parse_osi(sym_str)
+            except ValueError:
+                continue
+
+            exp = parsed.expiry.date()
+
+            if expiration_date is not None and exp != expiration_date:
+                continue
+            if expiration_date_gte is not None and exp < expiration_date_gte:
+                continue
+            if expiration_date_lte is not None and exp > expiration_date_lte:
+                continue
+
+            strike = float(parsed.strike)
+            if strike_price_gte is not None and strike < strike_price_gte:
+                continue
+            if strike_price_lte is not None and strike > strike_price_lte:
+                continue
+
+            filtered.append(row)
+
+            if 0 < limit <= len(filtered):
                 break
 
         logger.info(
-            "Historical chain fetched | sym=%s date=%s contracts=%d",
-            sym, self._current_date, len(chain),
+            "Chain filtered | sym=%s date=%s total=%d filtered=%d "
+            "expiry=[%s → %s]",
+            sym, self._current_date, len(chain), len(filtered),
+            expiration_date_gte, expiration_date_lte,
         )
-        self._chain_cache[cache_key] = chain
-        return chain
+        return filtered
 
     # ------------------------------------------------------------------
     # Fill simulation
