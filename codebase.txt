@@ -39,11 +39,7 @@ FILE: .\config\config.yaml
 strategies:
   - name: pmcc
     pmcc:
-      # The underlying equity symbol this PMCC strategy trades on.
       underlying_symbol: SPY
-
-      # Maximum number of simultaneous PMCC spreads (LEAP + NEAR pairs) to hold.
-      # Each "unit" = 1 long LEAP call + 1 short NEAR call.
       max_units: 5
 
       leap:
@@ -57,29 +53,10 @@ strategies:
         target_delta: 0.20
 
       roll:
-        # NEAR management — any one condition triggers a roll.
-
-        # Roll NEAR when DTE falls to or below this value.
         dte_threshold: 14
-
-        # Roll NEAR when this fraction of the original premium has been captured.
-        # e.g. 0.50 = roll when 50% of premium is gone. Higher = more patient.
         profit_pct: 0.50
-
-        # Roll NEAR when spot reaches this fraction of the NEAR strike.
-        # e.g. 0.95 = roll when spot is within 3% of the strike.
-        # Lower = more aggressive protection; higher = more tolerant of ITM risk.
         near_strike_proximity: 0.95
-
-        # LEAP management — any one condition triggers action.
-
-        # Roll LEAP when DTE falls to or below this value.
-        # At this point theta acceleration makes the LEAP an ineffective hedge.
         leap_dte_threshold: 90
-
-        # Close the entire spread when spot falls to or below this fraction of
-        # the LEAP strike. The LEAP is going deep OTM and the structure is broken.
-        # e.g. 0.90 = close when spot is 10% below the LEAP strike.
         leap_strike_danger: 0.90
 
       liquidity:
@@ -93,15 +70,15 @@ strategies:
         slippage_factor: 1.05
         ignore_spread_checks: false
 
-# ---------------------------------------------------------------------------
-# Set to true to run the full cycle (positions, signals, sizing) but skip
-# all order submission. Nothing will be sent to the broker.
-# Use this whenever you're testing logic changes on a live account.
-# ---------------------------------------------------------------------------
 default_dry_run: true
-
-# How long to wait between cycles, in seconds.
 cycle_seconds: 60
+
+backtest:
+  initial_cash: 100000
+  start_date: "2025-02-24"
+  end_date:  "2025-03-02" #"2022-02-24"
+  output_dir: backtest_results
+  log_mode: verbose # progress # None
 
 ============================================================
 FILE: .\src\__init__.py
@@ -531,69 +508,109 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        Fetch the full EOD option chain snapshot for the given date, then
+        filter client-side.
+
+        Alpaca's historical snapshot endpoint (/v1beta1/options/snapshots/{sym}
+        with ?date=YYYY-MM-DD) does NOT support expiration_date_gte /
+        expiration_date_lte as query parameters — it returns 400 if you send
+        them. The live endpoint does support them. We handle this by fetching
+        the full chain (paginated) and filtering in Python.
+
+        The full SPY chain for one date is ~5,000-8,000 contracts. We cache
+        the raw full chain keyed by (sym, date, type) so that the leaps and
+        shorts requests within the same cycle share one HTTP fetch.
+        """
         sym = underlying.strip().upper()
         url = f"{_OPTION_BASE}/options/snapshots/{sym}"
 
+        # Only send params the historical endpoint actually supports.
         params: Dict[str, Any] = {
             "feed": "indicative",
-            # Historical EOD snapshot — pass the date so Alpaca returns
-            # end-of-day data rather than live quotes.
             "date": self._current_date.isoformat(),
         }
-
         if include_calls and not include_puts:
             params["type"] = "call"
         elif include_puts and not include_calls:
             params["type"] = "put"
-        if expiration_date is not None:
-            params["expiration_date"] = expiration_date.isoformat()
-        if expiration_date_gte is not None:
-            params["expiration_date_gte"] = expiration_date_gte.isoformat()
-        if expiration_date_lte is not None:
-            params["expiration_date_lte"] = expiration_date_lte.isoformat()
-        if strike_price_gte is not None:
-            params["strike_price_gte"] = strike_price_gte
-        if strike_price_lte is not None:
-            params["strike_price_lte"] = strike_price_lte
-        if root_symbol:
-            params["root_symbol"] = root_symbol.strip().upper()
 
-        # Cache key — same params within a cycle reuse the cached result.
-        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}:" \
-                    f"{params.get('expiration_date_gte','')}:{params.get('expiration_date_lte','')}"
-        if cache_key in self._chain_cache:
+        # Cache the full raw chain — both the leaps and shorts requests
+        # within one cycle hit the same underlying fetch.
+        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}"
+        if cache_key not in self._chain_cache:
+            raw_chain: List[Dict[str, Any]] = []
+            next_page: Optional[str] = None
+            while True:
+                p = dict(params)
+                if next_page:
+                    p["page_token"] = next_page
+                data = self._get(url, params=p)
+                if not isinstance(data, dict):
+                    raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
+                for contract_sym, snap in (data.get("snapshots") or {}).items():
+                    if isinstance(snap, dict):
+                        row = dict(snap)
+                        row["contract_symbol"] = contract_sym
+                        raw_chain.append(row)
+                nxt = data.get("next_page_token")
+                next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
+                if not next_page:
+                    break
+            logger.info(
+                "Historical chain fetched | sym=%s date=%s contracts=%d",
+                sym, self._current_date, len(raw_chain),
+            )
+            self._chain_cache[cache_key] = raw_chain
+        else:
             logger.info("Chain cache hit | key=%s", cache_key)
-            return self._chain_cache[cache_key]
 
-        chain: List[Dict[str, Any]] = []
-        next_page: Optional[str] = None
+        chain = self._chain_cache[cache_key]
 
-        while True:
-            p = dict(params)
-            if next_page:
-                p["page_token"] = next_page
-            data = self._get(url, params=p)
-            if not isinstance(data, dict):
-                raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
-            for contract_sym, snap in (data.get("snapshots") or {}).items():
-                if isinstance(snap, dict):
-                    row = dict(snap)
-                    row["contract_symbol"] = contract_sym
-                    chain.append(row)
-                    if 0 < limit <= len(chain):
-                        self._chain_cache[cache_key] = chain
-                        return chain
-            nxt = data.get("next_page_token")
-            next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
-            if not next_page:
+        # ----------------------------------------------------------------
+        # Client-side filtering — mirrors what the live endpoint does
+        # server-side. Applied after the cache so repeated calls with
+        # different filters reuse the same HTTP fetch.
+        # ----------------------------------------------------------------
+        from src.risk.pmcc_sizer import parse_osi
+
+        filtered = []
+        for row in chain:
+            sym_str = str(row.get("contract_symbol", "")).strip().upper()
+            if not sym_str:
+                continue
+            try:
+                parsed = parse_osi(sym_str)
+            except ValueError:
+                continue
+
+            exp = parsed.expiry.date()
+
+            if expiration_date is not None and exp != expiration_date:
+                continue
+            if expiration_date_gte is not None and exp < expiration_date_gte:
+                continue
+            if expiration_date_lte is not None and exp > expiration_date_lte:
+                continue
+
+            strike = float(parsed.strike)
+            if strike_price_gte is not None and strike < strike_price_gte:
+                continue
+            if strike_price_lte is not None and strike > strike_price_lte:
+                continue
+
+            filtered.append(row)
+
+            if 0 < limit <= len(filtered):
                 break
 
         logger.info(
-            "Historical chain fetched | sym=%s date=%s contracts=%d",
-            sym, self._current_date, len(chain),
+            "Chain filtered | sym=%s date=%s total=%d filtered=%d "
+            "expiry=[%s → %s]",
+            sym, self._current_date, len(chain), len(filtered),
+            expiration_date_gte, expiration_date_lte,
         )
-        self._chain_cache[cache_key] = chain
-        return chain
+        return filtered
 
     # ------------------------------------------------------------------
     # Fill simulation
@@ -782,6 +799,7 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
             ticker.append(ch)
         return "".join(ticker)
 
+
 ============================================================
 FILE: .\src\backtest\backtest_runner.py
 ============================================================
@@ -790,37 +808,23 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.orchestration.orchestrator_interface import CycleRunResult
 from src.utilities.logger import setup_logger
 
-
-"""
-src/backtest/backtest_runner.py
---------------------------------
-Steps through a date range, calling orchestrator.run_cycle() once per
-trading day. Collects per-cycle results and produces a final summary.
-
-The runner owns the date iteration and hands off to the orchestrator
-exactly as the live Scheduler does — the orchestrator never knows it's
-in a backtest. This is the point: we test the real code, not a replica.
-
-Usage:
-    See run_backtest.py for the entry point.
-"""
-
-
-
 logger = setup_logger("BacktestRunner")
 
-# US market holidays (update annually).
-# A minimal set — any date in here is skipped.
+# ---------------------------------------------------------------------------
+# US market holidays — update annually
+# ---------------------------------------------------------------------------
 _HOLIDAYS: set = {
     # 2023
     date(2023, 1, 2), date(2023, 1, 16), date(2023, 2, 20), date(2023, 4, 7),
@@ -834,6 +838,10 @@ _HOLIDAYS: set = {
     date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
     date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
     date(2025, 11, 27), date(2025, 12, 25),
+    # 2026
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
 }
 
 
@@ -842,8 +850,7 @@ def _is_trading_day(d: date) -> bool:
 
 
 def _trading_days(start: date, end: date) -> List[date]:
-    days = []
-    current = start
+    days, current = [], start
     while current <= end:
         if _is_trading_day(current):
             days.append(current)
@@ -851,71 +858,123 @@ def _trading_days(start: date, end: date) -> List[date]:
     return days
 
 
+# ---------------------------------------------------------------------------
+# Per-day result
+# ---------------------------------------------------------------------------
+
 @dataclass
 class DayResult:
-    date:               str
-    cycle_result:       CycleRunResult
-    equity:             float
-    cash:               float
+    date:                str
+    cycle_result:        CycleRunResult
+    equity:              float
+    cash:                float
     option_buying_power: float
-    open_positions:     int
+    open_positions:      int
 
+
+# ---------------------------------------------------------------------------
+# Progress bar — pure stdlib, no tqdm dependency
+# ---------------------------------------------------------------------------
+
+def _progress(current: int, total: int, width: int = 40) -> str:
+    filled = int(width * current / total) if total else 0
+    bar    = "█" * filled + "░" * (width - filled)
+    pct    = 100 * current / total if total else 0
+    return f"\r[{bar}] {pct:5.1f}%  {current}/{total}"
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BacktestRunner:
-    orchestrator:  TradingOrchestrator
-    broker:        AlpacaHistoricalBroker
-    start_date:    date
-    end_date:      date
-    output_dir:    Path = Path("backtest_results")
+    orchestrator: TradingOrchestrator
+    broker:       AlpacaHistoricalBroker
+    start_date:   date
+    end_date:     date
+    output_dir:   Path  = Path("backtest_results")
+    log_mode:     str   = "progress"   # "progress" | "verbose"
 
-    _day_results:  List[DayResult] = field(default_factory=list, init=False)
+    _day_results: List[DayResult] = field(default_factory=list, init=False)
 
     def run(self) -> List[DayResult]:
-        days = _trading_days(self.start_date, self.end_date)
+        days  = _trading_days(self.start_date, self.end_date)
+        total = len(days)
+
         logger.info(
             "Backtest starting | from=%s to=%s trading_days=%d",
-            self.start_date, self.end_date, len(days),
+            self.start_date, self.end_date, total,
         )
 
-        for d in days:
-            logger.info("--- Cycle date=%s ---", d.isoformat())
+        # In progress mode suppress all INFO logs from noisy internal loggers
+        # so the terminal only shows the progress bar and final summary.
+        _silenced: List[logging.Logger] = []
+        if self.log_mode == "progress":
+            _noisy = [
+                "CycleSnapshotBuilder", "PmccStateClassifier", "PmccStrategy",
+                "PmccContractSelector", "AlpacaHistoricalBroker", "TradingOrchestrator",
+                "RiskEngine", "BrokerBase", "SimulatedAccount",
+            ]
+            for name in _noisy:
+                lg = logging.getLogger(name)
+                lg.setLevel(logging.WARNING)
+                _silenced.append(lg)
 
-            # Point the broker at today's date before the cycle runs.
-            self.broker.set_date(d)
+        try:
+            for i, d in enumerate(days):
+                self.broker.set_date(d)
 
-            try:
-                result = self.orchestrator.run_cycle()
-            except Exception:
-                logger.exception("Cycle failed | date=%s — continuing", d.isoformat())
-                result = CycleRunResult(
-                    orders_submitted=0,
-                    intents_generated=0,
-                    intents_approved=0,
-                    intents_rejected=0,
+                try:
+                    result = self.orchestrator.run_cycle()
+                except Exception as exc:
+                    if self.log_mode == "verbose":
+                        logger.exception("Cycle failed | date=%s", d.isoformat())
+                    result = CycleRunResult(
+                        orders_submitted=0,
+                        intents_generated=0,
+                        intents_approved=0,
+                        intents_rejected=0,
+                    )
+
+                self.broker.update_position_market_values()
+
+                summary    = self.broker.account.summary(d.isoformat())
+                day_result = DayResult(
+                    date=d.isoformat(),
+                    cycle_result=result,
+                    equity=summary["equity"],
+                    cash=summary["cash"],
+                    option_buying_power=summary["option_buying_power"],
+                    open_positions=summary["open_positions"],
                 )
+                self._day_results.append(day_result)
 
-            # Revalue positions at EOD prices now that chain data is cached.
-            self.broker.update_position_market_values()
+                if self.log_mode == "verbose":
+                    logger.info(
+                        "Day complete | date=%s equity=%.2f cash=%.2f "
+                        "positions=%d submitted=%d approved=%d rejected=%d",
+                        d.isoformat(),
+                        day_result.equity, day_result.cash, day_result.open_positions,
+                        result.orders_submitted, result.intents_approved, result.intents_rejected,
+                    )
+                else:
+                    # Inline progress bar — overwrites same line each tick
+                    sys.stdout.write(
+                        _progress(i + 1, total)
+                        + f"  equity=${day_result.equity:,.0f}  "
+                        f"pos={day_result.open_positions}"
+                    )
+                    sys.stdout.flush()
 
-            summary = self.broker.account.summary(d.isoformat())
-            day_result = DayResult(
-                date=d.isoformat(),
-                cycle_result=result,
-                equity=summary["equity"],
-                cash=summary["cash"],
-                option_buying_power=summary["option_buying_power"],
-                open_positions=summary["open_positions"],
-            )
-            self._day_results.append(day_result)
+        finally:
+            # Restore log levels regardless of how we exit
+            for lg in _silenced:
+                lg.setLevel(logging.DEBUG)
 
-            logger.info(
-                "Day complete | date=%s equity=%.2f cash=%.2f positions=%d "
-                "submitted=%d approved=%d rejected=%d",
-                d.isoformat(),
-                day_result.equity, day_result.cash, day_result.open_positions,
-                result.orders_submitted, result.intents_approved, result.intents_rejected,
-            )
+        if self.log_mode == "progress":
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         self._write_results()
         self._print_summary()
@@ -928,7 +987,6 @@ class BacktestRunner:
     def _write_results(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Daily equity curve CSV
         csv_path = self.output_dir / "equity_curve.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
@@ -941,7 +999,7 @@ class BacktestRunner:
                 writer.writerow({
                     "date":                r.date,
                     "equity":              r.equity,
-                    "cash":               r.cash,
+                    "cash":                r.cash,
                     "option_buying_power": r.option_buying_power,
                     "open_positions":      r.open_positions,
                     "orders_submitted":    r.cycle_result.orders_submitted,
@@ -950,7 +1008,6 @@ class BacktestRunner:
                 })
         logger.info("Equity curve written | path=%s", csv_path)
 
-        # Trade log JSON
         trade_log_path = self.output_dir / "trade_log.json"
         with open(trade_log_path, "w") as f:
             json.dump(self.broker.account.trade_log(), f, indent=2)
@@ -965,28 +1022,300 @@ class BacktestRunner:
         trades = len(self.broker.account.trade_log())
 
         total_return = (last.equity - first.equity) / first.equity * 100
-        # Annualised return (approximate)
-        ann_return = total_return * (252 / days) if days > 0 else 0.0
+        ann_return   = total_return * (252 / days) if days > 0 else 0.0
 
-        # Max drawdown
-        peak = first.equity
+        peak   = first.equity
         max_dd = 0.0
         for r in self._day_results:
-            peak = max(peak, r.equity)
-            dd   = (peak - r.equity) / peak * 100
-            max_dd = max(max_dd, dd)
+            peak  = max(peak, r.equity)
+            max_dd = max(max_dd, (peak - r.equity) / peak * 100)
 
-        logger.info("=" * 60)
-        logger.info("BACKTEST SUMMARY")
-        logger.info("  Period:          %s → %s (%d days)", first.date, last.date, days)
-        logger.info("  Start equity:    $%.2f", first.equity)
-        logger.info("  End equity:      $%.2f", last.equity)
-        logger.info("  Total return:    %.2f%%", total_return)
-        logger.info("  Ann. return:     %.2f%%", ann_return)
-        logger.info("  Max drawdown:    %.2f%%", max_dd)
-        logger.info("  Total trades:    %d", trades)
-        logger.info("=" * 60)
+        print("\n" + "=" * 60)
+        print("  BACKTEST SUMMARY")
+        print(f"  Period:        {first.date} → {last.date}  ({days} days)")
+        print(f"  Start equity:  ${first.equity:>12,.2f}")
+        print(f"  End equity:    ${last.equity:>12,.2f}")
+        print(f"  Total return:  {total_return:+.2f}%")
+        print(f"  Ann. return:   {ann_return:+.2f}%")
+        print(f"  Max drawdown:  {max_dd:.2f}%")
+        print(f"  Total trades:  {trades}")
+        print("=" * 60)
 
+============================================================
+FILE: .\src\backtest\backtest_snapshot_builder.py
+============================================================
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import List
+
+from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
+from src.domain.types import OptionChainRequest, Symbol
+from src.orchestration.cycle_snapshot import CycleSnapshot
+from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+
+
+class BacktestSnapshotBuilder(CycleSnapshotBuilder):
+    """
+    CycleSnapshotBuilder variant for backtesting.
+
+    The only difference from the live builder: as_of_utc is stamped with
+    the broker's current backtest date instead of datetime.now().
+
+    This matters because PmccStrategy.get_option_chain_requests() calls
+    _snapshot_date(snapshot) to compute option chain expiry windows.
+    If as_of_utc is real-time (2026-02-24) during a 2025-03-01 backtest
+    cycle, the expiry windows are wrong and Alpaca returns no contracts.
+    """
+
+    broker: AlpacaHistoricalBroker   # narrowed type — we need _current_date
+
+    def build_snapshot(
+        self,
+        *,
+        universe: List[Symbol],
+        option_chain_requests: List[OptionChainRequest],
+    ) -> CycleSnapshot:
+        # Build using the parent — then stamp the correct date.
+        snapshot = super().build_snapshot(
+            universe=universe,
+            option_chain_requests=option_chain_requests,
+        )
+        # Replace as_of_utc with the backtest cycle date so that
+        # _snapshot_date(snapshot) returns the correct historical date.
+        correct_as_of = datetime.combine(
+            self.broker._current_date,
+            datetime.min.time(),
+        ).replace(tzinfo=timezone.utc)
+
+        # CycleSnapshot is frozen — use dataclasses.replace
+        from dataclasses import replace
+        return replace(snapshot, _as_of_utc=correct_as_of)
+
+============================================================
+FILE: .\src\backtest\plot_results.py
+============================================================
+
+from __future__ import annotations
+
+"""
+src/backtest/plot_results.py
+-----------------------------
+Generates a two-panel chart from backtest results:
+
+  Top panel:   Equity curve (line) with entry/exit arrows
+               ↑ green  = BTO  (long LEAP entry)
+               ↓ red    = STO  (short NEAR sold)
+               ↑ orange = BTC  (near bought back / closed)
+               ↓ grey   = STC  (long closed)
+
+  Bottom panel: Drawdown curve (filled area, red)
+
+The chart is saved as a PNG to output_dir/backtest_chart.png.
+Requires matplotlib — install with: pip install matplotlib
+"""
+
+from datetime import date
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# We import matplotlib lazily so that the rest of the backtest can run even
+# if matplotlib isn't installed — the chart step simply logs a warning.
+def plot_backtest(
+    *,
+    day_results: list,        # List[DayResult] from backtest_runner
+    trade_log:   List[Dict[str, Any]],
+    output_dir:  Path,
+) -> Path:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")   # headless — no display needed
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import matplotlib.dates as mdates
+        from matplotlib.lines import Line2D
+    except ImportError:
+        raise ImportError(
+            "matplotlib is required for chart generation. "
+            "Install it with: pip install matplotlib"
+        )
+
+    from datetime import datetime
+
+    # ------------------------------------------------------------------
+    # Build equity + drawdown series
+    # ------------------------------------------------------------------
+    dates    = [datetime.fromisoformat(r.date) for r in day_results]
+    equities = [r.equity                        for r in day_results]
+
+    peak     = equities[0]
+    drawdowns = []
+    for eq in equities:
+        peak = max(peak, eq)
+        drawdowns.append((peak - eq) / peak * 100 if peak > 0 else 0.0)
+
+    # ------------------------------------------------------------------
+    # Map trade log entries to (date, action, symbol, equity_at_date)
+    # ------------------------------------------------------------------
+    # Build a quick lookup: date_str -> equity on that day
+    equity_by_date = {r.date: r.equity for r in day_results}
+
+    # Categorise each trade into one of four visual groups
+    # BTO = bought to open (entry of LEAP)     → green up arrow
+    # STO = sold to open   (entry of NEAR)     → red down arrow
+    # BTC = bought to close (near roll/close)  → orange up arrow
+    # STC = sold to close  (LEAP exit)         → grey down arrow
+
+    _ACTION_STYLE = {
+        "BTO": dict(color="#00c853", marker="^", zorder=5, label="BTO (long)"),
+        "STO": dict(color="#d32f2f", marker="v", zorder=5, label="STO (short NEAR)"),
+        "BTC": dict(color="#ff6f00", marker="^", zorder=5, label="BTC (close short)"),
+        "STC": dict(color="#757575", marker="v", zorder=5, label="STC (close long)"),
+    }
+
+    trade_points: Dict[str, List] = {a: {"x": [], "y": [], "labels": []}
+                                     for a in _ACTION_STYLE}
+
+    for trade in trade_log:
+        action  = str(trade.get("action", "")).upper()
+        t_date  = str(trade.get("date", ""))
+        symbol  = str(trade.get("symbol", ""))
+        eq      = equity_by_date.get(t_date)
+        if action not in trade_points or eq is None:
+            continue
+        dt = datetime.fromisoformat(t_date)
+        trade_points[action]["x"].append(dt)
+        # Offset arrow above/below the equity line so it doesn't overlap
+        offset = eq * 0.003
+        trade_points[action]["y"].append(
+            eq + offset if "^" in _ACTION_STYLE[action]["marker"] else eq - offset
+        )
+        trade_points[action]["labels"].append(symbol)
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1,
+        figsize=(16, 9),
+        gridspec_kw={"height_ratios": [3, 1]},
+        sharex=True,
+    )
+    fig.patch.set_facecolor("#1a1a2e")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#16213e")
+        ax.tick_params(colors="#cccccc")
+        ax.xaxis.label.set_color("#cccccc")
+        ax.yaxis.label.set_color("#cccccc")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#333355")
+
+    # --- equity curve ---
+    ax1.plot(dates, equities, color="#4fc3f7", linewidth=1.5, zorder=3)
+    ax1.fill_between(dates, equities, min(equities), alpha=0.08, color="#4fc3f7")
+
+    # initial capital reference line
+    initial = equities[0]
+    ax1.axhline(initial, color="#ffffff", linewidth=0.6, linestyle="--", alpha=0.3)
+    ax1.text(
+        dates[0], initial * 1.001,
+        f"  Start ${initial:,.0f}",
+        color="#aaaaaa", fontsize=7, va="bottom",
+    )
+
+    # --- trade arrows ---
+    for action, style in _ACTION_STYLE.items():
+        pts = trade_points[action]
+        if not pts["x"]:
+            continue
+        ax1.scatter(
+            pts["x"], pts["y"],
+            color=style["color"],
+            marker=style["marker"],
+            s=70, zorder=style["zorder"], alpha=0.85,
+        )
+        # Annotate with option symbol — small text, rotated so it doesn't clobber
+        for x, y, lbl in zip(pts["x"], pts["y"], pts["labels"]):
+            # Strip the OSI symbol to just ticker + expiry for brevity
+            short_lbl = lbl[:12] if len(lbl) > 12 else lbl
+            ax1.annotate(
+                short_lbl,
+                xy=(x, y),
+                xytext=(4, 6),
+                textcoords="offset points",
+                fontsize=5.5,
+                color=style["color"],
+                alpha=0.75,
+                rotation=60,
+            )
+
+    ax1.set_ylabel("Portfolio Equity ($)", color="#cccccc", fontsize=10)
+    ax1.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
+    )
+    ax1.grid(color="#2a2a4a", linewidth=0.5, alpha=0.6)
+
+    # Legend
+    legend_handles = [
+        Line2D([0], [0], color=s["color"], marker=s["marker"],
+               linestyle="None", markersize=7, label=s["label"])
+        for s in _ACTION_STYLE.values()
+    ] + [Line2D([0], [0], color="#4fc3f7", linewidth=1.5, label="Equity")]
+    ax1.legend(
+        handles=legend_handles,
+        loc="upper left",
+        framealpha=0.3,
+        facecolor="#1a1a2e",
+        edgecolor="#333355",
+        labelcolor="#cccccc",
+        fontsize=8,
+    )
+
+    # --- drawdown ---
+    ax2.fill_between(dates, drawdowns, 0, color="#d32f2f", alpha=0.55)
+    ax2.plot(dates, drawdowns, color="#d32f2f", linewidth=0.8)
+    ax2.set_ylabel("Drawdown (%)", color="#cccccc", fontsize=9)
+    ax2.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.1f}%")
+    )
+    ax2.invert_yaxis()
+    ax2.grid(color="#2a2a4a", linewidth=0.5, alpha=0.6)
+
+    # --- x-axis formatting ---
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+    ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=35, ha="right", fontsize=8)
+
+    # --- title & stats box ---
+    if day_results:
+        first_eq = day_results[0].equity
+        last_eq  = day_results[-1].equity
+        ret_pct  = (last_eq - first_eq) / first_eq * 100
+        n_days   = len(day_results)
+        ann_ret  = ret_pct * 252 / n_days if n_days else 0
+        max_dd   = max(drawdowns) if drawdowns else 0
+        n_trades = len(trade_log)
+
+        stats = (
+            f"Return {ret_pct:+.1f}%   "
+            f"Ann. {ann_ret:+.1f}%   "
+            f"Max DD {max_dd:.1f}%   "
+            f"Trades {n_trades}"
+        )
+        fig.suptitle(
+            f"PMCC Backtest  ·  {day_results[0].date} → {day_results[-1].date}\n"
+            f"{stats}",
+            color="#eeeeee", fontsize=11, y=0.98,
+        )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chart_path = output_dir / "backtest_chart.png"
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return chart_path
 
 ============================================================
 FILE: .\src\backtest\run_backtest.py
@@ -996,159 +1325,123 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 from src.app.container import build_settings_runtime
 from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
 from src.backtest.backtest_runner import BacktestRunner
+from src.backtest.backtest_snapshot_builder import BacktestSnapshotBuilder
 from src.backtest.simulated_account import SimulatedAccount
-from src.config.yaml_config import AppConfig, StrategySpec
 from src.execution.default_execution_policy import DefaultExecutionPolicy
-from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
 from src.signals.signal_pipeline import DefaultSignalPipeline
-from src.strategies.interfaces import StrategyABC
 from src.strategies.strategy_plugin import STRATEGY_PLUGINS
 from src.utilities.logger import setup_logger
 
 """
-src/backtest/run_backtest.py
------------------------------
-Entry point for running a backtest. Wire everything together here —
-the same pattern as main.py but using BacktestRunner instead of Scheduler
-and AlpacaHistoricalBroker instead of AlpacaBroker.
+Entry point for backtests.
 
-Run from the repo root:
+Run from repo root:
     python -m src.backtest.run_backtest
 
-Environment variables required (same as live):
+Required env vars:
     ALPACA_PAPER_API_KEY
     ALPACA_PAPER_API_SECRET
 
-Optional overrides via env vars:
-    BACKTEST_START_DATE   e.g. 2023-01-01  (default: 1 year ago)
-    BACKTEST_END_DATE     e.g. 2024-01-01  (default: today)
-    BACKTEST_INITIAL_CASH e.g. 100000      (default: 100000)
-    BACKTEST_OUTPUT_DIR   e.g. ./results   (default: ./backtest_results)
+All backtest parameters come from config.yaml [backtest] section.
+Env vars override yaml:
+    BACKTEST_START_DATE  BACKTEST_END_DATE
+    BACKTEST_INITIAL_CASH  BACKTEST_OUTPUT_DIR  BACKTEST_LOG_MODE
 """
 
-
 logger = setup_logger("RunBacktest")
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _build_broker(app_cfg: AppConfig) -> AlpacaHistoricalBroker:
-    api_key    = _env("ALPACA_PAPER_API_KEY")
-    api_secret = _env("ALPACA_PAPER_API_SECRET")
-    if not api_key or not api_secret:
-        logger.error(
-            "Missing Alpaca credentials. Set ALPACA_PAPER_API_KEY and "
-            "ALPACA_PAPER_API_SECRET in your .env or environment."
-        )
-        sys.exit(1)
-
-    initial_cash = float(_env("BACKTEST_INITIAL_CASH", "100000"))
-    account      = SimulatedAccount(initial_cash=initial_cash)
-
-    return AlpacaHistoricalBroker(
-        account=account,
-        api_key=api_key,
-        api_secret=api_secret,
-    )
-
-
-def _build_strategies(specs: list[StrategySpec]) -> list[StrategyABC]:
-    strategies = []
-    for spec in specs:
-        plugin = STRATEGY_PLUGINS.get(spec.name)
-        if plugin is None:
-            logger.error("No plugin for strategy '%s'", spec.name)
-            sys.exit(1)
-        strategies.append(plugin.build_strategy(spec))
-    return strategies
-
-
-def _build_risk_engine(app_cfg: AppConfig, broker) -> RiskEngine:
-    engine = RiskEngine(
-        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
-    )
-    for spec in app_cfg.strategies:
-        plugin = STRATEGY_PLUGINS.get(spec.name)
-        if plugin:
-            plugin.register_evaluators(spec, engine)
-    return engine
 
 
 def main() -> int:
     settings = build_settings_runtime()
     app_cfg  = settings.app_cfg
+    bt_cfg   = app_cfg.backtest
 
-    # ------------------------------------------------------------------
-    # Date range
-    # ------------------------------------------------------------------
-    start_str = _env("BACKTEST_START_DATE")
-    end_str   = _env("BACKTEST_END_DATE")
-
-    start_date = (
-        date.fromisoformat(start_str)
-        if start_str else
-        date.today() - timedelta(days=365)
-    )
-    end_date = (
-        date.fromisoformat(end_str)
-        if end_str else
-        date.today()
-    )
-
-    if start_date >= end_date:
-        logger.error("BACKTEST_START_DATE must be before BACKTEST_END_DATE")
+    if bt_cfg is None:
+        logger.error("No [backtest] section in config.yaml")
         return 1
 
-    output_dir = Path(_env("BACKTEST_OUTPUT_DIR", "backtest_results"))
+    api_key    = os.getenv("ALPACA_PAPER_API_KEY", "").strip()
+    api_secret = os.getenv("ALPACA_PAPER_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        print(
+            "\n[ERROR] Missing Alpaca credentials.\n"
+            "  Set ALPACA_PAPER_API_KEY and ALPACA_PAPER_API_SECRET\n"
+            "  in your .env file or environment before running a backtest.\n",
+            file=sys.stderr,
+        )
+        return 1
 
     logger.info(
-        "Backtest config | start=%s end=%s output=%s",
-        start_date, end_date, output_dir,
+        "Backtest config | start=%s end=%s capital=$%.0f output=%s mode=%s",
+        bt_cfg.start_date, bt_cfg.end_date,
+        bt_cfg.initial_cash, bt_cfg.output_dir, bt_cfg.log_mode,
     )
 
-    # ------------------------------------------------------------------
-    # Wire everything together
-    # ------------------------------------------------------------------
-    broker      = _build_broker(app_cfg)
-    strategies  = _build_strategies(app_cfg.strategies)
-    risk_engine = _build_risk_engine(app_cfg, broker)
+    broker = AlpacaHistoricalBroker(
+        account=SimulatedAccount(initial_cash=bt_cfg.initial_cash),
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+
+    strategies = [
+        STRATEGY_PLUGINS[spec.name].build_strategy(spec)
+        for spec in app_cfg.strategies
+        if spec.name in STRATEGY_PLUGINS
+    ]
+
+    risk_engine = RiskEngine(
+        rules=[OpenOrderDedupeRule()] if app_cfg.risk.enable_open_order_dedupe else []
+    )
+    for spec in app_cfg.strategies:
+        plugin = STRATEGY_PLUGINS.get(spec.name)
+        if plugin:
+            plugin.register_evaluators(spec, risk_engine)
 
     orchestrator = TradingOrchestrator(
         broker=broker,
         strategies=strategies,
         risk_engine=risk_engine,
         execution_policy=DefaultExecutionPolicy(),
-        snapshot_builder=CycleSnapshotBuilder(broker=broker),
+        snapshot_builder=BacktestSnapshotBuilder(broker=broker),  # ← key fix
         signal_pipeline=DefaultSignalPipeline(),
-        dry_run=False,   # backtest always executes fills
+        dry_run=False,
     )
 
     runner = BacktestRunner(
         orchestrator=orchestrator,
         broker=broker,
-        start_date=start_date,
-        end_date=end_date,
-        output_dir=output_dir,
+        start_date=bt_cfg.start_date,
+        end_date=bt_cfg.end_date,
+        output_dir=bt_cfg.output_dir,
+        log_mode=bt_cfg.log_mode,
     )
 
-    runner.run()
+    results = runner.run()
+
+    try:
+        from src.backtest.plot_results import plot_backtest
+        chart_path = plot_backtest(
+            day_results=results,
+            trade_log=broker.account.trade_log(),
+            output_dir=bt_cfg.output_dir,
+        )
+        print(f"\n  Chart saved → {chart_path}")
+    except Exception as exc:
+        logger.warning("Chart generation failed: %s", exc)
+
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
 
 ============================================================
 FILE: .\src\backtest\simulated_account.py
@@ -2252,7 +2545,9 @@ FILE: .\src\config\yaml_config.py
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -2279,24 +2574,11 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    # NEAR management — any one condition triggers a roll.
-
-    # Roll NEAR when DTE falls to or below this value.
-    dte_threshold: int
-
-    # Roll NEAR when this fraction of original premium has been captured.
-    profit_pct: float
-
-    # Roll NEAR when spot >= near_strike * this value.
+    dte_threshold:         int
+    profit_pct:            float
     near_strike_proximity: float
-
-    # LEAP management.
-
-    # Roll LEAP when DTE falls to or below this value.
-    leap_dte_threshold: int
-
-    # Close entire spread when spot <= leap_strike * this value.
-    leap_strike_danger: float
+    leap_dte_threshold:    int
+    leap_strike_danger:    float
 
 
 @dataclass(frozen=True)
@@ -2307,20 +2589,11 @@ class PmccLiquidityConfig:
 
 @dataclass(frozen=True)
 class PmccRiskConfig:
-    # Maximum fraction of available buying power to use per PMCC entry intent.
     max_buying_power_fraction: float
-
-    # Hard dollar ceiling on net debit per spread regardless of buying power.
-    max_debit_per_spread_usd: float
-
-    # Hard contract ceiling per intent — final safety cap after all other checks.
-    max_contracts_per_intent: int
-
-    # Multiply estimated cost by this before budget checks (e.g. 1.05 = 5% slippage buffer).
-    slippage_factor: float
-
-    # Skip bid-ask spread liquidity checks — only for paper/backtesting diagnostics.
-    ignore_spread_checks: bool
+    max_debit_per_spread_usd:  float
+    max_contracts_per_intent:  int
+    slippage_factor:           float
+    ignore_spread_checks:      bool
 
 
 @dataclass(frozen=True)
@@ -2335,38 +2608,40 @@ class PmccConfig:
 
 
 # ===========================================================================
-# StrategySpec — generic container for any strategy config
+# StrategySpec
 # ===========================================================================
 
 @dataclass(frozen=True)
 class StrategySpec:
     name:   str
-    config: Any  # typed config dataclass for the strategy, e.g. PmccConfig
+    config: Any
 
-    # Convenience accessor — avoids callers doing isinstance checks everywhere
     @property
     def pmcc(self) -> Optional[PmccConfig]:
         return self.config if isinstance(self.config, PmccConfig) else None
 
 
 # ===========================================================================
-# Strategy config parser registry
+# Backtest config
 # ===========================================================================
-# To add a new strategy:
-#   1. Define its config dataclass(es) above.
-#   2. Write a _parse_<n>_config(raw: dict) -> YourConfig function below.
-#   3. Register it in _STRATEGY_CONFIG_PARSERS.
-#   4. That's it — load_app_config() needs no changes.
-#
-# Each parser receives the full strategy YAML entry dict (the dict that also
-# contains "name": "pmcc") and returns a typed config object.
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    initial_cash: float
+    start_date:   date
+    end_date:     date
+    output_dir:   Path
+    log_mode:     str   # "progress" | "verbose"
+
+
+# ===========================================================================
+# Strategy config parser registry
 # ===========================================================================
 
 StrategyConfigParser = Callable[[Dict[str, Any]], Any]
 
 
 def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
-    """Parse the 'pmcc:' block from a strategy entry."""
     p = raw.get("pmcc")
     if not p:
         return None
@@ -2395,8 +2670,6 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
     )
 
 
-# Registry: strategy name → parser function.
-# Add new strategies here without touching load_app_config().
 _STRATEGY_CONFIG_PARSERS: Dict[str, StrategyConfigParser] = {
     "pmcc": _parse_pmcc_config,
 }
@@ -2418,6 +2691,7 @@ class AppConfig:
     cycle_seconds:   float
     risk:            GlobalRiskConfig
     strategies:      List[StrategySpec]
+    backtest:        Optional[BacktestConfig] = None
 
 
 # ===========================================================================
@@ -2440,7 +2714,7 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
     if path is None or not path.exists():
         raise FileNotFoundError(f"config.yaml not found. Searched: {_SEARCH_PATHS}")
 
-    raw = yaml.safe_load(path.read_text())
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     risk_raw    = raw.get("risk", {})
     global_risk = GlobalRiskConfig(
@@ -2458,12 +2732,25 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
             )
         strategies.append(StrategySpec(name=name, config=parser(entry)))
 
+    bt_raw         = raw.get("backtest") or {}
+    _default_start = (date.today() - timedelta(days=365)).isoformat()
+    _default_end   = date.today().isoformat()
+
+    backtest_cfg = BacktestConfig(
+        initial_cash=float(os.getenv("BACKTEST_INITIAL_CASH") or bt_raw.get("initial_cash", 100_000)),
+        start_date=date.fromisoformat(os.getenv("BACKTEST_START_DATE") or bt_raw.get("start_date", _default_start)),
+        end_date=date.fromisoformat(os.getenv("BACKTEST_END_DATE") or bt_raw.get("end_date", _default_end)),
+        output_dir=Path(os.getenv("BACKTEST_OUTPUT_DIR") or bt_raw.get("output_dir", "backtest_results")),
+        log_mode=str(os.getenv("BACKTEST_LOG_MODE") or bt_raw.get("log_mode", "progress")),
+    )
+
     return AppConfig(
         config_path=path,
         default_dry_run=bool(raw.get("default_dry_run", False)),
         cycle_seconds=float(raw.get("cycle_seconds", 60)),
         risk=global_risk,
         strategies=strategies,
+        backtest=backtest_cfg,
     )
 
 ============================================================
@@ -4354,7 +4641,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                         no trigger         → nothing
         """
         sym       = self.config.underlying_symbol.strip().upper()
-        today     = date.today()
+        today     = _snapshot_date(snapshot)
         leap_cfg  = self.config.leap
         short_cfg = self.config.short
         roll_cfg  = self.config.roll
@@ -4986,6 +5273,24 @@ def _get_spot(snapshot: CycleSnapshotABC, sym_str: str) -> float:
         if str(k).upper() == sym_str.upper():
             return v.mid or v.ask or v.bid or 0.0
     return 0.0
+
+
+def _snapshot_date(snapshot: CycleSnapshotABC) -> date:
+    """
+    Return the date the snapshot represents.
+
+    During live trading this is today. During backtesting the broker is set
+    to a historical date, and snapshot.as_of_utc() reflects that date because
+    CycleSnapshotBuilder stamps it at build time with datetime.now() — but
+    in the backtest broker, set_date() is called before build_snapshot(), so
+    the snapshot timestamp reflects the backtest cycle date.
+
+    Using this instead of date.today() makes all chain request expiry windows
+    correct during backtests. Without this fix, date.today() during a 2025-03-01
+    backtest cycle would request LEAPs expiring 2027-02-24 to 2027-08-27 —
+    contracts that don't exist in Alpaca's historical chain for that date.
+    """
+    return snapshot.as_of_utc().date()
 
 ============================================================
 FILE: .\src\strategies\registry.py
