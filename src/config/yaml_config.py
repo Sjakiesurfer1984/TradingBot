@@ -29,11 +29,14 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    near_dte_threshold:    int
-    profit_pct:            float
-    near_strike_proximity: float
-    leap_dte_threshold:    int
-    leap_strike_danger:    float
+    near_dte_threshold:       int    # roll the short NEAR when DTE reaches this
+    near_profit_pct_high_iv:  float  # profit target when IV regime is HIGH  (IVR > 50)
+    near_profit_pct_normal_iv: float # profit target when IV regime is NORMAL (IVR 25-50)
+    near_profit_pct_low_iv:   float  # profit target when IV regime is LOW    (IVR < 25)
+    near_strike_proximity:    float  # roll when spot / near_strike >= this ratio
+    leap_dte_threshold:       int    # rebuild the spread when LEAP DTE reaches this
+    leap_strike_danger:       float  # close everything when spot / leap_strike <= this ratio
+    near_max_roll_debit:      float  # max net debit allowed on a NEAR roll (points)
 
 
 @dataclass(frozen=True)
@@ -109,10 +112,13 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
         short=PmccShortConfig(**p["short"]),
         roll=PmccRollConfig(
             near_dte_threshold=int(ro["near_dte_threshold"]),
-            profit_pct=float(ro["profit_pct"]),
+            near_profit_pct_high_iv=float(ro["near_profit_pct_high_iv"]),
+            near_profit_pct_normal_iv=float(ro["near_profit_pct_normal_iv"]),
+            near_profit_pct_low_iv=float(ro["near_profit_pct_low_iv"]),
             near_strike_proximity=float(ro["near_strike_proximity"]),
             leap_dte_threshold=int(ro["leap_dte_threshold"]),
             leap_strike_danger=float(ro["leap_strike_danger"]),
+            near_max_roll_debit=float(ro.get("near_max_roll_debit", 2.0)),
         ),
         liquidity=PmccLiquidityConfig(**p["liquidity"]),
         risk=PmccRiskConfig(

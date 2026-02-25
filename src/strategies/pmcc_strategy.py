@@ -19,6 +19,7 @@ from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
 from src.strategies.pmcc_selector import PmccContractSelector
 from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
+from src.domain.signals import IvRegime
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("PmccStrategy")
@@ -186,9 +187,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 if cost_basis < 0:
                     premium_received = abs(cost_basis)
                     current_cost     = abs(market_value)
+                    profit_target = self._near_profit_target(snapshot)
                     if premium_received > 0:
                         profit_captured = (premium_received - current_cost) / premium_received
-                        if profit_captured >= roll_cfg.near_profit_pct:
+                        if profit_captured >= profit_target:
                             return [short_req]
 
                 if near_strike > 0 and spot > 0:
@@ -203,6 +205,24 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     # ------------------------------------------------------------------
     # State handlers
     # ------------------------------------------------------------------
+
+    def _near_profit_target(self, snapshot: CycleSnapshot) -> float:
+        """
+        Return the appropriate profit target for the NEAR based on the current
+        IV regime signal in the snapshot.
+
+          HIGH IV   (IVR > 50) → near_profit_pct_high_iv   (exit early, vol compresses)
+          NORMAL IV (IVR 25-50) → near_profit_pct_normal_iv
+          LOW IV    (IVR < 25) → near_profit_pct_low_iv    (stay in, capture more decay)
+          UNKNOWN              → near_profit_pct_normal_iv (safe fallback)
+        """
+        regime = snapshot.signals.iv_regime.regime
+        roll   = self.config.roll
+        if regime == IvRegime.HIGH:
+            return roll.near_profit_pct_high_iv
+        if regime == IvRegime.LOW:
+            return roll.near_profit_pct_low_iv
+        return roll.near_profit_pct_normal_iv   # NORMAL or UNKNOWN
 
     def _intents_entry(self, sym: Symbol, snapshot: CycleSnapshot) -> List[TradeIntent]:
         chains    = snapshot.option_chains
@@ -485,9 +505,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     current   = abs(market_value)
                     if premium > 0:
                         captured = (premium - current) / premium
-                        if captured >= roll_cfg.near_profit_pct:
+                        profit_target = self._near_profit_target(snapshot)
+                        if captured >= profit_target:
                             roll_near = True
-                            reason    = f"profit {captured:.1%} >= {roll_cfg.near_profit_pct:.1%}"
+                            reason    = f"profit {captured:.1%} >= {profit_target:.1%} (regime={snapshot.signals.iv_regime.regime.value})"
 
             if not roll_near and near_strike > 0 and spot > 0:
                 if (spot / near_strike) >= roll_cfg.near_strike_proximity:

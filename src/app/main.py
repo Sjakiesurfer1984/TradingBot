@@ -22,7 +22,7 @@ from src.risk.evaluators import PmccEvaluator, _EnterPmccApproved
 from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
-from src.signals.signal_pipeline import DefaultSignalPipeline
+from src.signals.signal_pipeline import IvRegimePipelineWithBars
 from src.strategies.pmcc_strategy import PmccStrategy
 from src.utilities.clock import LiveClock
 from src.utilities.logger import setup_logger
@@ -85,7 +85,7 @@ def main() -> int:
         risk_engine=risk_engine,
         execution_policy=DefaultExecutionPolicy(),
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
-        signal_pipeline=DefaultSignalPipeline(),
+        signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
         dry_run=app_cfg.default_dry_run,
     )
 
