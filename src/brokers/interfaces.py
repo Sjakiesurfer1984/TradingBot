@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from src.domain.orders import OrderABC
 from src.domain.types import AssetQuote
+from src.orchestration.cycle_snapshot import AccountSnapshot
 
 
 class MarketDataProviderABC(ABC):
@@ -41,37 +42,21 @@ class MarketDataProviderABC(ABC):
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         raise NotImplementedError
-    
-'''
-The MarketDataProviderABC is an abstract base class that defines the interface for a market data provider.
-It includes methods for retrieving asset quotes, latest prices, daily bars, and option chains.
-By defining this interface, we can ensure that any concrete implementation of a market data provider will adhere to this contract 
-(i.e. implement all the required methods), which allows us to write code that depends on this interface without worrying about the 
-specific details of how the market data is retrieved. This promotes loose coupling and makes it easier to switch out different 
-market data providers or mock them for testing purposes,
-'''
-    
+
 
 class ExecutionBrokerABC(ABC):
 
     @abstractmethod
-    def get_equity(self) -> float:
-        raise NotImplementedError
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """
+        Return a typed snapshot of all account state in one call.
 
-    @abstractmethod
-    # THis is to use the individual methods to provide an entire account snapshot. Not sure yet how to deal with this. 
-    def get_account_snapshot(self) -> Dict[str, Any]:
-        raise NotImplementedError
+        Covers: equity, cash, option_buying_power, positions, open_orders.
 
-    @abstractmethod
-    def get_option_buying_power(self) -> float:
-        raise NotImplementedError
-    @abstractmethod
-    def get_positions(self) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_open_orders(self) -> List[Dict[str, Any]]:
+        CycleSnapshotBuilder calls this once per cycle — no separate
+        get_equity(), get_positions(), get_open_orders() calls needed.
+        All downstream code reads typed AccountSnapshot fields.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -81,12 +66,7 @@ class ExecutionBrokerABC(ABC):
     @abstractmethod
     def cancel_order(self, order_id: str) -> None:
         raise NotImplementedError
-'''
-The ExecutionBrokerABC is an abstract base class that defines the interface for an execution broker.
-It includes methods for retrieving account information such as equity, account snapshot, option buying power, positions, and open orders,
-as well as methods for submitting and canceling orders. By defining this interface, we can ensure that any concrete 
-implementation of an execution broker will adhere to this contract. 
-'''
+
 
 class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
-    """Full broker — composition of market data + execution. Depend on the narrow interface where possible."""
+    """Full broker — composition of market data + execution."""

@@ -1,175 +1,84 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-
-import requests
-from requests import Session
-from requests.adapters import HTTPAdapter
+from typing import Any, Callable, Dict, List, Optional, Type
 
 from src.brokers.broker_base import BrokerBase
-from src.brokers.errors import BrokerConnectionError
 from src.brokers.interfaces import BrokerABC
-from src.domain.orders import (
-    MarketOrder,
-    MultiLegLimitOrder,
-    OrderABC,
-    OrderSide as DomainOrderSide,
-    TimeInForce as DomainTIF,
-)
+from src.domain.orders import MarketOrder, MultiLegLimitOrder, OrderABC, OrderSide
 from src.domain.types import AssetQuote
+from src.orchestration.cycle_snapshot import AccountSnapshot
+from src.utilities.clock import ClockABC, LiveClock
 from src.utilities.logger import setup_logger
-
-if TYPE_CHECKING:
-    from alpaca.trading.client import TradingClient
 
 logger = setup_logger("AlpacaBroker")
 
 
-def _underlying_from_osi(osi_symbol: str) -> str:
-    """Extract the underlying ticker from an OSI option symbol (e.g. SPY270617C00605000 → SPY)."""
-    return "".join(c for c in osi_symbol if c.isalpha()).upper()
+@dataclass
+class AlpacaBroker(BrokerABC, BrokerBase):
+    api_key:    str
+    secret_key: str
+    paper:      bool     = True
+    clock:      ClockABC = field(default_factory=LiveClock)
 
+    _trading_client: Any = field(default=None, init=False)
+    _data_client:    Any = field(default=None, init=False)
+    _order_handlers: Dict[Type[OrderABC], Callable[[OrderABC], Any]] = field(
+        default_factory=dict, init=False,
+    )
 
-class AlpacaBroker(BrokerBase, BrokerABC):
+    def __post_init__(self) -> None:
+        from alpaca.trading.client import TradingClient
+        from alpaca.data.historical import StockHistoricalDataClient
 
-    def __init__(
-        self,
-        *,
-        api_key:                 str,
-        api_secret:              str,
-        paper:                   bool  = True,
-        request_timeout_seconds: float = 10.0,
-        connect_timeout_seconds: float = 3.0,
-    ) -> None:
-        self._api_key           = api_key
-        self._api_secret        = api_secret
-        self._paper             = paper
-        self._request_timeout   = request_timeout_seconds
-        self._connect_timeout   = connect_timeout_seconds
-        self._session: Optional[Session]               = None
-        self._trading_client: Optional["TradingClient"] = None
-
-    # ------------------------------------------------------------------
-    # HTTP helpers
-    # ------------------------------------------------------------------
-
-    def _base_url_v2(self) -> str:
-        base = "https://paper-api.alpaca.markets" if self._paper else "https://api.alpaca.markets"
-        return f"{base}/v2"
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "APCA-API-KEY-ID":     self._api_key,
-            "APCA-API-SECRET-KEY": self._api_secret,
+        self._trading_client = TradingClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            paper=self.paper,
+        )
+        self._data_client = StockHistoricalDataClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+        )
+        self._order_handlers = {
+            MarketOrder:        self._submit_market_order,
+            MultiLegLimitOrder: self._submit_multileg_limit_order,
         }
-
-    def _ensure_session(self) -> Session:
-        if self._session is None:
-            session = requests.Session()
-            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
-            session.mount("https://", adapter)
-            session.mount("http://",  adapter)
-            self._session = session
-            logger.info("HTTP session created | paper=%s", self._paper)
-        return self._session
-
-    def _ensure_trading_client(self) -> "TradingClient":
-        if self._trading_client is None:
-            from alpaca.trading.client import TradingClient
-            self._trading_client = TradingClient(
-                api_key=self._api_key,
-                secret_key=self._api_secret,
-                paper=self._paper,
-            )
-        return self._trading_client
-
-    def _request_json(self, method: str, path: str, *, params: Optional[Dict] = None) -> Any:
-        return self._request_json_url(method, self._base_url_v2() + path, params=params)
-
-    def _request_json_url(self, method: str, url: str, *, params: Optional[Dict] = None) -> Any:
-        session  = self._ensure_session()
-        timeout  = (self._connect_timeout, self._request_timeout)
-        response = session.request(method, url, headers=self._headers(), params=params, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-
-    @staticmethod
-    def _quantise_2dp(value: Decimal) -> Decimal:
-        return value.quantize(Decimal("0.01"))
 
     # ------------------------------------------------------------------
     # ExecutionBrokerABC
     # ------------------------------------------------------------------
 
-    def get_account_snapshot(self) -> Dict[str, Any]:
-        """Single HTTP call to /account. Returns the raw Alpaca account dict."""
+    def get_account_snapshot(self) -> AccountSnapshot:
         self._log_io_boundary("get_account_snapshot")
-        return self._request_json("GET", "/account")  # type: ignore[return-value]
+        account   = self._trading_client.get_account()
+        positions = self._trading_client.get_all_positions()
+        orders    = self._trading_client.get_orders()
 
-    def get_option_buying_power(self) -> float:
-        return self._safe_float(self.get_account_snapshot().get("options_buying_power"))
-
-    def get_equity(self) -> float:
-        return self._safe_float(self.get_account_snapshot().get("equity"))
-
-    def get_positions(self) -> List[Dict[str, Any]]:
-        self._log_io_boundary("get_positions")
-        data = self._request_json("GET", "/positions")
-        positions = [p for p in data if isinstance(p, dict)] if isinstance(data, list) else []
-
-        for p in positions:
-            # Alpaca sometimes omits underlying_symbol — derive it from the OSI symbol as fallback
-            underlying = p.get("underlying_symbol") or _underlying_from_osi(str(p.get("symbol", "")))
-            logger.info(
-                "Position | symbol=%s asset_class=%s underlying=%s qty=%s side=%s",
-                p.get("symbol"), p.get("asset_class"),
-                underlying, p.get("qty"), p.get("side"),
-            )
-        if not positions:
-            logger.info("Positions | none")
-        return positions
-
-    def get_open_orders(self) -> List[Dict[str, Any]]:
-        self._log_io_boundary("get_open_orders")
-        data = self._request_json("GET", "/orders", params={"status": "open"})
-        orders = [o for o in data if isinstance(o, dict)] if isinstance(data, list) else []
-
-        for o in orders:
-            legs_info = [
-                f"{leg.get('symbol')}:{leg.get('side')}"
-                for leg in (o.get("legs") or [])
-                if isinstance(leg, dict)
-            ]
-            # Alpaca omits underlying_symbol on MLEG orders — derive from legs
-            underlying = o.get("underlying_symbol")
-            if not underlying:
-                for leg in (o.get("legs") or []):
-                    leg_sym = str(leg.get("symbol") or "")
-                    underlying = _underlying_from_osi(leg_sym) or None
-                    if underlying:
-                        break
-            logger.info(
-                "OpenOrder | id=%s symbol=%s underlying=%s type=%s status=%s legs=%s",
-                o.get("id"), o.get("symbol"), underlying,
-                o.get("order_class"), o.get("status"), legs_info or "n/a",
-            )
-        if not orders:
-            logger.info("OpenOrders | none")
-        return orders
+        return AccountSnapshot(
+            equity=self._safe_float(account.equity),
+            cash=self._safe_float(account.cash),
+            option_buying_power=self._safe_float(
+                getattr(account, "options_buying_power", None)
+                or getattr(account, "buying_power", 0)
+            ),
+            positions=[self._position_to_dict(p) for p in (positions or [])],
+            open_orders=[self._order_to_dict(o) for o in (orders or [])],
+        )
 
     def submit_order(self, order: OrderABC) -> Any:
         self._log_io_boundary("submit_order")
-        if isinstance(order, MultiLegLimitOrder):
-            return self._ensure_trading_client().submit_order(order_data=self._to_alpaca_mleg(order))
-        if isinstance(order, MarketOrder):
-            return self._ensure_trading_client().submit_order(order_data=self._to_alpaca_market(order))
-        raise TypeError(f"Unsupported order type: {type(order).__name__}")
+        return self._dispatch_by_type(
+            order,
+            self._order_handlers,
+            error_prefix="Unsupported order type",
+        )
 
     def cancel_order(self, order_id: str) -> None:
         self._log_io_boundary("cancel_order")
-        self._request_json("DELETE", f"/orders/{order_id.strip()}")
+        self._trading_client.cancel_order_by_id(order_id)
 
     # ------------------------------------------------------------------
     # MarketDataProviderABC
@@ -177,40 +86,46 @@ class AlpacaBroker(BrokerBase, BrokerABC):
 
     def get_asset_quote(self, symbol: str) -> AssetQuote:
         self._log_io_boundary("get_asset_quote")
-        sym  = symbol.strip().upper()
-        url  = f"https://data.alpaca.markets/v2/stocks/{sym}/quotes/latest"
-        data = self._request_json_url("GET", url, params={"feed": "iex"})
-        if not isinstance(data, dict):
-            raise BrokerConnectionError("alpaca", f"Unexpected response for {sym}")
-        q = data.get("quote")
-        if not isinstance(q, dict):
-            raise BrokerConnectionError("alpaca", f"Missing 'quote' for {sym}")
-        ask = self._safe_float(q.get("ap"))
-        bid = self._safe_float(q.get("bp"))
-        mid = (ask + bid) / 2.0 if ask > 0 and bid > 0 else None
-        return AssetQuote(symbol=sym, bid=bid or None, ask=ask or None, mid=mid, timestamp_utc=None)
+        from alpaca.data.requests import StockLatestQuoteRequest
+        sym = symbol.strip().upper()
+        try:
+            req  = StockLatestQuoteRequest(symbol_or_symbols=sym)
+            data = self._data_client.get_stock_latest_quote(req)
+            q    = data.get(sym)
+            if q:
+                bid = self._safe_float(getattr(q, "bid_price", None))
+                ask = self._safe_float(getattr(q, "ask_price", None))
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else ask or bid
+                return AssetQuote(
+                    symbol=sym,
+                    bid=bid or None,
+                    ask=ask or None,
+                    mid=mid or None,
+                    timestamp_utc=getattr(q, "timestamp", None),
+                )
+        except Exception as exc:
+            logger.warning("get_asset_quote failed for %s: %s", sym, exc)
+        return AssetQuote(symbol=sym, bid=None, ask=None, mid=None, timestamp_utc=None)
 
     def get_latest_price(self, symbol: str) -> float:
-        q = self.get_asset_quote(symbol)
-        for v in (q.mid, q.ask, q.bid):
-            if isinstance(v, float) and v > 0:
-                return v
-        raise BrokerConnectionError("alpaca", f"No usable price for {symbol}")
+        quote = self.get_asset_quote(symbol)
+        return quote.mid or quote.ask or quote.bid or 0.0
 
     def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
         self._log_io_boundary("get_daily_bars")
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from datetime import timedelta, timezone
         sym   = symbol.strip().upper()
-        end   = datetime.now(timezone.utc)
+        end   = self.clock.now_utc()
         start = end - timedelta(days=lookback_days + 5)
-        url   = f"https://data.alpaca.markets/v2/stocks/{sym}/bars"
-        return self._request_json_url("GET", url, params={
-            "timeframe":  "1Day",
-            "start":      start.isoformat(),
-            "end":        end.isoformat(),
-            "adjustment": "raw",
-            "feed":       "iex",
-            "limit":      1000,
-        })
+        req   = StockBarsRequest(
+            symbol_or_symbols=sym,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+        )
+        return self._data_client.get_stock_bars(req)
 
     def get_option_chain(
         self,
@@ -229,100 +144,168 @@ class AlpacaBroker(BrokerBase, BrokerABC):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
+        """
+        Fetch option chain via Alpaca trading client snapshots endpoint.
+        Filters applied client-side (server rejects most filter params).
+        """
         self._log_io_boundary("get_option_chain")
-        sym    = underlying.strip().upper()
-        url    = f"https://data.alpaca.markets/v1beta1/options/snapshots/{sym}"
-        params: Dict[str, Any] = {"feed": feed.strip().lower()}
+        from src.risk.pmcc_sizer import parse_osi
 
-        if include_calls and not include_puts:
-            params["type"] = "call"
-        elif include_puts and not include_calls:
-            params["type"] = "put"
-        if strike_price_gte is not None:
-            params["strike_price_gte"] = strike_price_gte
-        if strike_price_lte is not None:
-            params["strike_price_lte"] = strike_price_lte
-        if expiration_date is not None:
-            params["expiration_date"] = expiration_date.isoformat()
-        if expiration_date_gte is not None:
-            params["expiration_date_gte"] = expiration_date_gte.isoformat()
-        if expiration_date_lte is not None:
-            params["expiration_date_lte"] = expiration_date_lte.isoformat()
-        if root_symbol:
-            params["root_symbol"] = root_symbol.strip().upper()
-        if updated_since is not None:
-            params["updated_since"] = (
-                updated_since.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        sym = underlying.strip().upper()
+        try:
+            # get_option_contracts or get_options_snapshots depending on SDK version
+            snapshots = self._trading_client.get_option_contracts(
+                underlying_symbols=[sym],
+                feed=feed,
             )
+        except AttributeError:
+            # Older SDK — fall back to requests-based approach
+            logger.warning("get_option_contracts not available — chain will be empty")
+            return []
+        except Exception as exc:
+            logger.warning("Option chain fetch failed for %s: %s", sym, exc)
+            return []
 
-        chain: List[Dict[str, Any]] = []
-        next_page: Optional[str] = None
+        results: List[Dict[str, Any]] = []
+        for contract in (snapshots or []):
+            contract_sym = str(getattr(contract, "symbol", "") or "")
+            if not contract_sym:
+                continue
+            try:
+                parsed = parse_osi(contract_sym)
+            except ValueError:
+                continue
 
-        while True:
-            p = dict(params)
-            if next_page:
-                p["page_token"] = next_page
-            data = self._request_json_url("GET", url, params=p)
-            if not isinstance(data, dict):
-                raise BrokerConnectionError("alpaca", f"Unexpected chain response for {sym}")
-            for contract_sym, snap in (data.get("snapshots") or {}).items():
-                if isinstance(snap, dict):
-                    row = dict(snap)
-                    row["contract_symbol"] = contract_sym
-                    chain.append(row)
-                    if 0 < limit <= len(chain):
-                        return chain
-            nxt = data.get("next_page_token")
-            next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
-            if not next_page:
+            exp    = parsed.expiry.date()
+            strike = float(parsed.strike)
+            right  = parsed.right   # "C" or "P"
+
+            if not include_calls and right == "C":
+                continue
+            if not include_puts and right == "P":
+                continue
+            if expiration_date     is not None and exp    != expiration_date:     continue
+            if expiration_date_gte is not None and exp     < expiration_date_gte: continue
+            if expiration_date_lte is not None and exp     > expiration_date_lte: continue
+            if strike_price_gte    is not None and strike  < strike_price_gte:    continue
+            if strike_price_lte    is not None and strike  > strike_price_lte:    continue
+
+            row: Dict[str, Any] = {"contract_symbol": contract_sym}
+            # Map SDK fields to the dict shape the rest of the app expects
+            greeks = getattr(contract, "greeks", None) or {}
+            if hasattr(greeks, "__dict__"):
+                greeks = greeks.__dict__
+            quote  = getattr(contract, "latest_quote", None) or {}
+            if hasattr(quote, "__dict__"):
+                quote = quote.__dict__
+
+            row["greeks"]      = greeks
+            row["latestQuote"] = {
+                "ap": quote.get("ask_price") or quote.get("ap"),
+                "bp": quote.get("bid_price") or quote.get("bp"),
+            }
+            results.append(row)
+
+            if 0 < limit <= len(results):
                 break
 
-        return chain
-
-    # ------------------------------------------------------------------
-    # Private Alpaca order builders
-    # ------------------------------------------------------------------
-
-    def _to_alpaca_mleg(self, order: MultiLegLimitOrder) -> Any:
-        try:
-            from alpaca.trading.enums import OrderClass, OrderType
-            from alpaca.trading.enums import TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
-            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-        except ImportError as exc:
-            raise RuntimeError("alpaca-py is not installed") from exc
-
-        tif  = AlpacaTIF.DAY if order.time_in_force == DomainTIF.DAY else AlpacaTIF.GTC
-        legs = [
-            OptionLegRequest(
-                symbol=str(leg.contract.option_symbol).strip().upper(),
-                side=AlpacaSide.BUY if leg.side == DomainOrderSide.BUY else AlpacaSide.SELL,
-                ratio_qty=int(leg.ratio),
-            )
-            for leg in order.legs
-        ]
-        if len(legs) < 2:
-            raise ValueError("MLEG order requires at least 2 legs")
-
-        return LimitOrderRequest(
-            type=OrderType.LIMIT,
-            order_class=OrderClass.MLEG,
-            qty=float(order.quantity),
-            limit_price=float(self._quantise_2dp(order.limit_price)),
-            time_in_force=tif,
-            client_order_id=str(order.client_order_id),
-            legs=legs,
+        logger.info(
+            "Option chain | sym=%s total=%d expiry=[%s → %s]",
+            sym, len(results), expiration_date_gte, expiration_date_lte,
         )
+        return results
 
-    def _to_alpaca_market(self, order: MarketOrder) -> Any:
-        try:
-            from alpaca.trading.enums import TimeInForce as AlpacaTIF, OrderSide as AlpacaSide
-            from alpaca.trading.requests import MarketOrderRequest
-        except ImportError as exc:
-            raise RuntimeError("alpaca-py is not installed") from exc
+    # ------------------------------------------------------------------
+    # Order submission
+    # ------------------------------------------------------------------
 
-        return MarketOrderRequest(
+    def _submit_market_order(self, order: OrderABC) -> Any:
+        if not isinstance(order, MarketOrder):
+            raise TypeError(f"Expected MarketOrder, got {type(order).__name__}")
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce as AlpacaTIF
+
+        side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
+        tif  = AlpacaTIF.DAY  # always DAY for options
+
+        req = MarketOrderRequest(
             symbol=order.symbol,
             qty=order.quantity,
-            side=AlpacaSide.BUY if order.side == DomainOrderSide.BUY else AlpacaSide.SELL,
-            time_in_force=AlpacaTIF.DAY if order.time_in_force == DomainTIF.DAY else AlpacaTIF.GTC,
+            side=side,
+            time_in_force=tif,
         )
+        logger.info(
+            "Submitting market order | symbol=%s side=%s qty=%d",
+            order.symbol, side.value, order.quantity,
+        )
+        return self._trading_client.submit_order(req)
+
+    def _submit_multileg_limit_order(self, order: OrderABC) -> Any:
+        if not isinstance(order, MultiLegLimitOrder):
+            raise TypeError(f"Expected MultiLegLimitOrder, got {type(order).__name__}")
+        from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+        from alpaca.trading.enums import OrderClass, TimeInForce as AlpacaTIF, PositionIntent
+
+        legs = []
+        for leg in order.legs:
+            side_str = "buy" if leg.side == OrderSide.BUY else "sell"
+            # Determine position intent from contract + side
+            # BUY = BTO (opening), SELL = STO (opening) for entries
+            # For closing legs the execution policy sets position_intent
+            pi = PositionIntent.BUY_TO_OPEN if leg.side == OrderSide.BUY else PositionIntent.SELL_TO_OPEN
+            legs.append(OptionLegRequest(
+                symbol=leg.contract.option_symbol,
+                ratio_qty=leg.ratio,
+                side=side_str,
+                position_intent=pi,
+            ))
+
+        req = LimitOrderRequest(
+            order_class=OrderClass.MLEG,
+            qty=order.quantity,
+            limit_price=float(order.limit_price),
+            time_in_force=AlpacaTIF.DAY,
+            legs=legs,
+        )
+        logger.info(
+            "Submitting MLEG order | underlying=%s legs=%d limit=%.2f qty=%d",
+            order.underlying, len(legs), float(order.limit_price), order.quantity,
+        )
+        return self._trading_client.submit_order(req)
+
+    # ------------------------------------------------------------------
+    # Dict converters — Alpaca SDK objects → plain dicts the app expects
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _position_to_dict(p: Any) -> Dict[str, Any]:
+        return {
+            "symbol":           str(getattr(p, "symbol", "") or ""),
+            "asset_class":      str(getattr(p, "asset_class", "") or ""),
+            "qty":              str(getattr(p, "qty", 0) or 0),
+            "side":             str(getattr(p, "side", "") or ""),
+            "market_value":     str(getattr(p, "market_value", 0) or 0),
+            "cost_basis":       str(getattr(p, "cost_basis", 0) or 0),
+            "unrealized_pl":    str(getattr(p, "unrealized_pl", 0) or 0),
+            "current_price":    str(getattr(p, "current_price", 0) or 0),
+            "underlying_symbol": str(getattr(p, "underlying_symbol", "") or ""),
+        }
+
+    @staticmethod
+    def _order_to_dict(o: Any) -> Dict[str, Any]:
+        legs = []
+        for leg in (getattr(o, "legs", None) or []):
+            legs.append({
+                "symbol": str(getattr(leg, "symbol", "") or ""),
+                "side":   str(getattr(leg, "side", "") or ""),
+            })
+        return {
+            "id":                str(getattr(o, "id", "") or ""),
+            "symbol":            str(getattr(o, "symbol", "") or ""),
+            "underlying_symbol": str(getattr(o, "underlying_symbol", "") or ""),
+            "order_class":       str(getattr(o, "order_class", "") or ""),
+            "status":            str(getattr(o, "status", "") or ""),
+            "side":              str(getattr(o, "side", "") or ""),
+            "qty":               str(getattr(o, "qty", 0) or 0),
+            "legs":              legs,
+        }

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -22,35 +20,9 @@ from src.domain.orders import (
     OrderSide as DomainOrderSide,
 )
 from src.domain.types import AssetQuote
+from src.orchestration.cycle_snapshot import AccountSnapshot
+from src.utilities.clock import BacktestClock, ClockABC, LiveClock
 from src.utilities.logger import setup_logger
-
-
-
-
-
-"""
-src/backtest/alpaca_historical_broker.py
------------------------------------------
-Implements BrokerABC against Alpaca's historical data API and a
-SimulatedAccount for order execution.
-
-Data sources:
-  - Stock quotes:   /v2/stocks/{sym}/bars  (daily OHLCV, use close as mid)
-  - Option chains:  /v1beta1/options/snapshots/{sym}  (same endpoint as live,
-                    but we pass a date parameter to get historical EOD data)
-
-Fill model:
-  - Market orders (BTC/STO single-leg): fill at bid (sells) or ask (buys)
-    from the historical chain snapshot for that date.
-  - MLEG limit orders (PMCC entry): fill at the limit price if
-    (leap_ask - near_bid) <= limit_price, otherwise not filled this cycle.
-
-Alpaca's historical options snapshot endpoint returns EOD data when you
-pass `feed=indicative` and a specific date. We request one date at a time.
-
-The broker is stateless w.r.t. dates — the BacktestRunner sets the current
-date before each cycle via set_date().
-"""
 
 logger = setup_logger("AlpacaHistoricalBroker")
 
@@ -61,38 +33,42 @@ _OPTION_BASE = "https://data.alpaca.markets/v1beta1"
 @dataclass
 class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
     """
-    BrokerABC implementation for backtesting.
+    BrokerABC for paper testing and backtesting.
 
-    The runner calls set_date() at the start of each cycle to point the
-    broker at the correct historical date. All data fetches then use that
-    date. Orders are simulated against the same day's prices.
-
-    Rate limiting: Alpaca's data API allows ~200 req/min on free tier.
-    We add a small sleep between chain fetches to stay safe.
+    get_account_snapshot() returns a typed AccountSnapshot — equity, cash,
+    option_buying_power, positions, open_orders in one call.
+    CycleSnapshotBuilder no longer needs separate get_equity() /
+    get_positions() / get_open_orders() calls.
     """
 
-    account:       SimulatedAccount
-    api_key:       str
-    api_secret:    str
-    rate_limit_sleep: float = 0.4   # seconds between API calls
+    account:          SimulatedAccount
+    api_key:          str
+    api_secret:       str
+    clock:            ClockABC = field(default_factory=LiveClock)
+    rate_limit_sleep: float    = 0.15
 
-    _current_date: date               = field(init=False, default_factory=date.today)
-    _session:      Optional[Session]  = field(init=False, default=None)
-    # Cache chain data within a single cycle — avoid re-fetching the same
-    # chain multiple times (get_option_chain_requests may request leaps and
-    # shorts separately but they often overlap).
-    _chain_cache:  Dict[str, List[Dict[str, Any]]] = field(default_factory=dict, init=False)
-    _bar_cache:    Dict[str, float]                 = field(default_factory=dict, init=False)
+    _session:     Optional[Session]               = field(init=False, default=None)
+    _chain_cache: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict, init=False)
+    _bar_cache:   Dict[str, float]                = field(default_factory=dict, init=False)
 
     # ------------------------------------------------------------------
-    # Date control (called by BacktestRunner)
+    # Date control
     # ------------------------------------------------------------------
 
     def set_date(self, d: date) -> None:
-        self._current_date = d
+        if not isinstance(self.clock, BacktestClock):
+            raise TypeError(
+                "set_date() requires a BacktestClock. "
+                "Did you forget to pass clock=BacktestClock() when constructing the broker?"
+            )
+        self.clock.set_date(d)
         self._chain_cache.clear()
         self._bar_cache.clear()
         logger.info("BacktestBroker date set | date=%s", d.isoformat())
+
+    @property
+    def _current_date(self) -> date:
+        return self.clock.today()
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -124,53 +100,35 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         return response.json()
 
     # ------------------------------------------------------------------
-    # ExecutionBrokerABC
+    # ExecutionBrokerABC — account
     # ------------------------------------------------------------------
 
-    def get_account_snapshot(self) -> Dict[str, Any]:
-        return {
-            "equity":               str(self.account.equity),
-            "options_buying_power": str(self.account.option_buying_power),
-            "cash":                 str(self.account.cash),
-        }
-
-    def get_option_buying_power(self) -> float:
-        return self.account.option_buying_power
-
-    def get_equity(self) -> float:
-        return self.account.equity
-
-    def get_positions(self) -> List[Dict[str, Any]]:
-        return self.account.positions()
-
-    def get_open_orders(self) -> List[Dict[str, Any]]:
-        # In backtest all orders fill same-day — no open orders carry over.
-        return []
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """One call returns all account state as a typed value object."""
+        return AccountSnapshot(
+            equity=self.account.equity,
+            cash=self.account.cash,
+            option_buying_power=self.account.option_buying_power,
+            positions=self.account.positions(),
+            open_orders=[],   # all orders fill same-day in simulation
+        )
 
     def submit_order(self, order: OrderABC) -> Any:
         date_str = self._current_date.isoformat()
-
         if isinstance(order, MultiLegLimitOrder):
             return self._fill_mleg(order, date_str)
-
         if isinstance(order, MarketOrder):
             return self._fill_market(order, date_str)
-
         raise TypeError(f"Unsupported order type: {type(order).__name__}")
 
     def cancel_order(self, order_id: str) -> None:
-        pass  # No open orders in backtest
+        pass
 
     # ------------------------------------------------------------------
     # MarketDataProviderABC
     # ------------------------------------------------------------------
 
     def get_asset_quote(self, symbol: str) -> AssetQuote:
-        """
-        Return EOD close price for the symbol on _current_date.
-        We use the daily bar close as both bid and ask (no spread model
-        for the underlying — we only need it for spot price in strategy logic).
-        """
         sym   = symbol.strip().upper()
         price = self._get_bar_close(sym)
         return AssetQuote(
@@ -178,9 +136,7 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
             bid=price,
             ask=price,
             mid=price,
-            timestamp_utc=datetime.combine(
-                self._current_date, datetime.min.time(), tzinfo=timezone.utc
-            ),
+            timestamp_utc=self.clock.now_utc(),
         )
 
     def get_latest_price(self, symbol: str) -> float:
@@ -217,74 +173,81 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch the full EOD option chain snapshot for the given date, then
-        filter client-side.
-
-        Alpaca's historical snapshot endpoint (/v1beta1/options/snapshots/{sym}
-        with ?date=YYYY-MM-DD) does NOT support expiration_date_gte /
-        expiration_date_lte as query parameters — it returns 400 if you send
-        them. The live endpoint does support them. We handle this by fetching
-        the full chain (paginated) and filtering in Python.
-
-        The full SPY chain for one date is ~5,000-8,000 contracts. We cache
-        the raw full chain keyed by (sym, date, type) so that the leaps and
-        shorts requests within the same cycle share one HTTP fetch.
-        """
         sym = underlying.strip().upper()
         url = f"{_OPTION_BASE}/options/snapshots/{sym}"
 
-        # Only send params the historical endpoint actually supports.
-        params: Dict[str, Any] = {
-            "feed": "indicative",
-            "date": self._current_date.isoformat(),
-        }
+        params: Dict[str, Any] = {"feed": "indicative"}
         if include_calls and not include_puts:
             params["type"] = "call"
         elif include_puts and not include_calls:
             params["type"] = "put"
 
-        # Cache the full raw chain — both the leaps and shorts requests
-        # within one cycle hit the same underlying fetch.
-        cache_key = f"{sym}:{self._current_date}:{params.get('type','')}"
+        cache_key = f"{sym}:{self._current_date}:{params.get('type', '')}"
+
         if cache_key not in self._chain_cache:
+            import sys as _sys
             raw_chain: List[Dict[str, Any]] = []
             next_page: Optional[str] = None
+            page_num = 0
+            _MAX_RAW = 3000
+
+            _sys.stdout.write(f"\r  Fetching {sym} chain... 0 contracts")
+            _sys.stdout.flush()
+
             while True:
                 p = dict(params)
                 if next_page:
                     p["page_token"] = next_page
                 data = self._get(url, params=p)
                 if not isinstance(data, dict):
-                    raise BrokerConnectionError("alpaca-historical", f"Unexpected response for {sym}")
+                    raise BrokerConnectionError(
+                        "alpaca-historical", f"Unexpected response for {sym}"
+                    )
+                page_num += 1
                 for contract_sym, snap in (data.get("snapshots") or {}).items():
                     if isinstance(snap, dict):
                         row = dict(snap)
                         row["contract_symbol"] = contract_sym
                         raw_chain.append(row)
+
+                _sys.stdout.write(
+                    f"\r  Fetching {sym} chain... {len(raw_chain)} contracts (page {page_num})"
+                )
+                _sys.stdout.flush()
+
+                if len(raw_chain) >= _MAX_RAW:
+                    logger.warning(
+                        "Chain fetch capped at %d contracts for %s",
+                        _MAX_RAW, sym,
+                    )
+                    break
+
                 nxt = data.get("next_page_token")
-                next_page = str(nxt).strip() if isinstance(nxt, str) and nxt.strip() else None
+                next_page = (
+                    str(nxt).strip()
+                    if isinstance(nxt, str) and nxt.strip()
+                    else None
+                )
                 if not next_page:
                     break
+
+            _sys.stdout.write(
+                f"\r  Chain fetched: {sym} — {len(raw_chain)} contracts ({page_num} pages)\n"
+            )
+            _sys.stdout.flush()
+
             logger.info(
-                "Historical chain fetched | sym=%s date=%s contracts=%d",
-                sym, self._current_date, len(raw_chain),
+                "Chain fetched | sym=%s date=%s contracts=%d pages=%d",
+                sym, self._current_date, len(raw_chain), page_num,
             )
             self._chain_cache[cache_key] = raw_chain
         else:
             logger.info("Chain cache hit | key=%s", cache_key)
 
-        chain = self._chain_cache[cache_key]
-
-        # ----------------------------------------------------------------
-        # Client-side filtering — mirrors what the live endpoint does
-        # server-side. Applied after the cache so repeated calls with
-        # different filters reuse the same HTTP fetch.
-        # ----------------------------------------------------------------
         from src.risk.pmcc_sizer import parse_osi
 
-        filtered = []
-        for row in chain:
+        filtered: List[Dict[str, Any]] = []
+        for row in self._chain_cache[cache_key]:
             sym_str = str(row.get("contract_symbol", "")).strip().upper()
             if not sym_str:
                 continue
@@ -293,30 +256,22 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
             except ValueError:
                 continue
 
-            exp = parsed.expiry.date()
-
-            if expiration_date is not None and exp != expiration_date:
-                continue
-            if expiration_date_gte is not None and exp < expiration_date_gte:
-                continue
-            if expiration_date_lte is not None and exp > expiration_date_lte:
-                continue
-
+            exp    = parsed.expiry.date()
             strike = float(parsed.strike)
-            if strike_price_gte is not None and strike < strike_price_gte:
-                continue
-            if strike_price_lte is not None and strike > strike_price_lte:
-                continue
+
+            if expiration_date     is not None and exp    != expiration_date:     continue
+            if expiration_date_gte is not None and exp     < expiration_date_gte: continue
+            if expiration_date_lte is not None and exp     > expiration_date_lte: continue
+            if strike_price_gte    is not None and strike  < strike_price_gte:    continue
+            if strike_price_lte    is not None and strike  > strike_price_lte:    continue
 
             filtered.append(row)
-
             if 0 < limit <= len(filtered):
                 break
 
         logger.info(
-            "Chain filtered | sym=%s date=%s total=%d filtered=%d "
-            "expiry=[%s → %s]",
-            sym, self._current_date, len(chain), len(filtered),
+            "Chain filtered | sym=%s total=%d filtered=%d expiry=[%s → %s]",
+            sym, len(self._chain_cache[cache_key]), len(filtered),
             expiration_date_gte, expiration_date_lte,
         )
         return filtered
@@ -326,38 +281,26 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
     # ------------------------------------------------------------------
 
     def _fill_mleg(self, order: MultiLegLimitOrder, date_str: str) -> None:
-        """
-        Fill a PMCC entry (BTO LEAP + STO NEAR) at historical EOD prices.
-
-        We accept the fill if the net debit implied by historical prices
-        is <= the limit price on the order. This matches how a limit order
-        would behave — if the market is worse than the limit, no fill.
-        """
         underlying = str(order.underlying).upper()
-
-        # Gather fill prices for each leg from the chain cache.
         leg_fills: List[Dict[str, Any]] = []
+
         for leg in order.legs:
             sym   = str(leg.contract.option_symbol).upper()
             price = self._get_option_price(sym, leg.side)
             if price is None:
-                logger.warning(
-                    "MLEG fill skipped — no price for %s on %s", sym, date_str,
-                )
+                logger.warning("MLEG fill skipped — no price for %s on %s", sym, date_str)
                 return
             leg_fills.append({
-                "symbol": sym, "side": leg.side, "price": price,
-                "underlying": underlying,
+                "symbol": sym, "side": leg.side,
+                "price": price, "underlying": underlying,
             })
 
-        # Net debit = buy legs - sell legs (per contract, pre-multiplier)
         net_debit = sum(
             f["price"] if f["side"] == DomainOrderSide.BUY else -f["price"]
             for f in leg_fills
         )
-
         limit = float(order.limit_price)
-        if net_debit > limit * 1.02:   # 2% tolerance for EOD vs intraday
+        if limit > 0 and net_debit > limit * 1.02:
             logger.info(
                 "MLEG fill skipped — net_debit %.2f > limit %.2f | date=%s",
                 net_debit, limit, date_str,
@@ -378,17 +321,12 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
                 )
 
     def _fill_market(self, order: MarketOrder, date_str: str) -> None:
-        """
-        Fill a single-leg market order (BTC or STO) at historical EOD prices.
-        """
         sym        = str(order.symbol).upper()
         underlying = self._underlying_from_osi(sym)
         price      = self._get_option_price(sym, order.side)
 
         if price is None:
-            logger.warning(
-                "Market fill skipped — no price for %s on %s", sym, date_str,
-            )
+            logger.warning("Market fill skipped — no price for %s on %s", sym, date_str)
             return
 
         qty = int(order.quantity)
@@ -404,7 +342,7 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
             )
 
     # ------------------------------------------------------------------
-    # Price lookup helpers
+    # Price helpers
     # ------------------------------------------------------------------
 
     def _get_option_price(
@@ -412,11 +350,6 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         osi_symbol: str,
         side: DomainOrderSide,
     ) -> Optional[float]:
-        """
-        Find the fill price for an option from the cached chain data.
-        Buys fill at ask; sells fill at bid. Falls back to mid if one
-        side is missing.
-        """
         for chain_data in self._chain_cache.values():
             for row in chain_data:
                 if str(row.get("contract_symbol", "")).upper() == osi_symbol:
@@ -429,10 +362,8 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
                     else:
                         return bid if bid > 0 else (mid if mid > 0 else None)
 
-        # Not in any cached chain — fetch directly (rare: only for management
-        # orders where chain wasn't fetched this cycle).
         logger.warning(
-            "Option not in chain cache — fetching single snapshot | sym=%s", osi_symbol,
+            "Option not in chain cache — fetching full snapshot | sym=%s", osi_symbol
         )
         underlying = self._underlying_from_osi(osi_symbol)
         try:
@@ -452,19 +383,16 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         return None
 
     def _get_bar_close(self, symbol: str) -> float:
-        """Fetch EOD close for the underlying on _current_date."""
         if symbol in self._bar_cache:
             return self._bar_cache[symbol]
 
-        # We request a small window around the target date to handle
-        # weekends/holidays — take the last bar at or before our date.
-        start = (self._current_date - timedelta(days=5)).isoformat()
-        end   = self._current_date.isoformat()
+        end   = self._current_date
+        start = (end - timedelta(days=5)).isoformat()
         url   = f"{_STOCK_BASE}/stocks/{symbol}/bars"
         data  = self._get(url, params={
             "timeframe":  "1Day",
             "start":      start,
-            "end":        end,
+            "end":        end.isoformat(),
             "adjustment": "raw",
             "feed":       "iex",
             "limit":      10,
@@ -481,10 +409,6 @@ class AlpacaHistoricalBroker(BrokerBase, BrokerABC):
         return close
 
     def update_position_market_values(self) -> None:
-        """
-        Revalue all open positions from cached chain prices.
-        Called by the runner at end of each cycle for accurate equity tracking.
-        """
         prices: Dict[str, float] = {}
         for chain_data in self._chain_cache.values():
             for row in chain_data:

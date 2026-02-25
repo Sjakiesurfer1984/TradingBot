@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Tuple
 
 from src.domain.orders import OptionContract, TimeInForce
 from src.domain.types import IntentId, StrategyId, Symbol
@@ -18,21 +18,7 @@ class PositionIntent(str, Enum):
 
 
 class IntentPayloadABC(ABC):
-    """Marker base — every intent payload type extends this."""
-
-
-@dataclass(frozen=True)
-class SingleOptionLeg:
-    contract_symbol:  str
-    position_intent:  PositionIntent
-    qty:              Optional[int]
-
-
-@dataclass(frozen=True)
-class OptionIntentPayload(IntentPayloadABC):
-    """Single-leg management intent (sell NEAR, buy-back NEAR, etc.)."""
-    underlying_symbol: Symbol
-    leg:               SingleOptionLeg
+    """Marker base — every intent payload extends this for RiskEngine dispatch."""
 
 
 @dataclass(frozen=True)
@@ -41,13 +27,94 @@ class SelectedOption:
     contract:      OptionContract
 
 
-@dataclass(frozen=True)
-class PmccIntentPayload(IntentPayloadABC):
-    """PMCC entry intent — carries both legs so the sizer knows which is LEAP/NEAR."""
-    underlying_symbol: Symbol
-    leap_leg:          SelectedOption
-    near_leg:          SelectedOption
+# ---------------------------------------------------------------------------
+# Semantic payloads — named after what the strategy wants to achieve,
+# not after the mechanical shape of the trade.
+#
+# ExecutionPolicy reads the payload type and decides how many broker orders
+# to emit. Strategy and RiskEngine never see OrderABC.
+# ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class EnterPmccPayload(IntentPayloadABC):
+    """
+    Open a new PMCC spread.
+
+    Roles are explicit fields — the sizer knows which leg is the LEAP
+    without inspecting DTE or any PMCC-specific heuristic.
+
+    → ExecutionPolicy emits ONE MultiLegLimitOrder (BTO leap + STO near).
+    → Alpaca MLEG supports this: short is covered by the long in the same order.
+    """
+    underlying_symbol: Symbol
+    leap:              SelectedOption
+    near:              SelectedOption
+    max_debit:         float   # net debit ceiling in points (e.g. 45.00 = $4500/contract)
+
+
+@dataclass(frozen=True)
+class RollNearPayload(IntentPayloadABC):
+    """
+    Close the current short NEAR and open a new one.
+
+    Both legs are always present — a roll is never a single-leg action.
+
+    → ExecutionPolicy emits TWO sequential MarketOrders: BTC close, then STO open.
+    → Alpaca MLEG CANNOT do this: the STO leg would be uncovered at submission
+      (the BTC hasn't filled yet), so Alpaca Level 3 rejects it. Sequential
+      single-leg orders are the only safe path.
+
+    max_net_debit: the maximum net cost of the roll in points.
+      Negative means we collect a credit (the ideal case).
+      Positive means we pay a debit (acceptable up to this ceiling).
+    """
+    underlying_symbol: Symbol
+    close:             SelectedOption   # BTC this
+    open:              SelectedOption   # STO this
+    max_net_debit:     float
+
+
+@dataclass(frozen=True)
+class CloseLegPayload(IntentPayloadABC):
+    """
+    Close a single option leg (BTC a short NEAR, or STC a long LEAP).
+
+    Used for:
+      - NEAR_ONLY illegal state: BTC the naked short immediately.
+      - LEAP danger intermediate step: BTC the near before closing the LEAP.
+      - Any single-leg management action.
+
+    → ExecutionPolicy emits ONE MarketOrder.
+    """
+    underlying_symbol: Symbol
+    contract:          SelectedOption
+    position_intent:   PositionIntent   # BTC or STC
+    qty:               int = 1
+
+
+@dataclass(frozen=True)
+class CloseSpreadPayload(IntentPayloadABC):
+    """
+    Close the entire PMCC spread (both legs together).
+
+    Used when:
+      - LEAP danger threshold is hit — close everything atomically.
+      - End-of-backtest cleanup.
+
+    Both legs are STC / BTC closes — no uncovered short is created,
+    so Alpaca MLEG accepts this as a single order.
+
+    → ExecutionPolicy emits ONE MultiLegLimitOrder (STC near + STC leap).
+    → Alpaca MLEG supports this: both legs are closing, no new short opened.
+    """
+    underlying_symbol: Symbol
+    near:              SelectedOption   # BTC (short → close)
+    leap:              SelectedOption   # STC (long → close)
+
+
+# ---------------------------------------------------------------------------
+# Envelope + factory
+# ---------------------------------------------------------------------------
 
 def _make_intent_id(strategy_id: str, symbol: str) -> IntentId:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -60,8 +127,8 @@ class TradeIntent:
     strategy_id:   StrategyId
     symbol:        Symbol
     payload:       IntentPayloadABC
-    time_in_force: TimeInForce          = TimeInForce.DAY
-    tags:          Tuple[str, ...]      = field(default_factory=tuple)
+    time_in_force: TimeInForce        = TimeInForce.DAY
+    tags:          Tuple[str, ...]    = field(default_factory=tuple)
 
     @classmethod
     def create(

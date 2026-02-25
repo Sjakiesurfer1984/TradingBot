@@ -1,63 +1,68 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.signals import SignalSnapshot
 from src.domain.types import AssetQuote, OptionChainRequest, Symbol
-from src.orchestration.cycle_snapshot import CycleSnapshot
+from src.orchestration.cycle_snapshot import AccountSnapshot, CycleSnapshot
+from src.utilities.clock import ClockABC, LiveClock
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("CycleSnapshotBuilder")
 
 
-class CycleSnapshotBuilderABC(ABC):
-    @abstractmethod
-    def build_snapshot(
-        self,
-        *,
-        universe: List[Symbol],
-        option_chain_requests: List[OptionChainRequest],
-    ) -> CycleSnapshot:
-        raise NotImplementedError
-
-
 @dataclass(frozen=True)
-class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
+class CycleSnapshotBuilder:
+    """
+    Builds a CycleSnapshot from live broker data.
+
+    Composed from BrokerABC + ClockABC — no inheritance, no ABC of its own.
+    One class, two clock variants:
+      clock=LiveClock()      → production
+      clock=BacktestClock()  → backtest (set by BacktestRunner before each cycle)
+
+    Build sequence:
+      1. broker.get_account_snapshot() — one call, returns typed AccountSnapshot
+         (equity, cash, buying_power, positions, open_orders)
+      2. broker.get_asset_quote(sym) — once per symbol in universe
+      3. broker.get_option_chain(req) — once per OptionChainRequest, cached per cycle
+    """
+
     broker: BrokerABC
+    clock:  ClockABC = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.clock is None:
+            object.__setattr__(self, "clock", LiveClock())
 
     def build_snapshot(
         self,
         *,
-        universe: List[Symbol],
+        universe:             List[Symbol],
         option_chain_requests: List[OptionChainRequest],
     ) -> CycleSnapshot:
-        as_of = datetime.now(timezone.utc)
+        as_of = self.clock.now_utc()
 
-        # Single HTTP call — derive equity and option BP from the same response.
-        # Previously get_equity() and get_option_buying_power() each independently
-        # called get_account_snapshot(), resulting in 2 redundant /account round-trips.
+        # One call — typed AccountSnapshot covers everything about the account.
         account = self.broker.get_account_snapshot()
-        equity  = float(account.get("equity") or 0.0)
-        opt_bp  = float(account.get("options_buying_power") or 0.0)
 
         logger.info(
-            "Account snapshot | equity=%.2f options_buying_power=%.2f",
-            equity, opt_bp,
+            "Account snapshot | equity=%.2f option_buying_power=%.2f "
+            "positions=%d open_orders=%d",
+            account.equity,
+            account.option_buying_power,
+            len(account.positions),
+            len(account.open_orders),
         )
-
-        positions   = list(self.broker.get_positions())
-        open_orders = list(self.broker.get_open_orders())
 
         quotes: Dict[Symbol, AssetQuote] = {
             sym: self.broker.get_asset_quote(str(sym))
             for sym in universe
         }
 
-        chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]] = {}
+        chains: Dict[Tuple[Symbol, str], List[Any]] = {}
         for req in option_chain_requests:
             logger.info(
                 "Fetching option chain | underlying=%s id=%s expiry=[%s → %s]",
@@ -80,12 +85,9 @@ class CycleSnapshotBuilder(CycleSnapshotBuilderABC):
             chains[(Symbol(req.underlying), req.request_id)] = result
 
         return CycleSnapshot(
-            _as_of_utc=as_of,
-            _equity=equity,
-            _option_buying_power=opt_bp,
-            _positions=positions,
-            _open_orders=open_orders,
-            _asset_quotes=quotes,
-            _option_chains=chains,
-            _signals=SignalSnapshot.empty(as_of_utc=as_of),
+            as_of_utc=as_of,
+            account=account,
+            asset_quotes=quotes,
+            option_chains=chains,
+            signals=SignalSnapshot.empty(as_of_utc=as_of),
         )

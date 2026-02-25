@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+"""
+src/backtest/backtest_runner.py
+--------------------------------
+Steps through a date range calling orchestrator.run_cycle() once per trading day.
+
+Clock injection:
+  The runner owns a BacktestClock and advances it each cycle. The broker and
+  snapshot builder both depend on ClockABC — they automatically see the correct
+  historical date. No subclassing, no snapshot mutation, no monkey-patching.
+"""
+
 import csv
 import json
 import logging
@@ -7,35 +18,33 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from src.backtest.alpaca_historical_broker import AlpacaHistoricalBroker
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.orchestration.orchestrator_interface import CycleRunResult
+from src.utilities.clock import BacktestClock
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("BacktestRunner")
 
-# ---------------------------------------------------------------------------
-# US market holidays — update annually
-# ---------------------------------------------------------------------------
 _HOLIDAYS: set = {
     # 2023
-    date(2023, 1, 2), date(2023, 1, 16), date(2023, 2, 20), date(2023, 4, 7),
-    date(2023, 5, 29), date(2023, 6, 19), date(2023, 7, 4), date(2023, 9, 4),
-    date(2023, 11, 23), date(2023, 12, 25),
+    date(2023, 1, 2),  date(2023, 1, 16), date(2023, 2, 20), date(2023, 4, 7),
+    date(2023, 5, 29), date(2023, 6, 19), date(2023, 7, 4),  date(2023, 9, 4),
+    date(2023, 11, 23),date(2023, 12, 25),
     # 2024
-    date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
-    date(2024, 5, 27), date(2024, 6, 19), date(2024, 7, 4), date(2024, 9, 2),
-    date(2024, 11, 28), date(2024, 12, 25),
+    date(2024, 1, 1),  date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
+    date(2024, 5, 27), date(2024, 6, 19), date(2024, 7, 4),  date(2024, 9, 2),
+    date(2024, 11, 28),date(2024, 12, 25),
     # 2025
-    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
-    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1),
-    date(2025, 11, 27), date(2025, 12, 25),
+    date(2025, 1, 1),  date(2025, 1, 20), date(2025, 2, 17), date(2025, 4, 18),
+    date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4),  date(2025, 9, 1),
+    date(2025, 11, 27),date(2025, 12, 25),
     # 2026
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
-    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
-    date(2026, 11, 26), date(2026, 12, 25),
+    date(2026, 1, 1),  date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3),  date(2026, 9, 7),
+    date(2026, 11, 26),date(2026, 12, 25),
 }
 
 
@@ -52,10 +61,6 @@ def _trading_days(start: date, end: date) -> List[date]:
     return days
 
 
-# ---------------------------------------------------------------------------
-# Per-day result
-# ---------------------------------------------------------------------------
-
 @dataclass
 class DayResult:
     date:                str
@@ -66,10 +71,6 @@ class DayResult:
     open_positions:      int
 
 
-# ---------------------------------------------------------------------------
-# Progress bar — pure stdlib, no tqdm dependency
-# ---------------------------------------------------------------------------
-
 def _progress(current: int, total: int, width: int = 40) -> str:
     filled = int(width * current / total) if total else 0
     bar    = "█" * filled + "░" * (width - filled)
@@ -77,18 +78,15 @@ def _progress(current: int, total: int, width: int = 40) -> str:
     return f"\r[{bar}] {pct:5.1f}%  {current}/{total}"
 
 
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
 @dataclass
 class BacktestRunner:
     orchestrator: TradingOrchestrator
     broker:       AlpacaHistoricalBroker
+    clock:        BacktestClock
     start_date:   date
     end_date:     date
-    output_dir:   Path  = Path("backtest_results")
-    log_mode:     str   = "progress"   # "progress" | "verbose"
+    output_dir:   Path = field(default_factory=lambda: Path("backtest_results"))
+    log_mode:     str  = "progress"
 
     _day_results: List[DayResult] = field(default_factory=list, init=False)
 
@@ -101,14 +99,13 @@ class BacktestRunner:
             self.start_date, self.end_date, total,
         )
 
-        # In progress mode suppress all INFO logs from noisy internal loggers
-        # so the terminal only shows the progress bar and final summary.
         _silenced: List[logging.Logger] = []
         if self.log_mode == "progress":
             _noisy = [
                 "CycleSnapshotBuilder", "PmccStateClassifier", "PmccStrategy",
                 "PmccContractSelector", "AlpacaHistoricalBroker", "TradingOrchestrator",
-                "RiskEngine", "BrokerBase", "SimulatedAccount",
+                "RiskEngine", "BrokerBase", "SimulatedAccount", "IntentEvaluators",
+                "DefaultExecutionPolicy",
             ]
             for name in _noisy:
                 lg = logging.getLogger(name)
@@ -117,18 +114,17 @@ class BacktestRunner:
 
         try:
             for i, d in enumerate(days):
+                self.clock.set_date(d)
                 self.broker.set_date(d)
 
                 try:
                     result = self.orchestrator.run_cycle()
-                except Exception as exc:
+                except Exception:
                     if self.log_mode == "verbose":
                         logger.exception("Cycle failed | date=%s", d.isoformat())
                     result = CycleRunResult(
-                        orders_submitted=0,
-                        intents_generated=0,
-                        intents_approved=0,
-                        intents_rejected=0,
+                        orders_submitted=0, intents_generated=0,
+                        intents_approved=0, intents_rejected=0,
                     )
 
                 self.broker.update_position_market_values()
@@ -148,21 +144,19 @@ class BacktestRunner:
                     logger.info(
                         "Day complete | date=%s equity=%.2f cash=%.2f "
                         "positions=%d submitted=%d approved=%d rejected=%d",
-                        d.isoformat(),
-                        day_result.equity, day_result.cash, day_result.open_positions,
-                        result.orders_submitted, result.intents_approved, result.intents_rejected,
+                        d.isoformat(), day_result.equity, day_result.cash,
+                        day_result.open_positions, result.orders_submitted,
+                        result.intents_approved, result.intents_rejected,
                     )
                 else:
-                    # Inline progress bar — overwrites same line each tick
                     sys.stdout.write(
                         _progress(i + 1, total)
-                        + f"  equity=${day_result.equity:,.0f}  "
-                        f"pos={day_result.open_positions}"
+                        + f"  equity=${day_result.equity:,.0f}"
+                        f"  pos={day_result.open_positions}"
                     )
                     sys.stdout.flush()
 
         finally:
-            # Restore log levels regardless of how we exit
             for lg in _silenced:
                 lg.setLevel(logging.DEBUG)
 
@@ -173,10 +167,6 @@ class BacktestRunner:
         self._write_results()
         self._print_summary()
         return self._day_results
-
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
 
     def _write_results(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -218,10 +208,9 @@ class BacktestRunner:
         total_return = (last.equity - first.equity) / first.equity * 100
         ann_return   = total_return * (252 / days) if days > 0 else 0.0
 
-        peak   = first.equity
-        max_dd = 0.0
+        peak, max_dd = first.equity, 0.0
         for r in self._day_results:
-            peak  = max(peak, r.equity)
+            peak   = max(peak, r.equity)
             max_dd = max(max_dd, (peak - r.equity) / peak * 100)
 
         print("\n" + "=" * 60)

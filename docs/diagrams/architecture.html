@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Trading Bot — Architecture v2</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg:       #080a0d;
+  --s1:       #0e1117;
+  --s2:       #141820;
+  --border:   #1f2533;
+  --border2:  #2a3347;
+  --text:     #c0cce0;
+  --dim:      #4a5a72;
+  --bright:   #e8f0ff;
+
+  /* category colours — border-top accent only, backgrounds stay near-black */
+  --c-iface:    #2563eb;   /* interfaces / ABCs */
+  --c-core:     #0891b2;   /* core concrete (orchestrator, risk, execution) */
+  --c-broker:   #059669;   /* broker implementations */
+  --c-strategy: #7c3aed;   /* strategy layer */
+  --c-domain:   #b45309;   /* domain value objects */
+  --c-backtest: #be185d;   /* backtest layer */
+  --c-infra:    #374151;   /* config / scheduler */
+
+  --arrow:    #3b82f6;
+  --ret:      #334155;
+  --label:    #22d3ee;
+  --cond:     #f59e0b;
+  --note:     #475569;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 48px 36px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* ── Typography ── */
+h1 { font-size: 22px; font-weight: 700; color: var(--bright); letter-spacing: -0.3px; margin-bottom: 4px; }
+.sub { font-size: 11px; color: var(--dim); letter-spacing: 0.06em; margin-bottom: 52px; font-family: 'IBM Plex Mono', monospace; }
+
+h2 {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.18em; color: var(--dim);
+  margin-bottom: 24px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section { margin-bottom: 72px; }
+
+/* ── Legend ── */
+.legend { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 36px; }
+.li { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--dim); font-family: 'IBM Plex Mono', monospace; }
+.ld { width: 12px; height: 3px; border-radius: 1px; }
+
+/* ── CLASS BOXES ── */
+.grid { display: flex; flex-direction: column; gap: 28px; }
+.row  { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+
+.row-label {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.16em;
+  color: var(--dim); margin-bottom: 8px;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.box {
+  background: var(--s1);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  min-width: 172px;
+  max-width: 230px;
+  overflow: hidden;
+  flex-shrink: 0;
+  position: relative;
+}
+.box::before {
+  content: '';
+  display: block;
+  height: 3px;
+  width: 100%;
+}
+
+/* category top-border colours */
+.iface    { border-top: 3px solid var(--c-iface); }
+.core     { border-top: 3px solid var(--c-core); }
+.broker   { border-top: 3px solid var(--c-broker); }
+.strategy { border-top: 3px solid var(--c-strategy); }
+.domain   { border-top: 3px solid var(--c-domain); }
+.backtest { border-top: 3px solid var(--c-backtest); }
+.infra    { border-top: 3px solid var(--c-infra); }
+
+.box-head {
+  padding: 8px 11px 7px;
+  border-bottom: 1px solid var(--border);
+  font-family: 'IBM Plex Mono', monospace;
+}
+.box-head .tag {
+  font-size: 9px; color: var(--dim);
+  display: block; margin-bottom: 1px;
+  letter-spacing: 0.05em;
+}
+.box-head .name { font-size: 12px; font-weight: 600; color: var(--bright); }
+
+.box-body { padding: 8px 11px; font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; line-height: 1.9; }
+.f  { color: var(--text); }
+.m  { color: #38bdf8; }
+.hr { border: none; border-top: 1px solid var(--border); margin: 5px 0; }
+.nt { color: var(--dim); font-size: 10px; line-height: 1.6; }
+.del { color: #ef4444; text-decoration: line-through; opacity: 0.5; font-size: 10px; }
+
+/* ── RELATIONSHIPS TABLE ── */
+.rel-grid {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  gap: 1px 14px;
+  align-items: baseline;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+.rf  { color: var(--bright); font-weight: 600; }
+.ra  { color: var(--arrow); }
+.rt  { color: #38bdf8; }
+.rl  { color: var(--dim); font-size: 10px; }
+.rel-block { margin-bottom: 28px; }
+.rel-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--dim); margin-bottom: 10px; }
+
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+
+/* ── SVG sequence ── */
+svg { display: block; width: 100%; border: 1px solid var(--border); border-radius: 6px; background: var(--s1); }
+</style>
+</head>
+<body>
+
+<h1>Trading Bot — Architecture v2</h1>
+<p class="sub">composition over inheritance &nbsp;·&nbsp; lean intent model &nbsp;·&nbsp; semantic payloads &nbsp;·&nbsp; alpaca MLEG constraints respected</p>
+
+<!-- LEGEND -->
+<div class="legend">
+  <div class="li"><div class="ld" style="background:var(--c-iface)"></div>interface / ABC</div>
+  <div class="li"><div class="ld" style="background:var(--c-core)"></div>core concrete</div>
+  <div class="li"><div class="ld" style="background:var(--c-broker)"></div>broker</div>
+  <div class="li"><div class="ld" style="background:var(--c-strategy)"></div>strategy</div>
+  <div class="li"><div class="ld" style="background:var(--c-domain)"></div>domain value object</div>
+  <div class="li"><div class="ld" style="background:var(--c-backtest)"></div>backtest</div>
+  <div class="li"><div class="ld" style="background:var(--c-infra)"></div>infra / config</div>
+  <div class="li"><div class="ld" style="background:#ef4444"></div>deleted</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- CLASS DIAGRAM -->
+<!-- ================================================================ -->
+<div class="section">
+<h2>01 — Class Diagram</h2>
+<div class="grid">
+
+  <!-- ENTRY / INFRA -->
+  <div>
+    <div class="row-label">Entry &amp; Infrastructure</div>
+    <div class="row">
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">entrypoint</span><span class="name">main.py</span></div>
+        <div class="box-body">
+          <div class="f">+ main() → int</div>
+          <hr class="hr">
+          <div class="nt">wires LiveClock<br>wires TradeDatabase<br>starts Scheduler</div>
+        </div>
+      </div>
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">entrypoint</span><span class="name">run_backtest.py</span></div>
+        <div class="box-body">
+          <div class="f">+ main() → int</div>
+          <hr class="hr">
+          <div class="nt">wires BacktestClock<br>starts BacktestRunner</div>
+        </div>
+      </div>
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">infra · composed into main</span><span class="name">Scheduler</span></div>
+        <div class="box-body">
+          <div class="f">orchestrator: TradingOrchestrator</div>
+          <div class="f">cycle_seconds: float</div>
+          <hr class="hr">
+          <div class="m">+ run() → void</div>
+          <hr class="hr">
+          <div class="nt">calls run_cycle() on timer<br>owns KeyboardInterrupt guard</div>
+        </div>
+      </div>
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">config · frozen dataclass</span><span class="name">AppConfig</span></div>
+        <div class="box-body">
+          <div class="f">strategies: List[StrategySpec]</div>
+          <div class="f">backtest: BacktestConfig</div>
+          <div class="f">cycle_seconds: float</div>
+          <div class="f">default_dry_run: bool</div>
+          <hr class="hr">
+          <div class="nt">loaded from config.yaml</div>
+        </div>
+      </div>
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">config · frozen dataclass</span><span class="name">StrategySpec</span></div>
+        <div class="box-body">
+          <div class="f">name: str</div>
+          <div class="f">config: Any</div>
+          <hr class="hr">
+          <div class="nt">thin config envelope<br>keeps orchestrator ignorant<br>of PmccConfig internals</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ORCHESTRATION -->
+  <div>
+    <div class="row-label">Orchestration — composes all other layers</div>
+    <div class="row">
+
+      <div class="box core" style="max-width:280px">
+        <div class="box-head"><span class="tag">concrete · composes broker, strategies, risk, exec</span><span class="name">TradingOrchestrator</span></div>
+        <div class="box-body">
+          <div class="f">broker: BrokerABC</div>
+          <div class="f">strategies: List[StrategyABC]</div>
+          <div class="f">risk_engine: RiskEngine</div>
+          <div class="f">execution_policy: ExecutionPolicyABC</div>
+          <div class="f">snapshot_builder: CycleSnapshotBuilder</div>
+          <div class="f">dry_run: bool</div>
+          <hr class="hr">
+          <div class="m">+ run_cycle() → CycleRunResult</div>
+          <hr class="hr">
+          <div class="nt">Template Method: fixed cycle skeleton<br>all steps delegated to composed parts</div>
+        </div>
+      </div>
+
+      <div class="box core">
+        <div class="box-head"><span class="tag">concrete · composes broker + clock</span><span class="name">CycleSnapshotBuilder</span></div>
+        <div class="box-body">
+          <div class="f">broker: BrokerABC</div>
+          <div class="f">clock: ClockABC</div>
+          <hr class="hr">
+          <div class="m">+ build_snapshot(<br>&nbsp;&nbsp;universe,<br>&nbsp;&nbsp;chain_requests<br>) → CycleSnapshot</div>
+          <hr class="hr">
+          <div class="nt">clock=LiveClock in prod<br>clock=BacktestClock in test<br><b>no ABC needed — one builder</b></div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · frozen dataclass</span><span class="name">CycleSnapshot</span></div>
+        <div class="box-body">
+          <div class="f">as_of_utc: datetime</div>
+          <div class="f">account: AccountSnapshot</div>
+          <div class="f">asset_quotes: Dict[Symbol, AssetQuote]</div>
+          <div class="f">option_chains: Dict[str, List[Contract]]</div>
+          <div class="f">signals: SignalSnapshot</div>
+          <hr class="hr">
+          <div class="m">+ with_signals(s) → CycleSnapshot</div>
+          <hr class="hr">
+          <div class="nt">immutable — no ABC needed<br>one snapshot type</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · frozen dataclass</span><span class="name">AccountSnapshot</span></div>
+        <div class="box-body">
+          <div class="f">equity: float</div>
+          <div class="f">cash: float</div>
+          <div class="f">option_buying_power: float</div>
+          <div class="f">positions: List[Position]</div>
+          <div class="f">open_orders: List[OpenOrder]</div>
+          <hr class="hr">
+          <div class="nt">one broker call returns all<br>always needed every cycle<br>typed — no Dict[str,Any]</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">deleted</span><span class="name" style="color:#ef4444;text-decoration:line-through">OrchestratorABC</span></div>
+        <div class="box-body">
+          <div class="del">run_cycle() → CycleRunResult</div>
+          <hr class="hr">
+          <div class="nt">one orchestrator exists<br>Scheduler holds it directly<br>no polymorphism needed</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">deleted</span><span class="name" style="color:#ef4444;text-decoration:line-through">CycleSnapshotBuilderABC<br>CycleSnapshotABC</span></div>
+        <div class="box-body">
+          <div class="del">build_snapshot(…)</div>
+          <hr class="hr">
+          <div class="nt">one builder, one snapshot<br>ABCs were wrapping single impls<br>clock injection killed need for both</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- BROKER -->
+  <div>
+    <div class="row-label">Broker — add new brokers by implementing BrokerABC</div>
+    <div class="row">
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface · composition of two ABCs</span><span class="name">BrokerABC</span></div>
+        <div class="box-body">
+          <div class="m">+ get_account_snapshot() → AccountSnapshot</div>
+          <div class="m">+ get_asset_quote(sym) → AssetQuote</div>
+          <div class="m">+ get_option_chain(req) → List[Contract]</div>
+          <div class="m">+ submit_order(order: OrderABC) → Any</div>
+          <div class="m">+ cancel_order(id) → void</div>
+          <hr class="hr">
+          <div class="nt">= MarketDataProviderABC<br>&nbsp;&nbsp;+ ExecutionBrokerABC<br><br>get_account_snapshot wraps<br>equity, bp, positions, orders</div>
+        </div>
+      </div>
+
+      <div class="box broker">
+        <div class="box-head"><span class="tag">concrete · implements BrokerABC</span><span class="name">AlpacaBroker</span></div>
+        <div class="box-body">
+          <div class="f">api_key: str</div>
+          <div class="f">secret_key: str</div>
+          <div class="f">paper: bool</div>
+          <div class="f">clock: ClockABC</div>
+          <hr class="hr">
+          <div class="m">implements BrokerABC</div>
+          <div class="m">via Alpaca REST + alpaca-py</div>
+          <hr class="hr">
+          <div class="nt">live + paper trading<br>MLEG for entries &amp; close-all<br>sequential legs for rolls</div>
+        </div>
+      </div>
+
+      <div class="box backtest">
+        <div class="box-head"><span class="tag">concrete · implements BrokerABC</span><span class="name">AlpacaHistoricalBroker</span></div>
+        <div class="box-body">
+          <div class="f">account: SimulatedAccount</div>
+          <div class="f">clock: ClockABC</div>
+          <hr class="hr">
+          <div class="m">implements BrokerABC</div>
+          <div class="m">+ set_date(d: date)</div>
+          <hr class="hr">
+          <div class="nt">live chain endpoint only<br>(no historical chains exist)<br>fills → SimulatedAccount</div>
+        </div>
+      </div>
+
+      <div class="box backtest">
+        <div class="box-head"><span class="tag">future · implements BrokerABC</span><span class="name">ChainDatabaseBroker</span></div>
+        <div class="box-body">
+          <div class="f">db: TradeDatabaseABC</div>
+          <div class="f">clock: ClockABC</div>
+          <hr class="hr">
+          <div class="m">get_option_chain() reads<br>from chain_snapshots table</div>
+          <hr class="hr">
+          <div class="nt">enables true backtest once<br>chain_snapshots populated<br>one line swap in run_backtest.py</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- STRATEGY -->
+  <div>
+    <div class="row-label">Strategy — add new strategies by implementing StrategyABC</div>
+    <div class="row">
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface</span><span class="name">StrategyABC</span></div>
+        <div class="box-body">
+          <div class="m">+ get_symbols() → List[Symbol]</div>
+          <div class="m">+ generate_intents(snapshot) → List[TradeIntent]</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">mixin interface</span><span class="name">OptionChainConsumerABC</span></div>
+        <div class="box-body">
+          <div class="m">+ get_option_chain_requests(<br>&nbsp;&nbsp;snapshot<br>) → List[OptionChainRequest]</div>
+          <hr class="hr">
+          <div class="nt">implement only if strategy<br>needs chains — equity strategies<br>don't mix this in</div>
+        </div>
+      </div>
+
+      <div class="box strategy" style="max-width:260px">
+        <div class="box-head"><span class="tag">concrete · implements StrategyABC + OptionChainConsumerABC</span><span class="name">PmccStrategy</span></div>
+        <div class="box-body">
+          <div class="f">config: PmccConfig</div>
+          <div class="f">classifier: PmccStateClassifier</div>
+          <div class="f">selector: PmccContractSelector</div>
+          <hr class="hr">
+          <div class="m">+ get_symbols()</div>
+          <div class="m">+ get_option_chain_requests(snap)</div>
+          <div class="m">+ generate_intents(snap)</div>
+          <hr class="hr">
+          <div class="nt">FLAT → EnterPmccPayload<br>LEAP_ONLY → SellNearPayload<br>COVERED → RollNearPayload<br>NEAR_EXPIRY → RollNearPayload<br>CLOSE → CloseSpreadPayload</div>
+        </div>
+      </div>
+
+      <div class="box infra">
+        <div class="box-head"><span class="tag">config registry · no ABC</span><span class="name">STRATEGY_REGISTRY</span></div>
+        <div class="box-body">
+          <div class="f">Dict[str, StrategyEntry]</div>
+          <hr class="hr">
+          <div class="f">StrategyEntry:</div>
+          <div class="f">&nbsp;build: Callable[[StrategySpec], StrategyABC]</div>
+          <div class="f">&nbsp;register: Callable[[StrategySpec, RiskEngine]]</div>
+          <hr class="hr">
+          <div class="nt">plain dict, no ABC<br>add strategy = add one entry<br>main.py loops over it</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">deleted</span><span class="name" style="color:#ef4444;text-decoration:line-through">StrategyPlugin ABC</span></div>
+        <div class="box-body">
+          <div class="del">build_strategy(spec)</div>
+          <div class="del">register_evaluators(spec, engine)</div>
+          <hr class="hr">
+          <div class="nt">replaced by plain StrategyEntry<br>dataclass in STRATEGY_REGISTRY</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- DOMAIN — INTENTS -->
+  <div>
+    <div class="row-label">Domain — Intent model (semantic, not mechanical)</div>
+    <div class="row">
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · envelope</span><span class="name">TradeIntent</span></div>
+        <div class="box-body">
+          <div class="f">intent_id: IntentId</div>
+          <div class="f">strategy_id: StrategyId</div>
+          <div class="f">symbol: Symbol</div>
+          <div class="f">payload: IntentPayload</div>
+          <div class="f">time_in_force: TimeInForce</div>
+          <hr class="hr">
+          <div class="nt">strategy → risk boundary<br>what to achieve, not how</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · PMCC entry</span><span class="name">EnterPmccPayload</span></div>
+        <div class="box-body">
+          <div class="f">leap: SelectedOption</div>
+          <div class="f">near: SelectedOption</div>
+          <div class="f">max_debit: Decimal</div>
+          <hr class="hr">
+          <div class="nt">→ one MLEG limit order<br>(BTO leap + STO near)<br>Alpaca supports this ✅</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · NEAR roll</span><span class="name">RollNearPayload</span></div>
+        <div class="box-body">
+          <div class="f">close: SelectedOption  # BTC</div>
+          <div class="f">open: SelectedOption   # STO</div>
+          <div class="f">max_net_debit: Decimal</div>
+          <hr class="hr">
+          <div class="nt">→ two sequential market orders<br>BTC then STO<br>Alpaca MLEG rejects rolls ❌<br>ExecutionPolicy sequences them</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · single leg</span><span class="name">CloseLegPayload</span></div>
+        <div class="box-body">
+          <div class="f">contract: SelectedOption</div>
+          <div class="f">intent: PositionIntent  # BTC|STC</div>
+          <hr class="hr">
+          <div class="nt">→ one market order<br>close NEAR or LEAP alone</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · close spread</span><span class="name">CloseSpreadPayload</span></div>
+        <div class="box-body">
+          <div class="f">near: SelectedOption  # STC</div>
+          <div class="f">leap: SelectedOption  # STC</div>
+          <hr class="hr">
+          <div class="nt">→ one MLEG order (both STC)<br>no uncovered short — allowed ✅<br>or two market orders if needed</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">value object · risk→exec boundary</span><span class="name">ApprovedIntent</span></div>
+        <div class="box-body">
+          <div class="f">intent_id: str</div>
+          <div class="f">payload: IntentPayload</div>
+          <hr class="hr">
+          <div class="nt">payload travels through unchanged<br>ExecutionPolicy reads it directly<br>no type-erasure to Any</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">deleted</span><span class="name" style="color:#ef4444;text-decoration:line-through">PmccIntentPayload<br>OptionIntentPayload</span></div>
+        <div class="box-body">
+          <div class="del">leap_leg: SelectedOption</div>
+          <div class="del">near_leg: SelectedOption</div>
+          <div class="del">leg: SingleOptionLeg</div>
+          <hr class="hr">
+          <div class="nt">replaced by semantic payloads<br>above — role is explicit<br>not inferred from DTE</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- RISK -->
+  <div>
+    <div class="row-label">Risk — gates then evaluates each intent atomically</div>
+    <div class="row">
+
+      <div class="box core" style="max-width:260px">
+        <div class="box-head"><span class="tag">concrete · two-phase pipeline</span><span class="name">RiskEngine</span></div>
+        <div class="box-body">
+          <div class="f">rules: List[RiskRuleABC]</div>
+          <div class="f">evaluators: Dict[type, IntentEvaluatorABC]</div>
+          <hr class="hr">
+          <div class="m">+ register(payload_type, evaluator)</div>
+          <div class="m">+ evaluate(snapshot, intents) → RiskDecisionBatch</div>
+          <hr class="hr">
+          <div class="nt">phase 1: rules gate (dedupe, etc.)<br>phase 2: evaluator sizes + approves<br>dispatches by payload type<br>roll approved/rejected atomically</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface · chain-of-responsibility</span><span class="name">RiskRuleABC</span></div>
+        <div class="box-body">
+          <div class="m">+ evaluate(snapshot, intent) → RiskRuleOutcome</div>
+          <hr class="hr">
+          <div class="nt">gates: pass or reject<br>no order building<br>e.g. OpenOrderDedupeRule</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface · per payload type</span><span class="name">IntentEvaluatorABC</span></div>
+        <div class="box-body">
+          <div class="m">+ evaluate(snapshot, intent) → EvaluatorResult</div>
+          <hr class="hr">
+          <div class="nt">sizes, checks buying power<br>produces ApprovedIntent<br>one impl per strategy type</div>
+        </div>
+      </div>
+
+      <div class="box strategy">
+        <div class="box-head"><span class="tag">concrete · handles all PMCC payloads</span><span class="name">PmccEvaluator</span></div>
+        <div class="box-body">
+          <div class="f">sizer: PmccSizer</div>
+          <div class="f">max_units: int</div>
+          <hr class="hr">
+          <div class="m">evaluate(snap, intent)</div>
+          <hr class="hr">
+          <div class="nt">dispatches on payload type:<br>EnterPmcc → size contracts<br>RollNear → check net debit<br>CloseLeg → always approve<br>CloseSpread → always approve</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">deleted</span><span class="name" style="color:#ef4444;text-decoration:line-through">OptionIntentEvaluator</span></div>
+        <div class="box-body">
+          <div class="del">evaluate(snapshot, intent)</div>
+          <hr class="hr">
+          <div class="nt">merged into PmccEvaluator<br>single-leg closes are just<br>PMCC management actions</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- EXECUTION -->
+  <div>
+    <div class="row-label">Execution — converts semantic intents to broker orders</div>
+    <div class="row">
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface</span><span class="name">ExecutionPolicyABC</span></div>
+        <div class="box-body">
+          <div class="m">+ to_orders(approvals) → List[OrderABC]</div>
+          <hr class="hr">
+          <div class="nt">second impl = DryRunPolicy<br>(logs, returns empty list)</div>
+        </div>
+      </div>
+
+      <div class="box core" style="max-width:260px">
+        <div class="box-head"><span class="tag">concrete · builder registry, no switch</span><span class="name">DefaultExecutionPolicy</span></div>
+        <div class="box-body">
+          <div class="f">builders: Dict[type, OrderBuilderABC]</div>
+          <hr class="hr">
+          <div class="m">to_orders(approvals) → List[OrderABC]</div>
+          <hr class="hr">
+          <div class="nt">EnterPmcc → 1× MultiLegLimitOrder<br>RollNear → 2× MarketOrder (seq.)<br>CloseLeg → 1× MarketOrder<br>CloseSpread → 1× MultiLegLimitOrder</div>
+        </div>
+      </div>
+
+      <div class="box domain">
+        <div class="box-head"><span class="tag">domain orders · broker-agnostic</span><span class="name">OrderABC hierarchy</span></div>
+        <div class="box-body">
+          <div class="f">MultiLegLimitOrder</div>
+          <div class="f">&nbsp;legs: List[OptionLeg]</div>
+          <div class="f">&nbsp;limit_price: Decimal</div>
+          <hr class="hr">
+          <div class="f">MarketOrder</div>
+          <div class="f">&nbsp;symbol: str</div>
+          <div class="f">&nbsp;side: OrderSide</div>
+          <div class="f">&nbsp;position_intent: PositionIntent</div>
+          <hr class="hr">
+          <div class="nt">OrderABC = marker only<br>typed param on submit_order<br>broker translates to wire format</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- CLOCK + PERSISTENCE -->
+  <div>
+    <div class="row-label">Clock (GoF Strategy) &amp; Persistence (Null Object)</div>
+    <div class="row">
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface · GoF Strategy pattern</span><span class="name">ClockABC</span></div>
+        <div class="box-body">
+          <div class="m">+ now_utc() → datetime</div>
+          <div class="m">+ today() → date</div>
+        </div>
+      </div>
+
+      <div class="box core">
+        <div class="box-head"><span class="tag">concrete</span><span class="name">LiveClock</span></div>
+        <div class="box-body">
+          <div class="nt">returns datetime.now(utc)<br>stateless singleton</div>
+        </div>
+      </div>
+
+      <div class="box backtest">
+        <div class="box-head"><span class="tag">concrete · stepped by BacktestRunner</span><span class="name">BacktestClock</span></div>
+        <div class="box-body">
+          <div class="f">_date: date</div>
+          <hr class="hr">
+          <div class="m">+ set_date(d: date)</div>
+          <hr class="hr">
+          <div class="nt">shared instance across<br>broker + snapshot builder<br>one set_date() → both see it</div>
+        </div>
+      </div>
+
+      <div class="box iface">
+        <div class="box-head"><span class="tag">interface · Null Object pattern</span><span class="name">TradeDatabaseABC</span></div>
+        <div class="box-body">
+          <div class="m">+ record_fill(…)</div>
+          <div class="m">+ record_chain_snapshot(…)</div>
+          <div class="m">+ record_equity_snapshot(…)</div>
+          <div class="m">+ get_fills() → List</div>
+          <div class="m">+ get_chain_snapshot(…)</div>
+        </div>
+      </div>
+
+      <div class="box core">
+        <div class="box-head"><span class="tag">concrete</span><span class="name">TradeDatabase</span></div>
+        <div class="box-body">
+          <div class="f">db_path: Path</div>
+          <hr class="hr">
+          <div class="nt">SQLite · WAL mode<br>fills / positions /<br>chain_snapshots / equity_curve</div>
+        </div>
+      </div>
+
+      <div class="box core">
+        <div class="box-head"><span class="tag">null object</span><span class="name">NullTradeDatabase</span></div>
+        <div class="box-body">
+          <div class="nt">all writes no-op<br>all reads → []<br>used in tests + backtest</div>
+        </div>
+      </div>
+
+      <div class="box backtest">
+        <div class="box-head"><span class="tag">backtest</span><span class="name">BacktestRunner</span></div>
+        <div class="box-body">
+          <div class="f">orchestrator: TradingOrchestrator</div>
+          <div class="f">broker: AlpacaHistoricalBroker</div>
+          <div class="f">clock: BacktestClock</div>
+          <div class="f">start_date / end_date: date</div>
+          <hr class="hr">
+          <div class="m">+ run() → List[DayResult]</div>
+          <hr class="hr">
+          <div class="nt">owns date loop<br>calls clock.set_date() each day<br>writes equity_curve.csv</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- .grid -->
+</div><!-- .section -->
+
+<!-- ================================================================ -->
+<!-- RELATIONSHIPS -->
+<!-- ================================================================ -->
+<div class="section">
+<h2>02 — Relationships</h2>
+<div class="two">
+  <div>
+    <div class="rel-block">
+      <div class="rel-title">Implements (▷) — interface → concrete</div>
+      <div class="rel-grid">
+        <span class="rf">AlpacaBroker</span>            <span class="ra">──▷</span> <span class="rt">BrokerABC</span>              <span class="rl"></span>
+        <span class="rf">AlpacaHistoricalBroker</span>  <span class="ra">──▷</span> <span class="rt">BrokerABC</span>              <span class="rl">swappable in backtest</span>
+        <span class="rf">ChainDatabaseBroker</span>      <span class="ra">──▷</span> <span class="rt">BrokerABC</span>              <span class="rl">future</span>
+        <span class="rf">PmccStrategy</span>             <span class="ra">──▷</span> <span class="rt">StrategyABC</span>            <span class="rl"></span>
+        <span class="rf">PmccStrategy</span>             <span class="ra">──▷</span> <span class="rt">OptionChainConsumerABC</span> <span class="rl">mixin</span>
+        <span class="rf">PmccEvaluator</span>            <span class="ra">──▷</span> <span class="rt">IntentEvaluatorABC</span>     <span class="rl"></span>
+        <span class="rf">OpenOrderDedupeRule</span>      <span class="ra">──▷</span> <span class="rt">RiskRuleABC</span>            <span class="rl"></span>
+        <span class="rf">DefaultExecutionPolicy</span>   <span class="ra">──▷</span> <span class="rt">ExecutionPolicyABC</span>     <span class="rl"></span>
+        <span class="rf">TradeDatabase</span>            <span class="ra">──▷</span> <span class="rt">TradeDatabaseABC</span>       <span class="rl"></span>
+        <span class="rf">LiveClock</span>                <span class="ra">──▷</span> <span class="rt">ClockABC</span>               <span class="rl"></span>
+        <span class="rf">BacktestClock</span>            <span class="ra">──▷</span> <span class="rt">ClockABC</span>               <span class="rl"></span>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="rel-block">
+      <div class="rel-title">Composes (→) — depends on, injected</div>
+      <div class="rel-grid">
+        <span class="rf">TradingOrchestrator</span>   <span class="ra">──→</span> <span class="rt">BrokerABC</span>               <span class="rl">DIP</span>
+        <span class="rf">TradingOrchestrator</span>   <span class="ra">──→</span> <span class="rt">StrategyABC[]</span>           <span class="rl">DIP</span>
+        <span class="rf">TradingOrchestrator</span>   <span class="ra">──→</span> <span class="rt">RiskEngine</span>              <span class="rl"></span>
+        <span class="rf">TradingOrchestrator</span>   <span class="ra">──→</span> <span class="rt">ExecutionPolicyABC</span>      <span class="rl">DIP</span>
+        <span class="rf">TradingOrchestrator</span>   <span class="ra">──→</span> <span class="rt">CycleSnapshotBuilder</span>    <span class="rl">direct — no ABC</span>
+        <span class="rf">CycleSnapshotBuilder</span>  <span class="ra">──→</span> <span class="rt">BrokerABC</span>               <span class="rl">DIP</span>
+        <span class="rf">CycleSnapshotBuilder</span>  <span class="ra">──→</span> <span class="rt">ClockABC</span>                <span class="rl">Strategy pattern</span>
+        <span class="rf">AlpacaHistoricalBroker</span><span class="ra">──→</span> <span class="rt">ClockABC</span>                <span class="rl">same instance as builder</span>
+        <span class="rf">RiskEngine</span>            <span class="ra">──→</span> <span class="rt">IntentEvaluatorABC[]</span>    <span class="rl">registered by payload type</span>
+        <span class="rf">BacktestRunner</span>        <span class="ra">──→</span> <span class="rt">BacktestClock</span>           <span class="rl">owns + advances</span>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- SEQUENCE: ONE CYCLE -->
+<!-- ================================================================ -->
+<div class="section">
+<h2>03 — Sequence: One Live Cycle</h2>
+
+<svg viewBox="0 0 1120 740" font-family="IBM Plex Mono, monospace">
+<defs>
+  <marker id="a"  markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#3b82f6"/></marker>
+  <marker id="ar" markerWidth="7" markerHeight="5" refX="0" refY="2.5" orient="auto"><polygon points="7 0,0 2.5,7 5" fill="#475569"/></marker>
+  <marker id="ag" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#475569"/></marker>
+</defs>
+
+<!-- participant boxes — y=14 -->
+<!-- cols (lifeline x): Scheduler=65, Orchestrator=205, SnapshotBuilder=355, Broker=490, Strategy=620, RiskEngine=755, ExecPolicy=895, Broker2=1060 -->
+
+<rect x="10"  y="14" width="110" height="30" rx="3" fill="#111827" stroke="#374151"/>
+<text x="65"  y="34" text-anchor="middle" fill="#9ca3af" font-size="10.5" font-weight="600">Scheduler</text>
+
+<rect x="150" y="14" width="110" height="30" rx="3" fill="#0c1a2e" stroke="#1e40af"/>
+<text x="205" y="34" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600">Orchestrator</text>
+
+<rect x="300" y="14" width="110" height="30" rx="3" fill="#0c1a2e" stroke="#1e40af"/>
+<text x="355" y="34" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600">SnapshotBuilder</text>
+
+<rect x="440" y="14" width="100" height="30" rx="3" fill="#052e16" stroke="#166534"/>
+<text x="490" y="34" text-anchor="middle" fill="#86efac" font-size="10.5" font-weight="600">BrokerABC</text>
+
+<rect x="570" y="14" width="100" height="30" rx="3" fill="#2e1065" stroke="#6d28d9"/>
+<text x="620" y="34" text-anchor="middle" fill="#c4b5fd" font-size="10.5" font-weight="600">StrategyABC</text>
+
+<rect x="705" y="14" width="100" height="30" rx="3" fill="#0c1a2e" stroke="#1e40af"/>
+<text x="755" y="34" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600">RiskEngine</text>
+
+<rect x="843" y="14" width="104" height="30" rx="3" fill="#0c1a2e" stroke="#1e40af"/>
+<text x="895" y="34" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600">ExecPolicy</text>
+
+<rect x="1005" y="14" width="100" height="30" rx="3" fill="#052e16" stroke="#166534"/>
+<text x="1055" y="34" text-anchor="middle" fill="#86efac" font-size="10.5" font-weight="600">BrokerABC</text>
+
+<!-- lifelines -->
+<line x1="65"   y1="44" x2="65"   y2="730" stroke="#374151" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="205"  y1="44" x2="205"  y2="730" stroke="#1e40af" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="355"  y1="44" x2="355"  y2="730" stroke="#1e40af" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="490"  y1="44" x2="490"  y2="730" stroke="#166534" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="620"  y1="44" x2="620"  y2="730" stroke="#6d28d9" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="755"  y1="44" x2="755"  y2="730" stroke="#1e40af" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="895"  y1="44" x2="895"  y2="730" stroke="#1e40af" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="1055" y1="44" x2="1055" y2="730" stroke="#166534" stroke-dasharray="3,4" stroke-width="1"/>
+
+<!-- ① run_cycle -->
+<line x1="65" y1="80" x2="197" y2="80" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="130" y="74" text-anchor="middle" fill="#22d3ee" font-size="9.5">run_cycle()</text>
+<rect x="201" y="80" width="7" height="580" rx="1" fill="rgba(30,64,175,0.2)" stroke="#1e40af" stroke-width="0.5"/>
+
+<!-- ② build_snapshot (pre — no chains) -->
+<line x1="208" y1="108" x2="347" y2="108" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="276" y="102" text-anchor="middle" fill="#22d3ee" font-size="9.5">build_snapshot(universe, chain_requests=[])</text>
+<rect x="351" y="108" width="7" height="84" rx="1" fill="rgba(30,64,175,0.15)" stroke="#1e40af" stroke-width="0.5"/>
+
+<!-- ③ get_account_snapshot — ONE call returns everything -->
+<line x1="358" y1="128" x2="482" y2="128" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="418" y="122" text-anchor="middle" fill="#22d3ee" font-size="9.5">get_account_snapshot()</text>
+<line x1="358" y1="146" x2="481" y2="146" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="418" y="158" text-anchor="middle" fill="#475569" font-size="9">AccountSnapshot { equity, bp, cash, positions, open_orders }</text>
+
+<!-- ④ get_asset_quote per symbol -->
+<line x1="358" y1="172" x2="482" y2="172" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="418" y="166" text-anchor="middle" fill="#22d3ee" font-size="9.5">get_asset_quote(sym)  [ ×symbols ]</text>
+<line x1="358" y1="188" x2="481" y2="188" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+
+<!-- return pre_snapshot -->
+<line x1="208" y1="198" x2="350" y2="198" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ar)"/>
+<text x="276" y="192" text-anchor="middle" fill="#475569" font-size="9">CycleSnapshot (no chains)</text>
+
+<!-- ⑤ get_option_chain_requests from OptionChainConsumers -->
+<line x1="208" y1="222" x2="612" y2="222" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="408" y="215" text-anchor="middle" fill="#22d3ee" font-size="9.5">get_option_chain_requests(pre_snapshot)  [ OptionChainConsumerABC ]</text>
+<line x1="208" y1="240" x2="611" y2="240" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="408" y="252" text-anchor="middle" fill="#475569" font-size="9">List[OptionChainRequest]  { underlying, expiry_window, calls/puts, strike_range }</text>
+
+<!-- ⑥ build_snapshot (with chains) -->
+<line x1="208" y1="264" x2="347" y2="264" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="276" y="258" text-anchor="middle" fill="#22d3ee" font-size="9.5">build_snapshot(universe, chain_requests)</text>
+<rect x="351" y="264" width="7" height="68" rx="1" fill="rgba(30,64,175,0.15)" stroke="#1e40af" stroke-width="0.5"/>
+
+<line x1="358" y1="282" x2="482" y2="282" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="418" y="276" text-anchor="middle" fill="#22d3ee" font-size="9.5">get_option_chain(req)  [ ×requests, cached per cycle ]</text>
+<line x1="358" y1="298" x2="481" y2="298" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="418" y="310" text-anchor="middle" fill="#475569" font-size="9">List[Contract]  { leap window } then { short window } — 2nd is cache hit</text>
+
+<line x1="208" y1="322" x2="350" y2="322" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ar)"/>
+<text x="276" y="316" text-anchor="middle" fill="#475569" font-size="9">CycleSnapshot (with chains + signals)</text>
+
+<!-- ⑦ generate_intents -->
+<line x1="208" y1="348" x2="612" y2="348" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="408" y="341" text-anchor="middle" fill="#22d3ee" font-size="9.5">generate_intents(snapshot)  [ ×strategies ]</text>
+<rect x="616" y="348" width="7" height="30" rx="1" fill="rgba(109,40,217,0.2)" stroke="#6d28d9" stroke-width="0.5"/>
+<line x1="208" y1="378" x2="612" y2="378" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="408" y="372" text-anchor="middle" fill="#475569" font-size="9">List[TradeIntent { payload: EnterPmccPayload | RollNearPayload | … }]</text>
+
+<!-- ⑧ risk evaluate -->
+<line x1="208" y1="402" x2="747" y2="402" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="476" y="395" text-anchor="middle" fill="#22d3ee" font-size="9.5">evaluate(snapshot, intents)</text>
+<rect x="751" y="402" width="7" height="48" rx="1" fill="rgba(30,64,175,0.15)" stroke="#1e40af" stroke-width="0.5"/>
+<text x="638" y="420" fill="#f59e0b" font-size="8.5">① rules: OpenOrderDedupeRule etc.</text>
+<text x="638" y="433" fill="#f59e0b" font-size="8.5">② evaluator dispatches on payload type → approve/reject atomically</text>
+<line x1="208" y1="450" x2="750" y2="450" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="476" y="444" text-anchor="middle" fill="#475569" font-size="9">RiskDecisionBatch { approved: List[ApprovedIntent], rejected: List[RejectedIntent] }</text>
+
+<!-- dry run gate -->
+<rect x="140" y="462" width="138" height="18" rx="2" fill="#1c2430" stroke="#f59e0b" stroke-width="1"/>
+<text x="209" y="475" text-anchor="middle" fill="#f59e0b" font-size="9">[ if not dry_run ]</text>
+
+<!-- ⑨ to_orders -->
+<line x1="208" y1="494" x2="887" y2="494" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="546" y="487" text-anchor="middle" fill="#22d3ee" font-size="9.5">to_orders(approved_intents)</text>
+<rect x="891" y="494" width="7" height="30" rx="1" fill="rgba(30,64,175,0.15)" stroke="#1e40af" stroke-width="0.5"/>
+<line x1="208" y1="524" x2="890" y2="524" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+<text x="546" y="518" text-anchor="middle" fill="#475569" font-size="9">List[OrderABC]  — MultiLegLimitOrder or MarketOrder(s)</text>
+
+<!-- ⑩ submit_order -->
+<line x1="208" y1="548" x2="1047" y2="548" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="625" y="541" text-anchor="middle" fill="#22d3ee" font-size="9.5">submit_order(order)  [ ×orders ]</text>
+
+<!-- MLEG note -->
+<rect x="440" y="558" width="620" height="32" rx="3" fill="#0c1a1a" stroke="#134e4a"/>
+<text x="450" y="571" fill="#5eead4" font-size="8.5">EnterPmcc → 1× MultiLegLimitOrder (BTO leap + STO near, Alpaca MLEG ✅)</text>
+<text x="450" y="582" fill="#fbbf24" font-size="8.5">RollNear → 2× MarketOrder sequential (Alpaca MLEG rejects rolls — uncovered short ❌)</text>
+
+<line x1="208" y1="598" x2="1047" y2="598" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ag)"/>
+
+<!-- return CycleRunResult -->
+<line x1="65" y1="626" x2="203" y2="626" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#ar)"/>
+<text x="132" y="620" text-anchor="middle" fill="#475569" font-size="9">CycleRunResult</text>
+</svg>
+</div>
+
+<!-- ================================================================ -->
+<!-- SEQUENCE: BACKTEST LOOP -->
+<!-- ================================================================ -->
+<div class="section">
+<h2>04 — Sequence: Backtest Date Loop</h2>
+
+<svg viewBox="0 0 860 430" font-family="IBM Plex Mono, monospace">
+<defs>
+  <marker id="b"  markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#3b82f6"/></marker>
+  <marker id="br" markerWidth="7" markerHeight="5" refX="0" refY="2.5" orient="auto"><polygon points="7 0,0 2.5,7 5" fill="#475569"/></marker>
+  <marker id="bg" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#475569"/></marker>
+</defs>
+
+<!-- participants -->
+<rect x="10"  y="12" width="110" height="28" rx="3" fill="#1a0030" stroke="#7c3aed"/>
+<text x="65"  y="30" text-anchor="middle" fill="#c4b5fd" font-size="10.5" font-weight="600">BacktestRunner</text>
+
+<rect x="150" y="12" width="110" height="28" rx="3" fill="#1a0030" stroke="#7c3aed"/>
+<text x="205" y="30" text-anchor="middle" fill="#c4b5fd" font-size="10.5" font-weight="600">BacktestClock</text>
+
+<rect x="290" y="12" width="120" height="28" rx="3" fill="#1a0030" stroke="#7c3aed"/>
+<text x="350" y="30" text-anchor="middle" fill="#c4b5fd" font-size="10.5" font-weight="600">HistoricalBroker</text>
+
+<rect x="440" y="12" width="130" height="28" rx="3" fill="#0c1a2e" stroke="#1e40af"/>
+<text x="505" y="30" text-anchor="middle" fill="#93c5fd" font-size="10.5" font-weight="600">TradingOrchestrator</text>
+
+<rect x="600" y="12" width="120" height="28" rx="3" fill="#071a10" stroke="#166534"/>
+<text x="660" y="30" text-anchor="middle" fill="#86efac" font-size="10.5" font-weight="600">TradeDatabase</text>
+
+<rect x="750" y="12" width="100" height="28" rx="3" fill="#1a0030" stroke="#7c3aed"/>
+<text x="800" y="30" text-anchor="middle" fill="#c4b5fd" font-size="10.5" font-weight="600">SimulatedAccount</text>
+
+<!-- lifelines -->
+<line x1="65"  y1="40" x2="65"  y2="420" stroke="#7c3aed" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="205" y1="40" x2="205" y2="420" stroke="#7c3aed" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="350" y1="40" x2="350" y2="420" stroke="#7c3aed" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="505" y1="40" x2="505" y2="420" stroke="#1e40af" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="660" y1="40" x2="660" y2="420" stroke="#166534" stroke-dasharray="3,4" stroke-width="1"/>
+<line x1="800" y1="40" x2="800" y2="420" stroke="#7c3aed" stroke-dasharray="3,4" stroke-width="1"/>
+
+<!-- LOOP block -->
+<rect x="10" y="56" width="840" height="282" rx="3" fill="none" stroke="#2a3347" stroke-width="1"/>
+<rect x="10" y="56" width="88" height="16" rx="2" fill="#2a3347"/>
+<text x="54" y="68" text-anchor="middle" fill="#f59e0b" font-size="9" font-weight="600">LOOP  each trading day</text>
+
+<!-- clock.set_date -->
+<line x1="65" y1="86" x2="197" y2="86" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="130" y="80" text-anchor="middle" fill="#22d3ee" font-size="9.5">clock.set_date(d)</text>
+
+<!-- broker.set_date delegates to same clock -->
+<line x1="65" y1="106" x2="342" y2="106" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="202" y="99" text-anchor="middle" fill="#22d3ee" font-size="9.5">broker.set_date(d)  →  clock.set_date(d) + clear cache</text>
+<rect x="118" y="112" width="252" height="14" rx="2" fill="#1c2430" stroke="#2a3347"/>
+<text x="244" y="122" text-anchor="middle" fill="#4a5568" font-size="8.5">same BacktestClock instance — SnapshotBuilder sees same date automatically</text>
+
+<!-- run_cycle -->
+<line x1="65" y1="140" x2="497" y2="140" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="279" y="133" text-anchor="middle" fill="#22d3ee" font-size="9.5">orchestrator.run_cycle()  [ full cycle per diagram 03 ]</text>
+<rect x="501" y="140" width="7" height="48" rx="1" fill="rgba(30,64,175,0.15)" stroke="#1e40af" stroke-width="0.5"/>
+
+<!-- submit_order fills SimulatedAccount -->
+<line x1="508" y1="158" x2="792" y2="158" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="648" y="152" text-anchor="middle" fill="#22d3ee" font-size="9">submit_order → SimulatedAccount.fill()</text>
+<line x1="508" y1="172" x2="791" y2="172" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#bg)"/>
+
+<line x1="65" y1="192" x2="500" y2="192" stroke="#475569" stroke-dasharray="3,3" stroke-width="1" marker-end="url(#br)"/>
+<text x="279" y="186" text-anchor="middle" fill="#475569" font-size="9">CycleRunResult</text>
+
+<!-- record_chain_snapshot — feeds future ChainDatabaseBroker -->
+<line x1="65" y1="216" x2="652" y2="216" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="355" y="209" text-anchor="middle" fill="#22d3ee" font-size="9.5">db.record_chain_snapshot(date, underlying, contracts)</text>
+<rect x="118" y="221" width="300" height="14" rx="2" fill="#071a10" stroke="#134e4a"/>
+<text x="268" y="231" text-anchor="middle" fill="#5eead4" font-size="8.5">⚡ grows chain_snapshots table → future ChainDatabaseBroker reads this</text>
+
+<!-- record_equity_snapshot -->
+<line x1="65" y1="248" x2="652" y2="248" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="355" y="241" text-anchor="middle" fill="#22d3ee" font-size="9.5">db.record_equity_snapshot(date, equity, cash, bp)</text>
+
+<!-- next day -->
+<line x1="65" y1="270" x2="65" y2="290" stroke="#3b82f6" stroke-width="1" stroke-dasharray="2,3"/>
+<text x="82" y="283" fill="#4a5568" font-size="8.5">next day…</text>
+
+<!-- end loop separator -->
+<line x1="10" y1="298" x2="850" y2="298" stroke="#2a3347" stroke-width="1"/>
+
+<!-- write results -->
+<line x1="65" y1="316" x2="652" y2="316" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="355" y="309" text-anchor="middle" fill="#22d3ee" font-size="9.5">write equity_curve.csv + trade_log.json</text>
+
+<line x1="65" y1="336" x2="792" y2="336" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#b)"/>
+<text x="425" y="329" text-anchor="middle" fill="#22d3ee" font-size="9.5">account.trade_log() → plot_results()</text>
+</svg>
+</div>
+
+<!-- ================================================================ -->
+<!-- DELETE / KEEP SUMMARY -->
+<!-- ================================================================ -->
+<div class="section">
+<h2>05 — Delete vs Keep</h2>
+<div class="two">
+  <div>
+    <div class="rel-title" style="color:#ef4444;margin-bottom:12px">DELETE — no second implementation, no earned abstraction</div>
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:2.1;color:#ef4444">
+      OrchestratorABC<br>
+      CycleSnapshotBuilderABC<br>
+      CycleSnapshotABC<br>
+      BacktestSnapshotBuilder<br>
+      PmccIntentPayload<br>
+      OptionIntentPayload<br>
+      PmccOrderSpec<br>
+      OptionMarketOrderSpec<br>
+      OptionIntentEvaluator<br>
+      StrategyPlugin ABC<br>
+      <span style="color:#6b7280;font-size:10px">— total: 11 classes / files gone</span>
+    </div>
+  </div>
+  <div>
+    <div class="rel-title" style="color:#22d3ee;margin-bottom:12px">KEEP — each earns its place</div>
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;line-height:2;color:#22d3ee">
+      BrokerABC &nbsp;<span style="color:#4a5568;font-size:10px">— will add brokers</span><br>
+      StrategyABC &nbsp;<span style="color:#4a5568;font-size:10px">— will add strategies</span><br>
+      OptionChainConsumerABC &nbsp;<span style="color:#4a5568;font-size:10px">— mixin, not all strategies need chains</span><br>
+      ClockABC / LiveClock / BacktestClock &nbsp;<span style="color:#4a5568;font-size:10px">— GoF Strategy, core correctness</span><br>
+      RiskEngine &nbsp;<span style="color:#4a5568;font-size:10px">— two-phase pipeline, not swappable</span><br>
+      RiskRuleABC &nbsp;<span style="color:#4a5568;font-size:10px">— gates, genuinely different from evaluators</span><br>
+      IntentEvaluatorABC &nbsp;<span style="color:#4a5568;font-size:10px">— one per strategy family</span><br>
+      ExecutionPolicyABC &nbsp;<span style="color:#4a5568;font-size:10px">— DryRunPolicy is real 2nd impl</span><br>
+      TradeDatabaseABC / NullTradeDatabase &nbsp;<span style="color:#4a5568;font-size:10px">— Null Object pattern</span><br>
+      TradeIntent &nbsp;<span style="color:#4a5568;font-size:10px">— strategy→risk boundary envelope</span><br>
+      ApprovedIntent / RejectedIntent &nbsp;<span style="color:#4a5568;font-size:10px">— risk→exec boundary</span><br>
+      OrderABC / MultiLegLimitOrder / MarketOrder &nbsp;<span style="color:#4a5568;font-size:10px">— typed broker param</span><br>
+      <br>
+      <span style="color:#a78bfa;font-size:10.5px">NEW semantic payloads (replace old):</span><br>
+      EnterPmccPayload &nbsp;<span style="color:#4a5568;font-size:10px">→ 1× MLEG</span><br>
+      RollNearPayload &nbsp;<span style="color:#4a5568;font-size:10px">→ 2× sequential MarketOrder</span><br>
+      CloseLegPayload &nbsp;<span style="color:#4a5568;font-size:10px">→ 1× MarketOrder</span><br>
+      CloseSpreadPayload &nbsp;<span style="color:#4a5568;font-size:10px">→ 1× MLEG</span><br>
+      AccountSnapshot &nbsp;<span style="color:#4a5568;font-size:10px">— typed, wraps equity + bp + positions + orders</span><br>
+      PmccEvaluator &nbsp;<span style="color:#4a5568;font-size:10px">— handles all PMCC payload types</span><br>
+    </div>
+  </div>
+</div>
+</div>
+
+</body>
+</html>

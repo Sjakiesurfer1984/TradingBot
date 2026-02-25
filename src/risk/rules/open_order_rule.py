@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from src.domain.intents import TradeIntent
-from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.risk.rules.risk_rule_interface import RiskRuleABC, RiskRuleOutcome
 from src.utilities.logger import setup_logger
 
@@ -20,7 +20,7 @@ def _underlying(order: Dict[str, Any]) -> str:
 class OpenOrderDedupeRule(RiskRuleABC):
     """Reject an intent if there is already an open order for the same underlying."""
 
-    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> RiskRuleOutcome:
+    def evaluate(self, snapshot: CycleSnapshot, intent: TradeIntent) -> RiskRuleOutcome:
         underlying = str(intent.symbol).strip().upper()
         open_orders: List[Dict[str, Any]] = list(snapshot.open_orders())
 

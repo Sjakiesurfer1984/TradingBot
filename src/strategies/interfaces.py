@@ -5,7 +5,7 @@ from typing import List
 
 from src.domain.intents import TradeIntent
 from src.domain.types import OptionChainRequest, Symbol
-from src.orchestration.cycle_snapshot import CycleSnapshotABC
+from src.orchestration.cycle_snapshot import CycleSnapshot
 
 
 class StrategyABC(ABC):
@@ -14,13 +14,18 @@ class StrategyABC(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def generate_intents(self, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+    def generate_intents(self, snapshot: CycleSnapshot) -> List[TradeIntent]:
         raise NotImplementedError
 
 
 class OptionChainConsumerABC(ABC):
-    """Mixin for strategies that need option chain data."""
+    """
+    Mixin for strategies that need option chain data.
+
+    Implement only if the strategy reads option chains.
+    Equity-only or signal-only strategies skip this mixin entirely.
+    """
 
     @abstractmethod
-    def get_option_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+    def get_option_chain_requests(self, snapshot: CycleSnapshot) -> List[OptionChainRequest]:
         raise NotImplementedError

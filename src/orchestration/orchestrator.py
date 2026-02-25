@@ -8,9 +8,8 @@ from src.domain.intents import TradeIntent
 from src.domain.orders import OrderABC
 from src.domain.types import OptionChainRequest, Symbol
 from src.execution.execution_policy_interface import ExecutionPolicyABC
-from src.orchestration.cycle_snapshot import CycleSnapshotABC
-from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilderABC
-from src.orchestration.orchestrator_interface import CycleRunResult, OrchestratorABC
+from src.orchestration.cycle_snapshot import CycleSnapshot
+from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.risk.risk_engine import RiskEngine
 from src.signals.signal_pipeline import SignalPipelineABC
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
@@ -20,33 +19,65 @@ from src.utilities.logging_utils import log_scope
 logger = setup_logger("TradingOrchestrator")
 
 
+@dataclass(frozen=True)
+class CycleRunResult:
+    orders_submitted:  int
+    intents_generated: int
+    intents_approved:  int
+    intents_rejected:  int
+
+
 @dataclass
-class TradingOrchestrator(OrchestratorABC):
+class TradingOrchestrator:
+    """
+    Fixed cycle skeleton — all steps delegated to composed parts.
+
+    Depends on BrokerABC, StrategyABC[], RiskEngine, ExecutionPolicyABC,
+    CycleSnapshotBuilder, SignalPipelineABC. No OrchestratorABC above it —
+    Scheduler holds TradingOrchestrator directly. One orchestrator exists;
+    the ABC earned nothing.
+
+    Cycle sequence:
+      1. Collect universe (symbols declared by all strategies)
+      2. Pre-snapshot — account + quotes, no chains yet
+      3. Signal computation on pre-snapshot
+      4. Collect chain requests from OptionChainConsumer strategies
+      5. Full snapshot — adds option chains
+      6. generate_intents from each strategy
+      7. RiskEngine.evaluate — gates then sizes
+      8. ExecutionPolicy.to_orders — semantic payloads → broker orders
+      9. broker.submit_order — skipped if dry_run
+    """
+
     broker:           BrokerABC
     strategies:       List[StrategyABC]
     risk_engine:      RiskEngine
     execution_policy: ExecutionPolicyABC
-    snapshot_builder: CycleSnapshotBuilderABC
+    snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
     dry_run:          bool = False
 
-    # ------------------------------------------------------------------
-    # Template Method: fixed skeleton, swappable steps
-    # ------------------------------------------------------------------
-
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
-            universe       = self._collect_universe()
-            pre_snapshot   = self.snapshot_builder.build_snapshot(universe=universe, option_chain_requests=[])
-            signals        = self.signal_pipeline.compute(pre_snapshot)
-            pre_snapshot   = pre_snapshot.with_signals(signals)
+            universe     = self._collect_universe()
+            pre_snapshot = self.snapshot_builder.build_snapshot(
+                universe=universe,
+                option_chain_requests=[],
+            )
+            signals      = self.signal_pipeline.compute(pre_snapshot)
+            pre_snapshot = pre_snapshot.with_signals(signals)
+
             chain_requests = self._collect_chain_requests(pre_snapshot)
-            snapshot       = self.snapshot_builder.build_snapshot(universe=universe, option_chain_requests=chain_requests)
-            snapshot       = snapshot.with_signals(signals)
-            intents        = self._collect_intents(snapshot)
-            decisions      = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
-            orders         = self.execution_policy.to_orders(approvals=decisions.approved)
-            submitted      = self._submit_orders(orders)
+            snapshot       = self.snapshot_builder.build_snapshot(
+                universe=universe,
+                option_chain_requests=chain_requests,
+            )
+            snapshot = snapshot.with_signals(signals)
+
+            intents   = self._collect_intents(snapshot)
+            decisions = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
+            orders    = self.execution_policy.to_orders(approvals=decisions.approved)
+            submitted = self._submit_orders(orders)
 
         return CycleRunResult(
             orders_submitted=submitted,
@@ -67,14 +98,14 @@ class TradingOrchestrator(OrchestratorABC):
                     symbols.append(sym)
         return symbols
 
-    def _collect_chain_requests(self, snapshot: CycleSnapshotABC) -> List[OptionChainRequest]:
+    def _collect_chain_requests(self, snapshot: CycleSnapshot) -> List[OptionChainRequest]:
         requests: List[OptionChainRequest] = []
         for strategy in self.strategies:
             if isinstance(strategy, OptionChainConsumerABC):
                 requests.extend(strategy.get_option_chain_requests(snapshot))
         return requests
 
-    def _collect_intents(self, snapshot: CycleSnapshotABC) -> List[TradeIntent]:
+    def _collect_intents(self, snapshot: CycleSnapshot) -> List[TradeIntent]:
         intents: List[TradeIntent] = []
         for strategy in self.strategies:
             intents.extend(strategy.generate_intents(snapshot))

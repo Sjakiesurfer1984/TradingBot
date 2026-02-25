@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from src.orchestration.orchestrator_interface import OrchestratorABC
+from src.orchestration.orchestrator import TradingOrchestrator
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("Scheduler")
@@ -17,7 +17,13 @@ class SchedulerConfig:
 
 @dataclass
 class Scheduler:
-    orchestrator: OrchestratorABC
+    """
+    Runs TradingOrchestrator.run_cycle() on a timer.
+
+    Holds TradingOrchestrator directly — OrchestratorABC removed.
+    One orchestrator exists; the ABC earned nothing.
+    """
+    orchestrator: TradingOrchestrator
     config:       SchedulerConfig
 
     def run(self) -> None:
@@ -30,7 +36,10 @@ class Scheduler:
                 cycle_count += 1
                 logger.info(
                     "Cycle %d complete | submitted=%d approved=%d rejected=%d",
-                    cycle_count, result.orders_submitted, result.intents_approved, result.intents_rejected,
+                    cycle_count,
+                    result.orders_submitted,
+                    result.intents_approved,
+                    result.intents_rejected,
                 )
             except KeyboardInterrupt:
                 logger.info("Scheduler interrupted — shutting down")

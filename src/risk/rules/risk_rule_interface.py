@@ -6,8 +6,7 @@ from enum import Enum
 from typing import Optional
 
 from src.domain.intents import TradeIntent
-from src.orchestration.cycle_snapshot import CycleSnapshotABC
-
+from src.orchestration.cycle_snapshot import CycleSnapshot
 
 class RiskRuleOutcomeKind(str, Enum):
     PASS   = "pass"
@@ -34,5 +33,5 @@ class RiskRuleOutcome:
 
 class RiskRuleABC(ABC):
     @abstractmethod
-    def evaluate(self, snapshot: CycleSnapshotABC, intent: TradeIntent) -> RiskRuleOutcome:
+    def evaluate(self, snapshot: CycleSnapshot, intent: TradeIntent) -> RiskRuleOutcome:
         raise NotImplementedError
