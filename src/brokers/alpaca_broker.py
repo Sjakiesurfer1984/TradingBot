@@ -145,75 +145,134 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Fetch option chain via Alpaca trading client snapshots endpoint.
-        Filters applied client-side (server rejects most filter params).
+        Fetch option chain with quotes and greeks via two Alpaca SDK calls:
+
+          1. TradingClient.get_option_contracts(GetOptionContractsRequest)
+             Server-side filtering by expiry/type/strike. Returns contract
+             metadata only — no quotes, no greeks.
+
+          2. OptionHistoricalDataClient.get_option_chain(OptionChainRequest)
+             Returns latest quote + greeks keyed by contract symbol.
+
+        We merge: contract list defines what passes filters, data client
+        provides prices. Contracts without live quote data are dropped.
         """
         self._log_io_boundary("get_option_chain")
-        from src.risk.pmcc_sizer import parse_osi
+
+        from alpaca.trading.requests import GetOptionContractsRequest
+        from alpaca.trading.enums import AssetStatus, ContractType
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionChainRequest as AlpacaOptionChainRequest
 
         sym = underlying.strip().upper()
+
+        # ------------------------------------------------------------------
+        # Step 1: contract list with server-side filters
+        # ------------------------------------------------------------------
+        contract_type = None
+        if include_calls and not include_puts:
+            contract_type = ContractType.CALL
+        elif include_puts and not include_calls:
+            contract_type = ContractType.PUT
+
         try:
-            # get_option_contracts or get_options_snapshots depending on SDK version
-            snapshots = self._trading_client.get_option_contracts(
-                underlying_symbols=[sym],
-                feed=feed,
-            )
-        except AttributeError:
-            # Older SDK — fall back to requests-based approach
-            logger.warning("get_option_contracts not available — chain will be empty")
-            return []
+            contracts: List[Any] = []
+            page_token: Optional[str] = None
+            page = 0
+            while True:
+                page += 1
+                paged_req = GetOptionContractsRequest(
+                    underlying_symbols=[sym],
+                    status=AssetStatus.ACTIVE,
+                    type=contract_type,
+                    expiration_date_gte=expiration_date_gte,
+                    expiration_date_lte=expiration_date_lte,
+                    strike_price_gte=str(strike_price_gte) if strike_price_gte is not None else None,
+                    strike_price_lte=str(strike_price_lte) if strike_price_lte is not None else None,
+                    limit=1000,
+                    page_token=page_token,
+                )
+                resp = self._trading_client.get_option_contracts(paged_req)
+                page_contracts = resp.option_contracts or []
+                contracts.extend(page_contracts)
+                logger.info(
+                    "Contracts page %d | sym=%s page_count=%d total=%d",
+                    page, sym, len(page_contracts), len(contracts),
+                )
+                next_token = getattr(resp, "next_page_token", None)
+                if not next_token or not page_contracts:
+                    break
+                page_token = str(next_token)
         except Exception as exc:
-            logger.warning("Option chain fetch failed for %s: %s", sym, exc)
+            logger.warning("get_option_contracts failed for %s: %s", sym, exc)
             return []
 
+        if not contracts:
+            logger.info(
+                "No contracts returned | sym=%s expiry=[%s → %s]",
+                sym, expiration_date_gte, expiration_date_lte,
+            )
+            return []
+
+        contract_symbols = [str(c.symbol) for c in contracts if c.symbol]
+        logger.info("Contracts fetched | sym=%s count=%d", sym, len(contract_symbols))
+
+        # ------------------------------------------------------------------
+        # Step 2: quotes + greeks from OptionHistoricalDataClient
+        # get_option_chain returns { contract_sym: Snapshot } for the whole
+        # underlying — we filter down to the contracts we care about.
+        # ------------------------------------------------------------------
+        option_data_client = OptionHistoricalDataClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+        )
+        chain_data: Dict[str, Any] = {}
+        try:
+            chain_resp = option_data_client.get_option_chain(
+                AlpacaOptionChainRequest(underlying_symbol=sym, feed=feed)
+            )
+            for symbol_key, snapshot in chain_resp.items():
+                chain_data[str(symbol_key).upper()] = snapshot
+        except Exception as exc:
+            logger.warning("get_option_chain data fetch failed for %s: %s", sym, exc)
+
+        # ------------------------------------------------------------------
+        # Merge contract list + quote data
+        # ------------------------------------------------------------------
         results: List[Dict[str, Any]] = []
-        for contract in (snapshots or []):
-            contract_sym = str(getattr(contract, "symbol", "") or "")
-            if not contract_sym:
-                continue
-            try:
-                parsed = parse_osi(contract_sym)
-            except ValueError:
+        for contract_sym in contract_symbols:
+            snapshot = chain_data.get(contract_sym.upper())
+            if snapshot is None:
                 continue
 
-            exp    = parsed.expiry.date()
-            strike = float(parsed.strike)
-            right  = parsed.right   # "C" or "P"
+            quote  = getattr(snapshot, "latest_quote", None) or {}
+            greeks = getattr(snapshot, "greeks",       None) or {}
+            if hasattr(quote,  "__dict__"): quote  = vars(quote)
+            if hasattr(greeks, "__dict__"): greeks = vars(greeks)
 
-            if not include_calls and right == "C":
-                continue
-            if not include_puts and right == "P":
-                continue
-            if expiration_date     is not None and exp    != expiration_date:     continue
-            if expiration_date_gte is not None and exp     < expiration_date_gte: continue
-            if expiration_date_lte is not None and exp     > expiration_date_lte: continue
-            if strike_price_gte    is not None and strike  < strike_price_gte:    continue
-            if strike_price_lte    is not None and strike  > strike_price_lte:    continue
-
-            row: Dict[str, Any] = {"contract_symbol": contract_sym}
-            # Map SDK fields to the dict shape the rest of the app expects
-            greeks = getattr(contract, "greeks", None) or {}
-            if hasattr(greeks, "__dict__"):
-                greeks = greeks.__dict__
-            quote  = getattr(contract, "latest_quote", None) or {}
-            if hasattr(quote, "__dict__"):
-                quote = quote.__dict__
-
-            row["greeks"]      = greeks
-            row["latestQuote"] = {
-                "ap": quote.get("ask_price") or quote.get("ap"),
-                "bp": quote.get("bid_price") or quote.get("bp"),
-            }
-            results.append(row)
-
+            results.append({
+                "contract_symbol": contract_sym,
+                "greeks": {
+                    "delta": greeks.get("delta"),
+                    "gamma": greeks.get("gamma"),
+                    "theta": greeks.get("theta"),
+                    "vega":  greeks.get("vega"),
+                },
+                "latestQuote": {
+                    "ap": quote.get("ask_price") or quote.get("ap"),
+                    "bp": quote.get("bid_price") or quote.get("bp"),
+                },
+            })
             if 0 < limit <= len(results):
                 break
 
         logger.info(
-            "Option chain | sym=%s total=%d expiry=[%s → %s]",
-            sym, len(results), expiration_date_gte, expiration_date_lte,
+            "Option chain merged | sym=%s contracts=%d with_quotes=%d expiry=[%s → %s]",
+            sym, len(contract_symbols), len(results),
+            expiration_date_gte, expiration_date_lte,
         )
         return results
+
 
     # ------------------------------------------------------------------
     # Order submission
@@ -279,15 +338,38 @@ class AlpacaBroker(BrokerABC, BrokerBase):
 
     @staticmethod
     def _position_to_dict(p: Any) -> Dict[str, Any]:
+        def _enum_val(v: Any) -> str:
+            """
+            Alpaca SDK returns enum objects like AssetClass.US_OPTION.
+            str(AssetClass.US_OPTION) → "AssetClass.US_OPTION" (useless).
+            getattr(v, "value", str(v)) → "us_option" (what we need).
+            The classifier and state machine always compare against lowercase
+            plain strings, so we normalise here at the boundary.
+            """
+            return str(getattr(v, "value", v) or "").lower()
+
+        # qty: Alpaca returns positive for long, negative for short options.
+        # The SDK's PositionSide enum (LONG/SHORT) is on the `side` field.
+        # The classifier uses qty sign directly, so we preserve the raw number.
+        qty_raw = getattr(p, "qty", 0) or 0
+        side    = _enum_val(getattr(p, "side", ""))
+        # Enforce sign: LONG → positive, SHORT → negative
+        try:
+            qty_float = float(qty_raw)
+        except (TypeError, ValueError):
+            qty_float = 0.0
+        if side == "short" and qty_float > 0:
+            qty_float = -qty_float
+
         return {
-            "symbol":           str(getattr(p, "symbol", "") or ""),
-            "asset_class":      str(getattr(p, "asset_class", "") or ""),
-            "qty":              str(getattr(p, "qty", 0) or 0),
-            "side":             str(getattr(p, "side", "") or ""),
-            "market_value":     str(getattr(p, "market_value", 0) or 0),
-            "cost_basis":       str(getattr(p, "cost_basis", 0) or 0),
-            "unrealized_pl":    str(getattr(p, "unrealized_pl", 0) or 0),
-            "current_price":    str(getattr(p, "current_price", 0) or 0),
+            "symbol":            str(getattr(p, "symbol", "") or ""),
+            "asset_class":       _enum_val(getattr(p, "asset_class", "")),
+            "qty":               str(qty_float),
+            "side":              side,
+            "market_value":      str(getattr(p, "market_value", 0) or 0),
+            "cost_basis":        str(getattr(p, "cost_basis", 0) or 0),
+            "unrealized_pl":     str(getattr(p, "unrealized_pl", 0) or 0),
+            "current_price":     str(getattr(p, "current_price", 0) or 0),
             "underlying_symbol": str(getattr(p, "underlying_symbol", "") or ""),
         }
 

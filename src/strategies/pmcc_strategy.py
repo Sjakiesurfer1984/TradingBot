@@ -244,7 +244,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
 
         logger.info(
-            "PMCC entry intent | symbol=%s leap=%s near=%s spot=%.2f",
+            "PMCC entry intent CREATED | symbol=%s leap=%s near=%s spot=%.2f",
             sym_str, leap_sel.option_symbol, near_sel.option_symbol, spot,
         )
         payload = EnterPmccPayload(
