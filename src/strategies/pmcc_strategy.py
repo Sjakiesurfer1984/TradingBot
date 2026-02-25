@@ -178,7 +178,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 near_dte    = near.get("derived_dte") or 999
                 near_strike = near.get("derived_strike") or 0.0
 
-                if near_dte <= roll_cfg.dte_threshold:
+                if near_dte <= roll_cfg.near_dte_threshold:
                     return [short_req]
 
                 cost_basis   = float(near.get("cost_basis")   or 0.0)
@@ -188,7 +188,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     current_cost     = abs(market_value)
                     if premium_received > 0:
                         profit_captured = (premium_received - current_cost) / premium_received
-                        if profit_captured >= roll_cfg.profit_pct:
+                        if profit_captured >= roll_cfg.near_profit_pct:
                             return [short_req]
 
                 if near_strike > 0 and spot > 0:
@@ -474,8 +474,8 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             roll_near = False
             reason    = ""
 
-            if near_dte <= roll_cfg.dte_threshold:
-                roll_near, reason = True, f"DTE {near_dte} <= {roll_cfg.dte_threshold}"
+            if near_dte <= roll_cfg.near_dte_threshold:
+                roll_near, reason = True, f"DTE {near_dte} <= {roll_cfg.near_dte_threshold}"
 
             if not roll_near:
                 cost_basis   = float(near.get("cost_basis")   or 0.0)
@@ -485,9 +485,9 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     current   = abs(market_value)
                     if premium > 0:
                         captured = (premium - current) / premium
-                        if captured >= roll_cfg.profit_pct:
+                        if captured >= roll_cfg.near_profit_pct:
                             roll_near = True
-                            reason    = f"profit {captured:.1%} >= {roll_cfg.profit_pct:.1%}"
+                            reason    = f"profit {captured:.1%} >= {roll_cfg.near_profit_pct:.1%}"
 
             if not roll_near and near_strike > 0 and spot > 0:
                 if (spot / near_strike) >= roll_cfg.near_strike_proximity:
@@ -546,8 +546,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     underlying_symbol=sym,
                     close=_make_dummy_selected(near_sym),
                     open=new_near,
-                    max_net_debit=self.config.roll.max_roll_debit
-                    if hasattr(self.config.roll, "max_roll_debit") else 2.0,
+                    max_net_debit=self.config.roll.near_max_roll_debit,
                 ),
                 tags=("roll_near",),
             ))

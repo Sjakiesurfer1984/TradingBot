@@ -29,7 +29,7 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    dte_threshold:         int
+    near_dte_threshold:    int
     profit_pct:            float
     near_strike_proximity: float
     leap_dte_threshold:    int
@@ -108,7 +108,7 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
         leap=PmccLeapConfig(**p["leap"]),
         short=PmccShortConfig(**p["short"]),
         roll=PmccRollConfig(
-            dte_threshold=int(ro["dte_threshold"]),
+            near_dte_threshold=int(ro["near_dte_threshold"]),
             profit_pct=float(ro["profit_pct"]),
             near_strike_proximity=float(ro["near_strike_proximity"]),
             leap_dte_threshold=int(ro["leap_dte_threshold"]),

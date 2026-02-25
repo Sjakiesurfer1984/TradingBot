@@ -15,7 +15,7 @@ strategies:
         target_delta: 0.20
 
       roll:
-        dte_threshold: 14
+        near_dte_threshold: 14
         profit_pct: 0.50
         near_strike_proximity: 0.95
         leap_dte_threshold: 90
