@@ -114,9 +114,16 @@ strategies:
 # Set to false when ready to trade live.
 default_dry_run: true
 
-# How often to run a cycle in seconds. 60s is sensible for options —
-# conditions don't change fast enough to need sub-minute polling.
-cycle_seconds: 60
+# Two-speed cycle:
+#   cycle_seconds       — normal cadence when no orders are in flight.
+#                         5 min is plenty for PMCC/Wheel — DTE, IV regime,
+#                         and delta all move on the timescale of hours.
+#   order_check_seconds — fast cadence when an open order exists.
+#                         Check more often to detect fills quickly so the
+#                         state machine transitions correctly (PENDING → COVERED).
+#                         Once open_orders is empty, drops back to cycle_seconds.
+cycle_seconds: 300
+order_check_seconds: 30
 
 backtest:
   initial_cash: 100000

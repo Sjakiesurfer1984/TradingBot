@@ -87,9 +87,10 @@ class AlpacaBroker(BrokerABC, BrokerBase):
     def get_asset_quote(self, symbol: str) -> AssetQuote:
         self._log_io_boundary("get_asset_quote")
         from alpaca.data.requests import StockLatestQuoteRequest
+        from alpaca.data.enums import DataFeed
         sym = symbol.strip().upper()
         try:
-            req  = StockLatestQuoteRequest(symbol_or_symbols=sym)
+            req  = StockLatestQuoteRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
             data = self._data_client.get_stock_latest_quote(req)
             q    = data.get(sym)
             if q:
@@ -115,7 +116,8 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         self._log_io_boundary("get_daily_bars")
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
-        from datetime import timedelta, timezone
+        from alpaca.data.enums import DataFeed
+        from datetime import timedelta
         sym   = symbol.strip().upper()
         end   = self.clock.now_utc()
         start = end - timedelta(days=lookback_days + 5)
@@ -124,6 +126,7 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            feed=DataFeed.IEX,  # IEX is free; SIP requires a paid subscription
         )
         return self._data_client.get_stock_bars(req)
 

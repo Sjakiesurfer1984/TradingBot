@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Tuple
 
 from src.brokers.interfaces import BrokerABC
@@ -18,16 +18,17 @@ class CycleSnapshotBuilder:
     """
     Builds a CycleSnapshot from live broker data.
 
-    Composed from BrokerABC + ClockABC — no inheritance, no ABC of its own.
-    One class, two clock variants:
-      clock=LiveClock()      → production
-      clock=BacktestClock()  → backtest (set by BacktestRunner before each cycle)
+    Two entry points:
+      build_snapshot()    — full build: account + quotes (no chains).
+                            Called once per cycle for the pre-snapshot.
+      add_option_chains() — extend an existing snapshot with chain data,
+                            reusing the account + quote data already fetched.
+                            Called once per cycle after chain requests are known.
 
-    Build sequence:
-      1. broker.get_account_snapshot() — one call, returns typed AccountSnapshot
-         (equity, cash, buying_power, positions, open_orders)
-      2. broker.get_asset_quote(sym) — once per symbol in universe
-      3. broker.get_option_chain(req) — once per OptionChainRequest, cached per cycle
+    This split avoids the previous double-fetch: account and quote data were
+    being re-fetched for the full snapshot even though they hadn't changed
+    since the pre-snapshot 2 seconds earlier. Saving ~2 broker round-trips
+    per cycle (~4s on SPY).
     """
 
     broker: BrokerABC
@@ -40,12 +41,13 @@ class CycleSnapshotBuilder:
     def build_snapshot(
         self,
         *,
-        universe:             List[Symbol],
-        option_chain_requests: List[OptionChainRequest],
+        universe: List[Symbol],
     ) -> CycleSnapshot:
-        as_of = self.clock.now_utc()
-
-        # One call — typed AccountSnapshot covers everything about the account.
+        """
+        Fetch account state and asset quotes. No option chains.
+        Call add_option_chains() afterwards to attach chains.
+        """
+        as_of   = self.clock.now_utc()
         account = self.broker.get_account_snapshot()
 
         logger.info(
@@ -62,8 +64,36 @@ class CycleSnapshotBuilder:
             for sym in universe
         }
 
+        return CycleSnapshot(
+            as_of_utc=as_of,
+            account=account,
+            asset_quotes=quotes,
+            option_chains={},
+            signals=SignalSnapshot.empty(as_of_utc=as_of),
+        )
+
+    def add_option_chains(
+        self,
+        snapshot:              CycleSnapshot,
+        option_chain_requests: List[OptionChainRequest],
+    ) -> CycleSnapshot:
+        """
+        Extend snapshot with option chains. Reuses account + quote data.
+        Returns a new CycleSnapshot (original is immutable).
+        """
+        if not option_chain_requests:
+            return snapshot
+
+        new_chains = dict(snapshot.option_chains)
+        new_chains.update(self._fetch_chains(option_chain_requests))
+        return replace(snapshot, option_chains=new_chains)
+
+    def _fetch_chains(
+        self,
+        requests: List[OptionChainRequest],
+    ) -> Dict[Tuple[Symbol, str], List[Any]]:
         chains: Dict[Tuple[Symbol, str], List[Any]] = {}
-        for req in option_chain_requests:
+        for req in requests:
             logger.info(
                 "Fetching option chain | underlying=%s id=%s expiry=[%s → %s]",
                 req.underlying, req.request_id,
@@ -83,11 +113,4 @@ class CycleSnapshotBuilder:
                 req.underlying, req.request_id, len(result),
             )
             chains[(Symbol(req.underlying), req.request_id)] = result
-
-        return CycleSnapshot(
-            as_of_utc=as_of,
-            account=account,
-            asset_quotes=quotes,
-            option_chains=chains,
-            signals=SignalSnapshot.empty(as_of_utc=as_of),
-        )
+        return chains

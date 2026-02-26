@@ -25,6 +25,7 @@ class CycleRunResult:
     intents_generated: int
     intents_approved:  int
     intents_rejected:  int
+    has_pending_orders: bool = False  # True if open orders exist after this cycle
 
 
 @dataclass
@@ -59,31 +60,32 @@ class TradingOrchestrator:
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
-            universe     = self._collect_universe()
-            pre_snapshot = self.snapshot_builder.build_snapshot(
-                universe=universe,
-                option_chain_requests=[],
-            )
-            signals      = self.signal_pipeline.compute(pre_snapshot)
-            pre_snapshot = pre_snapshot.with_signals(signals)
+            universe = self._collect_universe()
 
-            chain_requests = self._collect_chain_requests(pre_snapshot)
-            snapshot       = self.snapshot_builder.build_snapshot(
-                universe=universe,
-                option_chain_requests=chain_requests,
-            )
+            # One account + quote fetch for the whole cycle.
+            snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            signals  = self.signal_pipeline.compute(snapshot)
             snapshot = snapshot.with_signals(signals)
+
+            # Determine chain requests from the pre-snapshot, then attach
+            # chains without re-fetching account or quotes.
+            chain_requests = self._collect_chain_requests(snapshot)
+            snapshot       = self.snapshot_builder.add_option_chains(
+                snapshot, chain_requests,
+            )
 
             intents   = self._collect_intents(snapshot)
             decisions = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
             orders    = self.execution_policy.to_orders(approvals=decisions.approved)
             submitted = self._submit_orders(orders)
 
+        pending = len(snapshot.account.open_orders) > 0 or submitted > 0
         return CycleRunResult(
             orders_submitted=submitted,
             intents_generated=len(intents),
             intents_approved=len(decisions.approved),
             intents_rejected=len(decisions.rejected),
+            has_pending_orders=pending,
         )
 
     # ------------------------------------------------------------------

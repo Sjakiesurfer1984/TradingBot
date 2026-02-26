@@ -91,7 +91,7 @@ def main() -> int:
 
     scheduler = Scheduler(
         orchestrator=orchestrator,
-        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds),
+        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds, order_check_seconds=app_cfg.order_check_seconds),
     )
     scheduler.run()
     return 0

@@ -45,46 +45,129 @@ FILE: .\config\config.yaml
 strategies:
   - name: pmcc
     pmcc:
+      # The underlying equity. SPY is ideal for PMCC: deep liquidity,
+      # tight spreads, and consistent IV makes premium collection reliable.
       underlying_symbol: SPY
+
+      # Maximum number of simultaneous PMCC spreads on this underlying.
+      # Each spread = 1 LEAP + 1 short NEAR. With SPY at ~$680, one spread
+      # costs roughly $10k-$15k in buying power. 5 units = ~$50k-$75k max.
       max_units: 5
 
       leap:
-        dte_min: 365
-        dte_max: 545
+        # How far out to buy the long LEAP call.
+        # 450-560 days puts you in the flat part of the theta curve where
+        # time decay is slowest. 365 is the minimum viable but leaves less
+        # buffer — SPY can move 15-20% in a year and a 365-day LEAP gives
+        # little runway before the short threatens the long.
+        dte_min: 450
+        dte_max: 560
+
+        # Target delta for the LEAP. 0.80 delta means deep ITM — roughly
+        # $0.80 of movement per $1 move in SPY. This gives strong directional
+        # exposure while still benefiting from short premium collection.
+        # Range: 0.70 (cheaper, less exposure) to 0.90 (expensive, more stock-like).
         target_delta: 0.80
 
       short:
+        # How far out to sell the short NEAR call.
+        # 21-45 DTE is the sweet spot: theta decay accelerates inside 45 DTE
+        # and the position is manageable before 21 DTE gets risky.
         dte_min: 21
         dte_max: 45
+
+        # Target delta for the short NEAR. 0.20 delta means OTM — low
+        # probability of the short being tested. Lower = less premium but
+        # safer. Higher = more premium but more assignment risk.
+        # Range: 0.15 (conservative) to 0.30 (aggressive).
         target_delta: 0.20
 
       roll:
-        dte_threshold: 14
-        profit_pct: 0.50
+        # Roll the short NEAR when it reaches this many days to expiry.
+        # 14 DTE avoids gamma risk (accelerating delta near expiry) while
+        # still capturing most of the premium. Use 21 DTE for more
+        # conservative management.
+        near_dte_threshold: 14
+
+        # Profit target for rolling the NEAR — varies by IV regime.
+        # The IvRegimePipeline classifies the regime each cycle from IV Rank (IVR):
+        #   HIGH IV   (IVR > 50): exit early — vol will compress, don't overstay.
+        #   NORMAL IV (IVR 25-50): standard management.
+        #   LOW IV    (IVR < 25): stay in longer — premium is thin, capture more decay.
+        # If IV regime is UNKNOWN (insufficient history), normal_iv value is used.
+        near_profit_pct_high_iv:   0.50
+        near_profit_pct_normal_iv: 0.55
+        near_profit_pct_low_iv:    0.65
+
+        # Roll when spot price reaches this fraction of the short strike.
+        # 0.95 = roll when SPY is within 5% of the short call strike.
+        # Prevents the short from going ITM and risking assignment.
         near_strike_proximity: 0.95
+
+        # Maximum net debit allowed when rolling the NEAR (points per contract).
+        # Roll cost = new_short_ask - old_short_bid. Negative = net credit (ideal).
+        # 2.00 means you'll pay at most $200/contract to roll forward.
+        # Lower this to only roll for credits; raise it if you must roll
+        # out of a tested position regardless of cost.
+        near_max_roll_debit: 2.00
+
+        # Rebuild the entire spread when the LEAP reaches this many DTE.
+        # 90 DTE gives enough time to find a good replacement LEAP before
+        # theta decay accelerates and the position loses its edge.
         leap_dte_threshold: 90
+
+        # Emergency close: liquidate the entire spread when spot drops to
+        # this fraction of the LEAP strike. 0.90 = close everything if SPY
+        # falls to within 10% of the LEAP strike. At that point the spread
+        # risks going underwater and the theta advantage disappears.
         leap_strike_danger: 0.90
 
       liquidity:
+        # Maximum bid-ask spread as a fraction of ask price.
+        # Rejects contracts where the spread is too wide to fill cleanly.
+        # 0.10 = allow up to 10% spread. LEAPs are naturally less liquid
+        # than NEARs so 0.10 is permissive but necessary for deep ITM
+        # long-dated SPY calls. Tighten to 0.05 for NEARs if desired.
         max_leap_spread_pct: 0.10
         max_near_spread_pct: 0.10
 
       risk:
+        # Maximum fraction of option buying power to deploy per entry.
+        # 0.50 = use at most 50% of available buying power for one spread.
         max_buying_power_fraction: 0.50
+
+        # Hard ceiling on net debit per spread in USD.
+        # At SPY ~$680, a 0.80-delta LEAP costs ~$12,000-$15,000/contract.
+        # 50000 is permissive — tighten this to your actual per-spread budget.
         max_debit_per_spread_usd: 50000
+
+        # Maximum contracts per single entry intent.
+        # The sizer may request more if buying power allows — this caps it.
         max_contracts_per_intent: 3
+
+        # Multiply the theoretical fill price by this to account for slippage.
+        # 1.05 = assume you pay 5% more than mid-price. Makes sizing conservative.
         slippage_factor: 1.05
+
+        # Skip bid-ask spread liquidity checks during contract selection.
+        # false = enforce max_leap/near_spread_pct (recommended for live trading).
+        # true = accept any contract regardless of spread (testing only).
         ignore_spread_checks: false
 
+# Run the full pipeline but skip broker.submit_order(). Safe for testing.
+# Set to false when ready to trade live.
 default_dry_run: true
+
+# How often to run a cycle in seconds. 60s is sensible for options —
+# conditions don't change fast enough to need sub-minute polling.
 cycle_seconds: 60
 
 backtest:
   initial_cash: 100000
   start_date: "2025-02-24"
-  end_date:  "2025-03-02" #"2022-02-24"
+  end_date:   "2025-03-02"
   output_dir: backtest_results
-  log_mode: verbose # progress # None
+  log_mode: verbose  # "progress" = summary only | "verbose" = full logs
 
 ============================================================
 FILE: .\src\__init__.py
@@ -147,7 +230,7 @@ from src.risk.evaluators import PmccEvaluator, _EnterPmccApproved
 from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
 from src.risk.risk_engine import RiskEngine
 from src.risk.rules.open_order_rule import OpenOrderDedupeRule
-from src.signals.signal_pipeline import DefaultSignalPipeline
+from src.signals.signal_pipeline import IvRegimePipelineWithBars
 from src.strategies.pmcc_strategy import PmccStrategy
 from src.utilities.clock import LiveClock
 from src.utilities.logger import setup_logger
@@ -210,7 +293,7 @@ def main() -> int:
         risk_engine=risk_engine,
         execution_policy=DefaultExecutionPolicy(),
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
-        signal_pipeline=DefaultSignalPipeline(),
+        signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
         dry_run=app_cfg.default_dry_run,
     )
 
@@ -1678,11 +1761,15 @@ FILE: .\src\brokers\alpaca_broker.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Type
 
 from src.brokers.broker_base import BrokerBase
 from src.brokers.interfaces import BrokerABC
-from src.domain.orders import OrderABC, MarketOrder, MultiLegLimitOrder
+from src.domain.orders import MarketOrder, MultiLegLimitOrder, OrderABC, OrderSide
+from src.domain.types import AssetQuote
+from src.orchestration.cycle_snapshot import AccountSnapshot
 from src.utilities.clock import ClockABC, LiveClock
 from src.utilities.logger import setup_logger
 
@@ -1691,36 +1778,55 @@ logger = setup_logger("AlpacaBroker")
 
 @dataclass
 class AlpacaBroker(BrokerABC, BrokerBase):
-    api_key: str
+    api_key:    str
     secret_key: str
-    paper: bool = True
-    clock: ClockABC = field(default_factory=LiveClock)
+    paper:      bool     = True
+    clock:      ClockABC = field(default_factory=LiveClock)
 
     _trading_client: Any = field(default=None, init=False)
+    _data_client:    Any = field(default=None, init=False)
     _order_handlers: Dict[Type[OrderABC], Callable[[OrderABC], Any]] = field(
-        default_factory=dict,
-        init=False,
+        default_factory=dict, init=False,
     )
 
     def __post_init__(self) -> None:
-        # Lazy-import alpaca so importing the module does not explode if alpaca is missing.
         from alpaca.trading.client import TradingClient
+        from alpaca.data.historical import StockHistoricalDataClient
 
         self._trading_client = TradingClient(
             api_key=self.api_key,
             secret_key=self.secret_key,
             paper=self.paper,
         )
-
-        # Registry to avoid isinstance ladders in submit_order (OCP improvement)
+        self._data_client = StockHistoricalDataClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+        )
         self._order_handlers = {
-            MarketOrder: self._submit_market_order,
+            MarketOrder:        self._submit_market_order,
             MultiLegLimitOrder: self._submit_multileg_limit_order,
         }
 
-    # -----------------------------
-    # BrokerABC methods (examples)
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # ExecutionBrokerABC
+    # ------------------------------------------------------------------
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        self._log_io_boundary("get_account_snapshot")
+        account   = self._trading_client.get_account()
+        positions = self._trading_client.get_all_positions()
+        orders    = self._trading_client.get_orders()
+
+        return AccountSnapshot(
+            equity=self._safe_float(account.equity),
+            cash=self._safe_float(account.cash),
+            option_buying_power=self._safe_float(
+                getattr(account, "options_buying_power", None)
+                or getattr(account, "buying_power", 0)
+            ),
+            positions=[self._position_to_dict(p) for p in (positions or [])],
+            open_orders=[self._order_to_dict(o) for o in (orders or [])],
+        )
 
     def submit_order(self, order: OrderABC) -> Any:
         self._log_io_boundary("submit_order")
@@ -1730,44 +1836,324 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             error_prefix="Unsupported order type",
         )
 
-    # -----------------------------
-    # Internal handlers
-    # -----------------------------
+    def cancel_order(self, order_id: str) -> None:
+        self._log_io_boundary("cancel_order")
+        self._trading_client.cancel_order_by_id(order_id)
+
+    # ------------------------------------------------------------------
+    # MarketDataProviderABC
+    # ------------------------------------------------------------------
+
+    def get_asset_quote(self, symbol: str) -> AssetQuote:
+        self._log_io_boundary("get_asset_quote")
+        from alpaca.data.requests import StockLatestQuoteRequest
+        from alpaca.data.enums import DataFeed
+        sym = symbol.strip().upper()
+        try:
+            req  = StockLatestQuoteRequest(symbol_or_symbols=sym, feed=DataFeed.IEX)
+            data = self._data_client.get_stock_latest_quote(req)
+            q    = data.get(sym)
+            if q:
+                bid = self._safe_float(getattr(q, "bid_price", None))
+                ask = self._safe_float(getattr(q, "ask_price", None))
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else ask or bid
+                return AssetQuote(
+                    symbol=sym,
+                    bid=bid or None,
+                    ask=ask or None,
+                    mid=mid or None,
+                    timestamp_utc=getattr(q, "timestamp", None),
+                )
+        except Exception as exc:
+            logger.warning("get_asset_quote failed for %s: %s", sym, exc)
+        return AssetQuote(symbol=sym, bid=None, ask=None, mid=None, timestamp_utc=None)
+
+    def get_latest_price(self, symbol: str) -> float:
+        quote = self.get_asset_quote(symbol)
+        return quote.mid or quote.ask or quote.bid or 0.0
+
+    def get_daily_bars(self, symbol: str, lookback_days: int) -> Any:
+        self._log_io_boundary("get_daily_bars")
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from alpaca.data.enums import DataFeed
+        from datetime import timedelta
+        sym   = symbol.strip().upper()
+        end   = self.clock.now_utc()
+        start = end - timedelta(days=lookback_days + 5)
+        req   = StockBarsRequest(
+            symbol_or_symbols=sym,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,  # IEX is free; SIP requires a paid subscription
+        )
+        return self._data_client.get_stock_bars(req)
+
+    def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        include_calls:       bool            = True,
+        include_puts:        bool            = False,
+        feed:                str             = "indicative",
+        max_age_seconds:     int             = 30,
+        limit:               int             = 0,
+        strike_price_gte:    Optional[float] = None,
+        strike_price_lte:    Optional[float] = None,
+        expiration_date:     Optional[date]  = None,
+        expiration_date_gte: Optional[date]  = None,
+        expiration_date_lte: Optional[date]  = None,
+        root_symbol:         Optional[str]   = None,
+        updated_since:       Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch option chain with quotes and greeks via two Alpaca SDK calls:
+
+          1. TradingClient.get_option_contracts(GetOptionContractsRequest)
+             Server-side filtering by expiry/type/strike. Returns contract
+             metadata only — no quotes, no greeks.
+
+          2. OptionHistoricalDataClient.get_option_chain(OptionChainRequest)
+             Returns latest quote + greeks keyed by contract symbol.
+
+        We merge: contract list defines what passes filters, data client
+        provides prices. Contracts without live quote data are dropped.
+        """
+        self._log_io_boundary("get_option_chain")
+
+        from alpaca.trading.requests import GetOptionContractsRequest
+        from alpaca.trading.enums import AssetStatus, ContractType
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionChainRequest as AlpacaOptionChainRequest
+
+        sym = underlying.strip().upper()
+
+        # ------------------------------------------------------------------
+        # Step 1: contract list with server-side filters
+        # ------------------------------------------------------------------
+        contract_type = None
+        if include_calls and not include_puts:
+            contract_type = ContractType.CALL
+        elif include_puts and not include_calls:
+            contract_type = ContractType.PUT
+
+        try:
+            contracts: List[Any] = []
+            page_token: Optional[str] = None
+            page = 0
+            while True:
+                page += 1
+                paged_req = GetOptionContractsRequest(
+                    underlying_symbols=[sym],
+                    status=AssetStatus.ACTIVE,
+                    type=contract_type,
+                    expiration_date_gte=expiration_date_gte,
+                    expiration_date_lte=expiration_date_lte,
+                    strike_price_gte=str(strike_price_gte) if strike_price_gte is not None else None,
+                    strike_price_lte=str(strike_price_lte) if strike_price_lte is not None else None,
+                    limit=1000,
+                    page_token=page_token,
+                )
+                resp = self._trading_client.get_option_contracts(paged_req)
+                page_contracts = resp.option_contracts or []
+                contracts.extend(page_contracts)
+                logger.info(
+                    "Contracts page %d | sym=%s page_count=%d total=%d",
+                    page, sym, len(page_contracts), len(contracts),
+                )
+                next_token = getattr(resp, "next_page_token", None)
+                if not next_token or not page_contracts:
+                    break
+                page_token = str(next_token)
+        except Exception as exc:
+            logger.warning("get_option_contracts failed for %s: %s", sym, exc)
+            return []
+
+        if not contracts:
+            logger.info(
+                "No contracts returned | sym=%s expiry=[%s → %s]",
+                sym, expiration_date_gte, expiration_date_lte,
+            )
+            return []
+
+        contract_symbols = [str(c.symbol) for c in contracts if c.symbol]
+        logger.info("Contracts fetched | sym=%s count=%d", sym, len(contract_symbols))
+
+        # ------------------------------------------------------------------
+        # Step 2: quotes + greeks from OptionHistoricalDataClient
+        # get_option_chain returns { contract_sym: Snapshot } for the whole
+        # underlying — we filter down to the contracts we care about.
+        # ------------------------------------------------------------------
+        option_data_client = OptionHistoricalDataClient(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+        )
+        chain_data: Dict[str, Any] = {}
+        try:
+            chain_resp = option_data_client.get_option_chain(
+                AlpacaOptionChainRequest(underlying_symbol=sym, feed=feed)
+            )
+            for symbol_key, snapshot in chain_resp.items():
+                chain_data[str(symbol_key).upper()] = snapshot
+        except Exception as exc:
+            logger.warning("get_option_chain data fetch failed for %s: %s", sym, exc)
+
+        # ------------------------------------------------------------------
+        # Merge contract list + quote data
+        # ------------------------------------------------------------------
+        results: List[Dict[str, Any]] = []
+        for contract_sym in contract_symbols:
+            snapshot = chain_data.get(contract_sym.upper())
+            if snapshot is None:
+                continue
+
+            quote  = getattr(snapshot, "latest_quote", None) or {}
+            greeks = getattr(snapshot, "greeks",       None) or {}
+            if hasattr(quote,  "__dict__"): quote  = vars(quote)
+            if hasattr(greeks, "__dict__"): greeks = vars(greeks)
+
+            results.append({
+                "contract_symbol": contract_sym,
+                "greeks": {
+                    "delta": greeks.get("delta"),
+                    "gamma": greeks.get("gamma"),
+                    "theta": greeks.get("theta"),
+                    "vega":  greeks.get("vega"),
+                },
+                "latestQuote": {
+                    "ap": quote.get("ask_price") or quote.get("ap"),
+                    "bp": quote.get("bid_price") or quote.get("bp"),
+                },
+            })
+            if 0 < limit <= len(results):
+                break
+
+        logger.info(
+            "Option chain merged | sym=%s contracts=%d with_quotes=%d expiry=[%s → %s]",
+            sym, len(contract_symbols), len(results),
+            expiration_date_gte, expiration_date_lte,
+        )
+        return results
+
+
+    # ------------------------------------------------------------------
+    # Order submission
+    # ------------------------------------------------------------------
 
     def _submit_market_order(self, order: OrderABC) -> Any:
         if not isinstance(order, MarketOrder):
-            raise TypeError(f"_submit_market_order expected MarketOrder, got {type(order).__name__}")
+            raise TypeError(f"Expected MarketOrder, got {type(order).__name__}")
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce as AlpacaTIF
 
-        return self._trading_client.submit_order(
+        side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
+        tif  = AlpacaTIF.DAY  # always DAY for options
+
+        req = MarketOrderRequest(
             symbol=order.symbol,
             qty=order.quantity,
-            side=str(order.side).lower(),
-            type="market",
-            time_in_force=str(order.time_in_force).lower(),
+            side=side,
+            time_in_force=tif,
         )
+        logger.info(
+            "Submitting market order | symbol=%s side=%s qty=%d",
+            order.symbol, side.value, order.quantity,
+        )
+        return self._trading_client.submit_order(req)
 
     def _submit_multileg_limit_order(self, order: OrderABC) -> Any:
         if not isinstance(order, MultiLegLimitOrder):
-            raise TypeError(
-                f"_submit_multileg_limit_order expected MultiLegLimitOrder, got {type(order).__name__}"
-            )
+            raise TypeError(f"Expected MultiLegLimitOrder, got {type(order).__name__}")
+        from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+        from alpaca.trading.enums import OrderClass, TimeInForce as AlpacaTIF, PositionIntent
 
-        legs_payload: List[Dict[str, Any]] = []
+        legs = []
         for leg in order.legs:
-            legs_payload.append(
-                {
-                    "symbol": str(leg.symbol),
-                    "ratio_qty": int(leg.ratio),
-                    "side": str(leg.side).lower(),
-                }
-            )
+            side_str = "buy" if leg.side == OrderSide.BUY else "sell"
+            # Determine position intent from contract + side
+            # BUY = BTO (opening), SELL = STO (opening) for entries
+            # For closing legs the execution policy sets position_intent
+            pi = PositionIntent.BUY_TO_OPEN if leg.side == OrderSide.BUY else PositionIntent.SELL_TO_OPEN
+            legs.append(OptionLegRequest(
+                symbol=leg.contract.option_symbol,
+                ratio_qty=leg.ratio,
+                side=side_str,
+                position_intent=pi,
+            ))
 
-        return self._trading_client.submit_order(
-            order_class="mleg",
-            legs=legs_payload,
+        req = LimitOrderRequest(
+            order_class=OrderClass.MLEG,
+            qty=order.quantity,
             limit_price=float(order.limit_price),
-            time_in_force=str(order.time_in_force).lower(),
+            time_in_force=AlpacaTIF.DAY,
+            legs=legs,
         )
+        logger.info(
+            "Submitting MLEG order | underlying=%s legs=%d limit=%.2f qty=%d",
+            order.underlying, len(legs), float(order.limit_price), order.quantity,
+        )
+        return self._trading_client.submit_order(req)
+
+    # ------------------------------------------------------------------
+    # Dict converters — Alpaca SDK objects → plain dicts the app expects
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _position_to_dict(p: Any) -> Dict[str, Any]:
+        def _enum_val(v: Any) -> str:
+            """
+            Alpaca SDK returns enum objects like AssetClass.US_OPTION.
+            str(AssetClass.US_OPTION) → "AssetClass.US_OPTION" (useless).
+            getattr(v, "value", str(v)) → "us_option" (what we need).
+            The classifier and state machine always compare against lowercase
+            plain strings, so we normalise here at the boundary.
+            """
+            return str(getattr(v, "value", v) or "").lower()
+
+        # qty: Alpaca returns positive for long, negative for short options.
+        # The SDK's PositionSide enum (LONG/SHORT) is on the `side` field.
+        # The classifier uses qty sign directly, so we preserve the raw number.
+        qty_raw = getattr(p, "qty", 0) or 0
+        side    = _enum_val(getattr(p, "side", ""))
+        # Enforce sign: LONG → positive, SHORT → negative
+        try:
+            qty_float = float(qty_raw)
+        except (TypeError, ValueError):
+            qty_float = 0.0
+        if side == "short" and qty_float > 0:
+            qty_float = -qty_float
+
+        return {
+            "symbol":            str(getattr(p, "symbol", "") or ""),
+            "asset_class":       _enum_val(getattr(p, "asset_class", "")),
+            "qty":               str(qty_float),
+            "side":              side,
+            "market_value":      str(getattr(p, "market_value", 0) or 0),
+            "cost_basis":        str(getattr(p, "cost_basis", 0) or 0),
+            "unrealized_pl":     str(getattr(p, "unrealized_pl", 0) or 0),
+            "current_price":     str(getattr(p, "current_price", 0) or 0),
+            "underlying_symbol": str(getattr(p, "underlying_symbol", "") or ""),
+        }
+
+    @staticmethod
+    def _order_to_dict(o: Any) -> Dict[str, Any]:
+        legs = []
+        for leg in (getattr(o, "legs", None) or []):
+            legs.append({
+                "symbol": str(getattr(leg, "symbol", "") or ""),
+                "side":   str(getattr(leg, "side", "") or ""),
+            })
+        return {
+            "id":                str(getattr(o, "id", "") or ""),
+            "symbol":            str(getattr(o, "symbol", "") or ""),
+            "underlying_symbol": str(getattr(o, "underlying_symbol", "") or ""),
+            "order_class":       str(getattr(o, "order_class", "") or ""),
+            "status":            str(getattr(o, "status", "") or ""),
+            "side":              str(getattr(o, "side", "") or ""),
+            "qty":               str(getattr(o, "qty", 0) or 0),
+            "legs":              legs,
+        }
 
 ============================================================
 FILE: .\src\brokers\broker_base.py
@@ -1986,9 +2372,10 @@ FILE: .\src\brokers\registry.py
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 from src.brokers.interfaces import BrokerABC
 from src.config.env_config import EnvConfig
@@ -1998,144 +2385,90 @@ logger = setup_logger("BrokerRegistry")
 
 
 class BrokerBuilderABC(ABC):
-    """
-    Abstract Broker Builder.
-
-    Purpose:
-    - Defines the contract for "how to build a BrokerABC" given EnvConfig.
-    - This is the plug-in interface for new brokers.
-
-    Key idea:
-    - Code that needs a broker should depend on BrokerABC.
-    - Code that chooses which broker to construct should depend on BrokerBuilderABC,
-      not on AlpacaBroker, IbkrBroker, etc.
-
-    Why an ABC here:
-    - It forces every broker integration to provide a consistent build(env_cfg) entry point.
-    - It prevents leaking broker-specific constructor details into the rest of the application.
-    """
-
     @abstractmethod
     def build(self, env_cfg: EnvConfig) -> BrokerABC:
-        """
-        Build and return a concrete broker implementation that satisfies BrokerABC.
-
-        env_cfg:
-        - Contains environment-driven settings such as broker name, api keys, mode, etc.
-
-        Returns:
-        - A fully configured BrokerABC (for example AlpacaBroker).
-        """
         raise NotImplementedError
 
 
 class BrokerBuilderRegistryABC(ABC):
-    """
-    Abstract Registry interface.
-
-    Purpose:
-    - Defines how builders are stored and retrieved.
-    - Allows you to swap out the registry implementation later (for example, add validation,
-      allow aliases, support lazy registration, support discovery) without rewriting callers.
-
-    The registry is a map:
-    - broker_name (string key) -> BrokerBuilderABC (builder instance)
-    """
-
     @abstractmethod
     def register(self, name: str, builder: BrokerBuilderABC) -> None:
-        """
-        Register a builder under a broker name.
-
-        Example:
-        - register("alpaca", AlpacaBrokerBuilder())
-        """
         raise NotImplementedError
 
     @abstractmethod
     def get_builder(self, name: str) -> BrokerBuilderABC:
-        """
-        Lookup and return the builder for the given broker name.
-
-        The caller typically provides the value from configuration, for example:
-        - env_cfg.broker_name
-        """
         raise NotImplementedError
 
 
 @dataclass
 class BrokerBuilderRegistry(BrokerBuilderRegistryABC):
-    """
-    Concrete in-memory registry.
-
-    How it is used:
-    - Startup code registers supported brokers (alpaca, ibkr, etc.).
-    - A factory (often called BrokerFactoryFacade) retrieves the correct builder based on config.
-    - The builder constructs the actual BrokerABC instance.
-
-    Why keep builders in a registry instead of if/elif?
-    - It avoids a growing conditional chain in your factory or main entry point.
-    - New brokers become a small, isolated change: implement a builder + register it.
-    - The application remains open for extension but closed for modification (OCP).
-    """
-
     _builders: Dict[str, BrokerBuilderABC] = field(default_factory=dict, init=False)
 
     def register(self, name: str, builder: BrokerBuilderABC) -> None:
-        """
-        Store the builder using a normalised (lowercased, stripped) key.
-
-        This normalisation reduces configuration fragility:
-        - "Alpaca", " alpaca ", "ALPACA" all map to the same entry.
-        """
         self._builders[name.lower().strip()] = builder
         logger.info("Registered broker builder | name=%s", name)
 
     def get_builder(self, name: str) -> BrokerBuilderABC:
-        """
-        Retrieve a builder by broker name.
-
-        If the name is not registered:
-        - Raise KeyError with helpful diagnostics (show registered keys).
-        """
         key = name.lower().strip()
         if key not in self._builders:
             raise KeyError(f"No broker builder for '{name}'. Registered: {list(self._builders)}")
         return self._builders[key]
 
 
+def _env(name: str) -> Optional[str]:
+    v = os.getenv(name, "").strip()
+    return v or None
+
+
+def _mask(v: Optional[str], n: int = 4) -> str:
+    if not v:
+        return "<missing>"
+    return v[:n] + "*" * max(0, len(v) - n)
+
+
 class AlpacaBrokerBuilder(BrokerBuilderABC):
     """
-    Concrete builder for Alpaca.
+    Builds AlpacaBroker directly from environment variables.
 
-    Responsibility:
-    - Knows how to construct an Alpaca broker instance.
-    - Contains the only direct dependency on alpaca construction code (alpaca_factory).
+    Reads:
+      ALPACA_PAPER_API_KEY    / ALPACA_LIVE_API_KEY
+      ALPACA_PAPER_API_SECRET / ALPACA_LIVE_API_SECRET
+      env_cfg.alpaca.mode     ("paper" | "live")
 
-    Important design rule:
-    - The rest of the codebase should not import alpaca_factory directly.
-    - Only this builder (and Alpaca-specific modules) should know about Alpaca construction.
-
-    Cooperation with a factory facade (typical flow):
-    - A factory reads env_cfg.broker_name (for example "alpaca").
-    - It asks the registry for the builder registered under that name.
-    - It calls builder.build(env_cfg) to create a BrokerABC.
-    - The returned broker is injected into the orchestrator and used via BrokerABC only.
+    alpaca_factory.py has been deleted — construction lives here.
     """
 
     def build(self, env_cfg: EnvConfig) -> BrokerABC:
-        """
-        Build and return an AlpacaBroker.
+        from src.brokers.alpaca_broker import AlpacaBroker
+        from src.utilities.clock import LiveClock
 
-        Note:
-        - This delegates to a factory function (build_alpaca_broker) which typically:
-          - reads env vars or uses env_cfg to obtain credentials
-          - configures paper/live mode
-          - returns a fully initialised AlpacaBroker adapter
-        """
-        from src.brokers.alpaca_broker import build_alpaca_broker
-        return build_alpaca_broker()
+        paper = env_cfg.alpaca.mode != "live"
 
+        if paper:
+            api_key    = _env("ALPACA_PAPER_API_KEY")
+            api_secret = _env("ALPACA_PAPER_API_SECRET")
+        else:
+            api_key    = _env("ALPACA_LIVE_API_KEY")
+            api_secret = _env("ALPACA_LIVE_API_SECRET")
+
+        if not api_key or not api_secret:
+            prefix = "ALPACA_PAPER" if paper else "ALPACA_LIVE"
+            raise EnvironmentError(
+                f"Missing Alpaca credentials for mode='{env_cfg.alpaca.mode}'. "
+                f"Set {prefix}_API_KEY and {prefix}_API_SECRET in your .env file."
+            )
+
+        logger.info(
+            "Building AlpacaBroker | mode=%s key=%s",
+            env_cfg.alpaca.mode, _mask(api_key),
+        )
+
+        return AlpacaBroker(
+            api_key=api_key,
+            secret_key=api_secret,
+            paper=paper,
+            clock=LiveClock(),
+        )
 
 ============================================================
 FILE: .\src\brokers\__init__.py
@@ -2239,11 +2572,14 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    dte_threshold:         int
-    profit_pct:            float
-    near_strike_proximity: float
-    leap_dte_threshold:    int
-    leap_strike_danger:    float
+    near_dte_threshold:       int    # roll the short NEAR when DTE reaches this
+    near_profit_pct_high_iv:  float  # profit target when IV regime is HIGH  (IVR > 50)
+    near_profit_pct_normal_iv: float # profit target when IV regime is NORMAL (IVR 25-50)
+    near_profit_pct_low_iv:   float  # profit target when IV regime is LOW    (IVR < 25)
+    near_strike_proximity:    float  # roll when spot / near_strike >= this ratio
+    leap_dte_threshold:       int    # rebuild the spread when LEAP DTE reaches this
+    leap_strike_danger:       float  # close everything when spot / leap_strike <= this ratio
+    near_max_roll_debit:      float  # max net debit allowed on a NEAR roll (points)
 
 
 @dataclass(frozen=True)
@@ -2318,11 +2654,14 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
         leap=PmccLeapConfig(**p["leap"]),
         short=PmccShortConfig(**p["short"]),
         roll=PmccRollConfig(
-            dte_threshold=int(ro["dte_threshold"]),
-            profit_pct=float(ro["profit_pct"]),
+            near_dte_threshold=int(ro["near_dte_threshold"]),
+            near_profit_pct_high_iv=float(ro["near_profit_pct_high_iv"]),
+            near_profit_pct_normal_iv=float(ro["near_profit_pct_normal_iv"]),
+            near_profit_pct_low_iv=float(ro["near_profit_pct_low_iv"]),
             near_strike_proximity=float(ro["near_strike_proximity"]),
             leap_dte_threshold=int(ro["leap_dte_threshold"]),
             leap_strike_danger=float(ro["leap_strike_danger"]),
+            near_max_roll_debit=float(ro.get("near_max_roll_debit", 2.0)),
         ),
         liquidity=PmccLiquidityConfig(**p["liquidity"]),
         risk=PmccRiskConfig(
@@ -2668,18 +3007,97 @@ class RegimeLabel(str, Enum):
     WHIPSAW = "whipsaw"
 
 
+class IvRegime(str, Enum):
+    """
+    Volatility regime derived from IV Rank (IVR).
+
+    HIGH   → IVR > 50  — IV is elevated relative to its 52-week range.
+                          Premium is rich. Exit shorts early (50% profit)
+                          before vol compresses and theta advantage evaporates.
+
+    NORMAL → IVR 25-50 — IV is in a normal range. Standard management.
+                          Roll at 55% profit.
+
+    LOW    → IVR < 25  — IV is suppressed. Premium is thin. Stay in longer
+                          to capture more decay before rolling (65% profit).
+
+    UNKNOWN → IVR could not be computed (insufficient history, API error).
+               Fall back to the static config value.
+    """
+    HIGH    = "high"
+    NORMAL  = "normal"
+    LOW     = "low"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class IvRegimeSignal:
+    """
+    IV regime computed once per cycle by the signal pipeline.
+
+    Fields:
+      regime         — HIGH / NORMAL / LOW / UNKNOWN
+      ivr            — IV Rank 0-100 (None if unavailable)
+      iv_current     — current 30-day implied vol (e.g. 0.18 = 18%)
+      iv_52w_high    — highest IV seen in the past 252 trading days
+      iv_52w_low     — lowest IV seen in the past 252 trading days
+      hv30           — 30-day historical (realised) vol
+      iv_hv_ratio    — iv_current / hv30 (>1 means options are expensive)
+    """
+    regime:      IvRegime
+    ivr:         float | None = None
+    iv_current:  float | None = None
+    iv_52w_high: float | None = None
+    iv_52w_low:  float | None = None
+    hv30:        float | None = None
+    iv_hv_ratio: float | None = None
+
+    @classmethod
+    def unknown(cls) -> "IvRegimeSignal":
+        return cls(regime=IvRegime.UNKNOWN)
+
+    @classmethod
+    def from_ivr(
+        cls,
+        *,
+        ivr:         float,
+        iv_current:  float,
+        iv_52w_high: float,
+        iv_52w_low:  float,
+        hv30:        float | None = None,
+    ) -> "IvRegimeSignal":
+        if ivr > 50:
+            regime = IvRegime.HIGH
+        elif ivr < 25:
+            regime = IvRegime.LOW
+        else:
+            regime = IvRegime.NORMAL
+
+        iv_hv_ratio = (iv_current / hv30) if hv30 and hv30 > 0 else None
+
+        return cls(
+            regime=regime,
+            ivr=round(ivr, 1),
+            iv_current=round(iv_current, 4),
+            iv_52w_high=round(iv_52w_high, 4),
+            iv_52w_low=round(iv_52w_low, 4),
+            hv30=round(hv30, 4) if hv30 is not None else None,
+            iv_hv_ratio=round(iv_hv_ratio, 2) if iv_hv_ratio is not None else None,
+        )
+
+
 @dataclass(frozen=True)
 class SignalSnapshot:
     as_of_utc:         datetime
-    regime:            RegimeLabel         = RegimeLabel.UNKNOWN
-    regime_confidence: float               = 0.0
+    regime:            RegimeLabel    = RegimeLabel.UNKNOWN
+    regime_confidence: float          = 0.0
+    iv_regime:         IvRegimeSignal = field(default_factory=IvRegimeSignal.unknown)
     scalar_signals:    Mapping[str, float] = field(default_factory=dict)
     iv_forecast:       Mapping[str, float] = field(default_factory=dict)
 
     @classmethod
     def empty(cls, *, as_of_utc: datetime) -> "SignalSnapshot":
         return cls(as_of_utc=as_of_utc)
-
 
 ============================================================
 FILE: .\src\domain\types.py
@@ -4833,23 +5251,236 @@ FILE: .\src\signals\signal_pipeline.py
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
-from src.domain.signals import SignalSnapshot
-from src.orchestration.cycle_snapshot import CycleSnapshot
+from src.domain.signals import IvRegimeSignal, SignalSnapshot
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("SignalPipeline")
+
+_IV_HISTORY_DAYS = 252
 
 
 class SignalPipelineABC(ABC):
     @abstractmethod
-    def compute(self, snapshot: CycleSnapshot) -> SignalSnapshot:
+    def compute(self, snapshot) -> SignalSnapshot:
         raise NotImplementedError
 
 
 class DefaultSignalPipeline(SignalPipelineABC):
-    """No-op pipeline — returns empty signals. Replace with real implementation."""
-
-    def compute(self, snapshot: CycleSnapshot) -> SignalSnapshot:
+    """No-op pipeline — returns empty signals."""
+    def compute(self, snapshot) -> SignalSnapshot:
         return SignalSnapshot.empty(as_of_utc=snapshot.as_of_utc)
+
+
+@dataclass
+class IvRegimePipeline(SignalPipelineABC):
+    """
+    Computes IV Rank and classifies the volatility regime each cycle.
+
+    IV source: ATM ~30-DTE call IV from the option chain already in the snapshot.
+    If greeks.iv is present on the contract row, use it directly. Otherwise
+    estimate IV from the mid price using the Brenner-Subrahmanyam approximation:
+      IV ≈ (mid / spot) * sqrt(2π / T)
+
+    IVR = (iv_current - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
+
+    History is maintained in a rolling in-memory buffer (capped at 252 entries,
+    one per trading day). Regime is UNKNOWN until at least 5 data points exist.
+
+    HV30 (optional): injected via IvRegimePipelineWithBars which also calls
+    broker.get_daily_bars() to compute realised vol.
+    """
+
+    underlying: str = "SPY"
+    _iv_history: List[Tuple[str, float]] = field(default_factory=list, init=False)
+
+    def compute(self, snapshot) -> SignalSnapshot:
+        sym        = self.underlying.strip().upper()
+        iv_current = self._estimate_atm_iv(snapshot, sym)
+        hv30       = self._compute_hv30(snapshot, sym)
+
+        # Always emit one IV regime log line per cycle so the pipeline is
+        # visible even when it can't produce a signal.
+        # Format: IV regime | sym=SPY regime=unknown ivr=n/a iv=n/a hv30=n/a iv_hv=n/a history=0d reason=<why>
+
+        def _fmt(v, fmt=".3f"):
+            return format(v, fmt) if v is not None else "n/a"
+
+        if iv_current is None:
+            # Most likely cause: option chains not yet in snapshot (pre-snapshot
+            # cycle) or no near-ATM contracts in the fetched window.
+            chains_loaded = sum(len(c) for c in snapshot.option_chains.values())
+            reason = f"no_atm_iv(chains={chains_loaded})"
+            logger.info(
+                "IV regime | sym=%s regime=unknown ivr=n/a iv=n/a hv30=%s "
+                "iv_hv=n/a history=%dd reason=%s",
+                sym, _fmt(hv30), len(self._iv_history), reason,
+            )
+            return SignalSnapshot(
+                as_of_utc=snapshot.as_of_utc,
+                iv_regime=IvRegimeSignal.unknown(),
+            )
+
+        # Record once per day
+        date_key = snapshot.as_of_utc.strftime("%Y-%m-%d")
+        if not self._iv_history or self._iv_history[-1][0] != date_key:
+            self._iv_history.append((date_key, iv_current))
+            if len(self._iv_history) > _IV_HISTORY_DAYS:
+                self._iv_history.pop(0)
+
+        iv_values   = [v for _, v in self._iv_history]
+        history_len = len(iv_values)
+
+        if history_len < 5:
+            logger.info(
+                "IV regime | sym=%s regime=unknown ivr=n/a iv=%s hv30=%s "
+                "iv_hv=n/a history=%dd reason=insufficient_history(need_5)",
+                sym, _fmt(iv_current), _fmt(hv30), history_len,
+            )
+            return SignalSnapshot(
+                as_of_utc=snapshot.as_of_utc,
+                iv_regime=IvRegimeSignal.unknown(),
+            )
+
+        iv_52w_high = max(iv_values)
+        iv_52w_low  = min(iv_values)
+        ivr = (
+            (iv_current - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
+            if iv_52w_high > iv_52w_low else 50.0
+        )
+
+        signal = IvRegimeSignal.from_ivr(
+            ivr=ivr,
+            iv_current=iv_current,
+            iv_52w_high=iv_52w_high,
+            iv_52w_low=iv_52w_low,
+            hv30=hv30,
+        )
+
+        iv_hv = _fmt(signal.iv_hv_ratio, ".2f")
+        logger.info(
+            "IV regime | sym=%s regime=%s ivr=%.1f iv=%s hv30=%s iv_hv=%s history=%dd",
+            sym, signal.regime.value, ivr,
+            _fmt(iv_current), _fmt(hv30), iv_hv, history_len,
+        )
+
+        return SignalSnapshot(as_of_utc=snapshot.as_of_utc, iv_regime=signal)
+
+    def _estimate_atm_iv(self, snapshot, sym: str) -> Optional[float]:
+        spot = self._get_spot(snapshot, sym)
+        if spot <= 0:
+            return None
+
+        best_iv    = None
+        best_score = float("inf")
+
+        for key, chain in snapshot.option_chains.items():
+            if str(key[0]).upper() != sym:
+                continue
+            for row in chain:
+                contract_sym = str(row.get("contract_symbol", "")).upper()
+                if not contract_sym:
+                    continue
+                try:
+                    from src.risk.pmcc_sizer import parse_osi
+                    parsed = parse_osi(contract_sym)
+                    dte    = max(1, (parsed.expiry.date() - snapshot.as_of_utc.date()).days)
+                    strike = float(parsed.strike)
+                except Exception:
+                    continue
+
+                # Only near-ATM calls
+                if abs(strike - spot) / spot > 0.05:
+                    continue
+
+                # Try greeks.iv
+                greeks = row.get("greeks") or {}
+                iv = None
+                for key_name in ("iv", "impliedVolatility", "implied_volatility"):
+                    v = greeks.get(key_name)
+                    if v:
+                        try:
+                            iv = float(v)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+
+                # Fallback: Brenner-Subrahmanyam approximation
+                if not iv:
+                    quote = row.get("latestQuote") or {}
+                    ask   = float(quote.get("ap") or 0)
+                    bid   = float(quote.get("bp") or 0)
+                    mid   = (ask + bid) / 2 if ask > 0 and bid > 0 else 0
+                    if mid > 0:
+                        T  = dte / 365
+                        iv = (mid / spot) * math.sqrt(2 * math.pi / T)
+
+                if not iv or not (0.01 < iv < 2.0):
+                    continue
+
+                score = abs(dte - 30) / 30 + abs(strike - spot) / spot
+                if score < best_score:
+                    best_score = score
+                    best_iv    = iv
+
+        return best_iv
+
+    def _compute_hv30(self, snapshot, sym: str) -> Optional[float]:
+        # Base implementation returns None.
+        # Use IvRegimePipelineWithBars for HV30.
+        return None
+
+    def _get_spot(self, snapshot, sym: str) -> float:
+        for k, v in snapshot.asset_quotes.items():
+            if str(k).upper() == sym:
+                return v.mid or v.ask or v.bid or 0.0
+        return 0.0
+
+
+@dataclass
+class IvRegimePipelineWithBars(IvRegimePipeline):
+    """
+    Extends IvRegimePipeline with HV30 computed from daily bars.
+
+    Requires broker to be injected. Wire up in main.py:
+      signal_pipeline=IvRegimePipelineWithBars(underlying="SPY", broker=broker)
+    """
+    broker: object = None  # BrokerABC — typed as object to avoid circular import
+
+    def _compute_hv30(self, snapshot, sym: str) -> Optional[float]:
+        if self.broker is None:
+            return None
+        try:
+            bars_resp = self.broker.get_daily_bars(sym, lookback_days=35)
+            if hasattr(bars_resp, "data"):
+                bars = bars_resp.data.get(sym, [])
+            elif isinstance(bars_resp, dict):
+                bars = bars_resp.get(sym, [])
+            else:
+                bars = list(bars_resp) if bars_resp else []
+
+            closes = []
+            for bar in bars:
+                c = getattr(bar, "close", None) or (bar.get("c") if isinstance(bar, dict) else None)
+                if c:
+                    closes.append(float(c))
+
+            closes = closes[-22:]
+            if len(closes) < 10:
+                return None
+
+            log_returns = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes))]
+            mean        = sum(log_returns) / len(log_returns)
+            variance    = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
+            return math.sqrt(variance) * math.sqrt(252)
+
+        except Exception as exc:
+            logger.info("HV30 unavailable for %s (bars subscription required) — iv_hv ratio will be n/a | %s", sym, exc)
+            return None
 
 ============================================================
 FILE: .\src\signals\__init__.py
@@ -5421,6 +6052,7 @@ from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
 from src.strategies.pmcc_selector import PmccContractSelector
 from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
+from src.domain.signals import IvRegime
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("PmccStrategy")
@@ -5580,7 +6212,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 near_dte    = near.get("derived_dte") or 999
                 near_strike = near.get("derived_strike") or 0.0
 
-                if near_dte <= roll_cfg.dte_threshold:
+                if near_dte <= roll_cfg.near_dte_threshold:
                     return [short_req]
 
                 cost_basis   = float(near.get("cost_basis")   or 0.0)
@@ -5588,9 +6220,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 if cost_basis < 0:
                     premium_received = abs(cost_basis)
                     current_cost     = abs(market_value)
+                    profit_target = self._near_profit_target(snapshot)
                     if premium_received > 0:
                         profit_captured = (premium_received - current_cost) / premium_received
-                        if profit_captured >= roll_cfg.profit_pct:
+                        if profit_captured >= profit_target:
                             return [short_req]
 
                 if near_strike > 0 and spot > 0:
@@ -5605,6 +6238,24 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     # ------------------------------------------------------------------
     # State handlers
     # ------------------------------------------------------------------
+
+    def _near_profit_target(self, snapshot: CycleSnapshot) -> float:
+        """
+        Return the appropriate profit target for the NEAR based on the current
+        IV regime signal in the snapshot.
+
+          HIGH IV   (IVR > 50) → near_profit_pct_high_iv   (exit early, vol compresses)
+          NORMAL IV (IVR 25-50) → near_profit_pct_normal_iv
+          LOW IV    (IVR < 25) → near_profit_pct_low_iv    (stay in, capture more decay)
+          UNKNOWN              → near_profit_pct_normal_iv (safe fallback)
+        """
+        regime = snapshot.signals.iv_regime.regime
+        roll   = self.config.roll
+        if regime == IvRegime.HIGH:
+            return roll.near_profit_pct_high_iv
+        if regime == IvRegime.LOW:
+            return roll.near_profit_pct_low_iv
+        return roll.near_profit_pct_normal_iv   # NORMAL or UNKNOWN
 
     def _intents_entry(self, sym: Symbol, snapshot: CycleSnapshot) -> List[TradeIntent]:
         chains    = snapshot.option_chains
@@ -5646,7 +6297,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
 
         logger.info(
-            "PMCC entry intent | symbol=%s leap=%s near=%s spot=%.2f",
+            "PMCC entry intent CREATED | symbol=%s leap=%s near=%s spot=%.2f",
             sym_str, leap_sel.option_symbol, near_sel.option_symbol, spot,
         )
         payload = EnterPmccPayload(
@@ -5876,8 +6527,8 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             roll_near = False
             reason    = ""
 
-            if near_dte <= roll_cfg.dte_threshold:
-                roll_near, reason = True, f"DTE {near_dte} <= {roll_cfg.dte_threshold}"
+            if near_dte <= roll_cfg.near_dte_threshold:
+                roll_near, reason = True, f"DTE {near_dte} <= {roll_cfg.near_dte_threshold}"
 
             if not roll_near:
                 cost_basis   = float(near.get("cost_basis")   or 0.0)
@@ -5887,9 +6538,10 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     current   = abs(market_value)
                     if premium > 0:
                         captured = (premium - current) / premium
-                        if captured >= roll_cfg.profit_pct:
+                        profit_target = self._near_profit_target(snapshot)
+                        if captured >= profit_target:
                             roll_near = True
-                            reason    = f"profit {captured:.1%} >= {roll_cfg.profit_pct:.1%}"
+                            reason    = f"profit {captured:.1%} >= {profit_target:.1%} (regime={snapshot.signals.iv_regime.regime.value})"
 
             if not roll_near and near_strike > 0 and spot > 0:
                 if (spot / near_strike) >= roll_cfg.near_strike_proximity:
@@ -5948,8 +6600,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     underlying_symbol=sym,
                     close=_make_dummy_selected(near_sym),
                     open=new_near,
-                    max_net_debit=self.config.roll.max_roll_debit
-                    if hasattr(self.config.roll, "max_roll_debit") else 2.0,
+                    max_net_debit=self.config.roll.near_max_roll_debit,
                 ),
                 tags=("roll_near",),
             ))

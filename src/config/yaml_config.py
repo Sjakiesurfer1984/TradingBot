@@ -147,12 +147,13 @@ class GlobalRiskConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    config_path:     Path
-    default_dry_run: bool
-    cycle_seconds:   float
-    risk:            GlobalRiskConfig
-    strategies:      List[StrategySpec]
-    backtest:        Optional[BacktestConfig] = None
+    config_path:          Path
+    default_dry_run:      bool
+    cycle_seconds:        float   # normal cadence — no pending orders
+    order_check_seconds:  float   # fast cadence — open order in flight
+    risk:                 GlobalRiskConfig
+    strategies:           List[StrategySpec]
+    backtest:             Optional[BacktestConfig] = None
 
 
 # ===========================================================================
@@ -208,7 +209,8 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
     return AppConfig(
         config_path=path,
         default_dry_run=bool(raw.get("default_dry_run", False)),
-        cycle_seconds=float(raw.get("cycle_seconds", 60)),
+        cycle_seconds=float(raw.get("cycle_seconds", 300)),
+        order_check_seconds=float(raw.get("order_check_seconds", 30)),
         risk=global_risk,
         strategies=strategies,
         backtest=backtest_cfg,

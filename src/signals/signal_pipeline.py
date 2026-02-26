@@ -48,13 +48,27 @@ class IvRegimePipeline(SignalPipelineABC):
     _iv_history: List[Tuple[str, float]] = field(default_factory=list, init=False)
 
     def compute(self, snapshot) -> SignalSnapshot:
-        from src.orchestration.cycle_snapshot import CycleSnapshot
         sym        = self.underlying.strip().upper()
         iv_current = self._estimate_atm_iv(snapshot, sym)
         hv30       = self._compute_hv30(snapshot, sym)
 
+        # Always emit one IV regime log line per cycle so the pipeline is
+        # visible even when it can't produce a signal.
+        # Format: IV regime | sym=SPY regime=unknown ivr=n/a iv=n/a hv30=n/a iv_hv=n/a history=0d reason=<why>
+
+        def _fmt(v, fmt=".3f"):
+            return format(v, fmt) if v is not None else "n/a"
+
         if iv_current is None:
-            logger.warning("IV regime: could not estimate ATM IV for %s — UNKNOWN", sym)
+            # Most likely cause: option chains not yet in snapshot (pre-snapshot
+            # cycle) or no near-ATM contracts in the fetched window.
+            chains_loaded = sum(len(c) for c in snapshot.option_chains.values())
+            reason = f"no_atm_iv(chains={chains_loaded})"
+            logger.info(
+                "IV regime | sym=%s regime=unknown ivr=n/a iv=n/a hv30=%s "
+                "iv_hv=n/a history=%dd reason=%s",
+                sym, _fmt(hv30), len(self._iv_history), reason,
+            )
             return SignalSnapshot(
                 as_of_utc=snapshot.as_of_utc,
                 iv_regime=IvRegimeSignal.unknown(),
@@ -67,12 +81,14 @@ class IvRegimePipeline(SignalPipelineABC):
             if len(self._iv_history) > _IV_HISTORY_DAYS:
                 self._iv_history.pop(0)
 
-        iv_values = [v for _, v in self._iv_history]
+        iv_values   = [v for _, v in self._iv_history]
+        history_len = len(iv_values)
 
-        if len(iv_values) < 5:
+        if history_len < 5:
             logger.info(
-                "IV regime: insufficient history (%d days) — UNKNOWN | iv_current=%.3f",
-                len(iv_values), iv_current,
+                "IV regime | sym=%s regime=unknown ivr=n/a iv=%s hv30=%s "
+                "iv_hv=n/a history=%dd reason=insufficient_history(need_5)",
+                sym, _fmt(iv_current), _fmt(hv30), history_len,
             )
             return SignalSnapshot(
                 as_of_utc=snapshot.as_of_utc,
@@ -94,12 +110,11 @@ class IvRegimePipeline(SignalPipelineABC):
             hv30=hv30,
         )
 
+        iv_hv = _fmt(signal.iv_hv_ratio, ".2f")
         logger.info(
-            "IV regime | sym=%s regime=%s ivr=%.1f iv=%.3f hv30=%s iv_hv=%s history=%d days",
-            sym, signal.regime.value, ivr, iv_current,
-            f"{hv30:.3f}" if hv30 else "n/a",
-            f"{signal.iv_hv_ratio:.2f}" if signal.iv_hv_ratio else "n/a",
-            len(iv_values),
+            "IV regime | sym=%s regime=%s ivr=%.1f iv=%s hv30=%s iv_hv=%s history=%dd",
+            sym, signal.regime.value, ivr,
+            _fmt(iv_current), _fmt(hv30), iv_hv, history_len,
         )
 
         return SignalSnapshot(as_of_utc=snapshot.as_of_utc, iv_regime=signal)
@@ -213,5 +228,5 @@ class IvRegimePipelineWithBars(IvRegimePipeline):
             return math.sqrt(variance) * math.sqrt(252)
 
         except Exception as exc:
-            logger.warning("HV30 computation failed for %s: %s", sym, exc)
+            logger.info("HV30 unavailable for %s (bars subscription required) — iv_hv ratio will be n/a | %s", sym, exc)
             return None
