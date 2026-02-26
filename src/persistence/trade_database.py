@@ -5,13 +5,17 @@ src/persistence/trade_database.py
 ----------------------------------
 SQLite-backed implementation of TradeDatabaseABC.
 
-leg_role field (added):
-  Every fill and position now carries a leg_role: 'leap' | 'near' | ''.
+leg_role field:
+  Every fill and position carries a leg_role: 'leap' | 'near' | ''.
   This is the source of truth for the state classifier — no more guessing
   from DTE thresholds whether a position is a LEAP or a NEAR.
 
   _run_migrations() adds the column to existing DBs on first startup.
   Safe to run repeatedly — idempotent.
+
+remove_positions() / get_db_symbols():
+  Narrow mutation/query methods used exclusively by LivePositionReconciler.
+  The reconciler calls these — the orchestrator and strategies never do.
 """
 
 import json
@@ -126,6 +130,29 @@ class TradeDatabase(TradeDatabaseABC):
                     pass  # column already exists
 
     # ------------------------------------------------------------------
+    # Reconciler support — called only by LivePositionReconciler
+    # ------------------------------------------------------------------
+
+    def get_db_symbols(self, underlying: str) -> List[str]:
+        """Return all OSI symbols in the positions table for this underlying."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM positions WHERE underlying = ?",
+                (underlying.strip().upper(),),
+            ).fetchall()
+        return [row["symbol"] for row in rows]
+
+    def remove_positions(self, symbols: List[str]) -> None:
+        """Delete positions by OSI symbol. Called by LivePositionReconciler only."""
+        if not symbols:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM positions WHERE symbol = ?",
+                [(sym.upper(),) for sym in symbols],
+            )
+
+    # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
 
@@ -217,8 +244,7 @@ class TradeDatabase(TradeDatabaseABC):
                          new_role, fill_date.isoformat(), cost_basis_usd, 0.0),
                     )
                 else:
-                    new_qty  = float(row["qty"]) + (qty if action == "BTO" else -qty)
-                    # Only overwrite role if we have one — don't blank out an existing role
+                    new_qty     = float(row["qty"]) + (qty if action == "BTO" else -qty)
                     stored_role = new_role or (row["leg_role"] or "")
                     conn.execute(
                         "UPDATE positions SET qty=?, leg_role=?, "
@@ -234,7 +260,8 @@ class TradeDatabase(TradeDatabaseABC):
                         conn.execute("DELETE FROM positions WHERE symbol=?", (sym,))
                     else:
                         conn.execute(
-                            "UPDATE positions SET qty=?, last_updated=datetime('now') WHERE symbol=?",
+                            "UPDATE positions SET qty=?, last_updated=datetime('now') "
+                            "WHERE symbol=?",
                             (new_qty, sym),
                         )
 
@@ -289,9 +316,6 @@ class TradeDatabase(TradeDatabaseABC):
         """
         Return {osi_symbol: leg_role} for all open positions on this underlying
         where leg_role is known ('leap' or 'near').
-
-        The state classifier calls this first. Positions not in the result
-        (role='') fall back to DTE heuristics in the classifier.
         """
         with self._connect() as conn:
             rows = conn.execute(
@@ -349,7 +373,8 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT snapshot_json FROM chain_snapshots WHERE snapshot_date=? AND underlying=?",
+                "SELECT snapshot_json FROM chain_snapshots "
+                "WHERE snapshot_date=? AND underlying=?",
                 (snapshot_date.isoformat(), underlying.upper()),
             ).fetchall()
-        return [json.loads(r["snapshot_json"]) for r in rows]
+        return [json.loads(row["snapshot_json"]) for row in rows]

@@ -156,7 +156,7 @@ strategies:
 
 # Run the full pipeline but skip broker.submit_order(). Safe for testing.
 # Set to false when ready to trade live.
-default_dry_run: true
+default_dry_run: false
 
 # Two-speed cycle:
 #   cycle_seconds       — normal cadence when no orders are in flight.
@@ -252,8 +252,8 @@ _DEFAULT_DB_PATH = Path("data/trades.db")
 #               "register": Callable[[StrategySpec, RiskEngine]] }
 # Add a new strategy by adding one entry here.
 # ---------------------------------------------------------------------------
-def _pmcc_build(spec, db=None):
-    return PmccStrategy(config=spec.pmcc, db=db)
+def _pmcc_build(spec):
+    return PmccStrategy(config=spec.pmcc)
 
 def _pmcc_register(spec, engine: RiskEngine) -> None:
     r = spec.pmcc.risk
@@ -291,14 +291,14 @@ def main() -> int:
     broker = _build_broker(settings.env_cfg)
     db     = _build_database()
 
-    strategies  = _build_strategies(app_cfg.strategies, db=db)
+    strategies  = _build_strategies(app_cfg.strategies)
     risk_engine = _build_risk_engine(app_cfg)
 
     orchestrator = TradingOrchestrator(
         broker=broker,
         strategies=strategies,
         risk_engine=risk_engine,
-        execution_policy=DefaultExecutionPolicy(),
+        execution_policy=DefaultExecutionPolicy(db=db, dry_run=app_cfg.default_dry_run),
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
         signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
         dry_run=app_cfg.default_dry_run,
@@ -323,14 +323,14 @@ def _build_broker(env_cfg):
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 
 
-def _build_strategies(specs, db=None):
+def _build_strategies(specs):
     strategies = []
     for spec in specs:
         entry = STRATEGY_REGISTRY.get(spec.name)
         if entry is None:
             logger.error("No strategy registered for name '%s'", spec.name)
             sys.exit(1)
-        strategies.append(entry["build"](spec, db=db))
+        strategies.append(entry["build"](spec))
     return strategies
 
 
@@ -1820,7 +1820,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Type
 
 from src.brokers.broker_base import BrokerBase
@@ -2423,6 +2422,134 @@ class ExecutionBrokerABC(ABC):
 
 class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
     """Full broker — composition of market data + execution."""
+
+
+class TradeDatabaseABC(ABC):
+    """
+    Interface for the trade persistence layer.
+
+    Responsibility: store and retrieve trade data. Nothing else.
+
+    leg_role is passed on every record_fill() call:
+      'leap' — this fill opens/closes a long LEAP leg
+      'near' — this fill opens/closes a short NEAR leg
+      ''     — unknown or not applicable
+
+    get_position_roles() is the primary source of truth for the state
+    classifier. The classifier reads this first and falls back to DTE
+    heuristics only for symbols with role=''.
+    """
+
+    @abstractmethod
+    def record_fill(
+        self,
+        *,
+        action:          str,
+        symbol:          str,
+        underlying:      str,
+        qty:             int,
+        fill_price:      float,
+        fill_date:       date,
+        expiry:          Optional[date],
+        strike:          Optional[float],
+        option_right:    Optional[str],
+        cost_basis_usd:  float,
+        leg_role:        str = "",
+        brokerage_fee:   float = 0.0,
+        usd_aud_rate:    Optional[float] = None,
+        notes:           str = "",
+    ) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_position_roles(self, underlying: str) -> Dict[str, str]:
+        """Return {osi_symbol: leg_role} for open positions where role is known."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def remove_positions(self, symbols: List[str]) -> None:
+        """
+        Delete positions by OSI symbol.
+
+        Called only by PositionReconcilerABC — not by strategies or the orchestrator
+        directly. Keeps the mutation path narrow and testable in isolation.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_db_symbols(self, underlying: str) -> List[str]:
+        """
+        Return all OSI symbols currently in the positions table for this underlying.
+
+        Called only by PositionReconcilerABC to compute the diff against live
+        broker positions. Kept separate from get_position_roles() so the
+        reconciler can see all symbols, including those with role=''.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_chain_snapshot(
+        self,
+        *,
+        snapshot_date: date,
+        underlying:    str,
+        contracts:     List[Dict[str, Any]],
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_equity_snapshot(
+        self,
+        *,
+        snapshot_date:       date,
+        equity:              float,
+        cash:                float,
+        option_buying_power: float,
+        open_positions:      int,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_fills(
+        self,
+        *,
+        from_date:  Optional[date] = None,
+        to_date:    Optional[date] = None,
+        underlying: Optional[str]  = None,
+        action:     Optional[str]  = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_equity_curve(
+        self,
+        *,
+        from_date: Optional[date] = None,
+        to_date:   Optional[date] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_chain_snapshot(
+        self,
+        *,
+        snapshot_date: date,
+        underlying:    str,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class NullTradeDatabase(TradeDatabaseABC):
+    """No-op implementation for tests or when persistence is disabled."""
+    def record_fill(self, **kwargs) -> int:                          return 0
+    def get_position_roles(self, underlying: str) -> Dict[str, str]: return {}
+    def remove_positions(self, symbols: List[str]) -> None:          pass
+    def get_db_symbols(self, underlying: str) -> List[str]:          return []
+    def record_chain_snapshot(self, **kwargs) -> None:               pass
+    def record_equity_snapshot(self, **kwargs) -> None:              pass
+    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:           return []
+    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]:    return []
+    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]:  return []
 
 ============================================================
 FILE: .\src\brokers\registry.py
@@ -3222,9 +3349,30 @@ FILE: .\src\execution\default_execution_policy.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+"""
+src/execution/default_execution_policy.py
+
+Converts ApprovedIntents to broker orders and records fills in the DB.
+
+SRP:  this class owns "translate an approved intent into broker effects".
+      Two outputs of the same action:
+        Output 1 — OrderABC objects sent to the broker
+        Output 2 — fill records written to the DB with leg_role
+      Both are consequences of the same decision; they belong together.
+
+OCP:  add a new payload type → add one _build_* method + one _record() call.
+      Zero other changes required.
+
+DIP:  depends on TradeDatabaseABC (abstraction), not TradeDatabase (concretion).
+      Defaults to NullTradeDatabase so callers without persistence need not change.
+
+Composition: db injected, never inherited.
+"""
+
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
-from typing import List
+from typing import List, Optional, Tuple
 from uuid import uuid4
 
 from src.domain.intents import (
@@ -3242,6 +3390,7 @@ from src.domain.orders import (
 )
 from src.domain.types import ClientOrderId, Symbol
 from src.execution.execution_policy_interface import ExecutionPolicyABC
+from src.persistence.interfaces import NullTradeDatabase, TradeDatabaseABC
 from src.risk.decisions import ApprovedIntent
 from src.risk.evaluators import _EnterPmccApproved
 from src.utilities.logger import setup_logger
@@ -3254,27 +3403,47 @@ def _coid() -> ClientOrderId:
     return ClientOrderId(str(uuid4())[:16])
 
 
+def _parse_osi(symbol: str) -> Tuple[Optional[date], Optional[float], Optional[str]]:
+    """
+    Extract (expiry, strike, right) from an OSI option symbol.
+    Single point of OSI parsing — delegates to pmcc_sizer.parse_osi.
+    Returns (None, None, None) on failure rather than raising.
+    """
+    try:
+        from src.risk.pmcc_sizer import parse_osi
+        parsed = parse_osi(symbol)
+        expiry = parsed.expiry
+        if hasattr(expiry, "date"):
+            expiry = expiry.date()
+        return expiry, float(parsed.strike), parsed.right
+    except Exception:
+        return None, None, None
+
+
 @dataclass
 class DefaultExecutionPolicy(ExecutionPolicyABC):
     """
     Converts ApprovedIntents to broker-domain orders.
 
-    No isinstance ladder — each payload type is handled in its own method.
-    Adding a new payload type = add one elif + one _build_* method.
+    db is injected for fill recording. Each _build_* method records its
+    own fills — one payload type, one method, one place to change (OCP).
 
-    Alpaca MLEG constraints respected:
-      EnterPmccPayload   → 1x MultiLegLimitOrder  (BTO leap + STO near — covered ✅)
-      RollNearPayload    → 2x MarketOrder sequential (MLEG rejects rolls — uncovered ❌)
+    Alpaca MLEG constraints:
+      EnterPmccPayload   → 1x MultiLegLimitOrder  (BTO leap + STO near, covered ✅)
+      RollNearPayload    → 2x MarketOrder sequential (MLEG rejects rolls ❌)
       CloseLegPayload    → 1x MarketOrder
-      CloseSpreadPayload → 1x MultiLegLimitOrder   (both legs closing — no new short ✅)
+      CloseSpreadPayload → 1x MultiLegLimitOrder   (both legs closing ✅)
     """
+
+    db:      TradeDatabaseABC = field(default_factory=NullTradeDatabase)
+    dry_run: bool             = False  # when True, _record() is a no-op
 
     def to_orders(self, approvals: List[ApprovedIntent]) -> List[OrderABC]:
         orders: List[OrderABC] = []
         for approval in approvals:
-            with log_scope("execution_policy.to_orders", logger, extra=type(approval.payload).__name__):
-                new_orders = self._build(approval)
-                orders.extend(new_orders)
+            with log_scope("execution_policy.to_orders", logger,
+                           extra=type(approval.payload).__name__):
+                orders.extend(self._build(approval))
         return orders
 
     def _build(self, approval: ApprovedIntent) -> List[OrderABC]:
@@ -3282,13 +3451,10 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
 
         if isinstance(payload, _EnterPmccApproved):
             return [self._build_entry(payload)]
-
         if isinstance(payload, RollNearPayload):
             return self._build_roll(payload)
-
         if isinstance(payload, CloseLegPayload):
             return [self._build_close_leg(payload)]
-
         if isinstance(payload, CloseSpreadPayload):
             return [self._build_close_spread(payload)]
 
@@ -3299,17 +3465,12 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
         return []
 
     # ------------------------------------------------------------------
-    # Builders
+    # Builders — each builds its orders AND records its fills.
+    # One payload type → one method → one place to change (OCP).
     # ------------------------------------------------------------------
 
     def _build_entry(self, payload: _EnterPmccApproved) -> MultiLegLimitOrder:
-        """
-        PMCC entry → one MultiLegLimitOrder.
-
-        BTO leap + STO near submitted as a single MLEG spread.
-        Alpaca fills both legs atomically — no partial-fill risk on entry.
-        """
-        from src.domain.orders import OptionLeg
+        """PMCC entry → one MultiLegLimitOrder (BTO leap + STO near)."""
         legs = [
             OptionLeg(contract=payload.leap.contract, side=OrderSide.BUY,  ratio=1),
             OptionLeg(contract=payload.near.contract, side=OrderSide.SELL, ratio=1),
@@ -3330,19 +3491,14 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.quantity,
             payload.limit_price,
         )
+        self._record(payload.leap.option_symbol, "BTO",
+                     str(payload.underlying_symbol), payload.quantity, "leap")
+        self._record(payload.near.option_symbol, "STO",
+                     str(payload.underlying_symbol), payload.quantity, "near")
         return order
 
     def _build_roll(self, payload: RollNearPayload) -> List[MarketOrder]:
-        """
-        NEAR roll → two sequential MarketOrders.
-
-        Alpaca Level 3 rejects a roll as a single MLEG: the STO leg would be
-        uncovered at submission time (the BTC hasn't filled yet). Sequential
-        single-leg orders are the only valid path.
-
-        Order: BTC first (eliminates the short), then STO (opens new short,
-        now covered by the existing LEAP).
-        """
+        """NEAR roll → two sequential MarketOrders (BTC then STO)."""
         btc = MarketOrder(
             client_order_id=_coid(),
             symbol=payload.close.option_symbol,
@@ -3362,16 +3518,23 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.close.option_symbol,
             payload.open.option_symbol,
         )
+        self._record(payload.close.option_symbol, "BTC",
+                     str(payload.underlying_symbol), 1, "near")
+        self._record(payload.open.option_symbol,  "STO",
+                     str(payload.underlying_symbol), 1, "near")
         return [btc, sto]
 
     def _build_close_leg(self, payload: CloseLegPayload) -> MarketOrder:
-        """Single-leg close — BTC a short or STC a long."""
-        side = (
-            OrderSide.BUY
-            if payload.position_intent.value in ("BTC", "BTO")
-            else OrderSide.SELL
-        )
-        order = MarketOrder(
+        """
+        Single-leg order — covers both opening and closing actions:
+          BTO → buy to open  (new long LEAP)
+          STO → sell to open (new short NEAR)
+          BTC → buy to close (close short NEAR)
+          STC → sell to close (close long LEAP)
+        """
+        intent = payload.position_intent.value
+        side   = OrderSide.BUY if intent in ("BTC", "BTO") else OrderSide.SELL
+        order  = MarketOrder(
             client_order_id=_coid(),
             symbol=payload.contract.option_symbol,
             side=side,
@@ -3379,31 +3542,27 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             time_in_force=TimeInForce.DAY,
         )
         logger.info(
-            "Close leg order | symbol=%s side=%s qty=%d intent=%s",
-            payload.contract.option_symbol,
-            side.value,
-            payload.qty,
-            payload.position_intent.value,
+            "Single leg order | symbol=%s side=%s qty=%d intent=%s",
+            payload.contract.option_symbol, side.value, payload.qty, intent,
         )
+        # Role: BTC/STO = near leg, BTO/STC = leap leg
+        role = "near" if intent in ("BTC", "STO") else "leap"
+        self._record(payload.contract.option_symbol, intent,
+                     str(payload.underlying_symbol), payload.qty, role)
         return order
 
     def _build_close_spread(self, payload: CloseSpreadPayload) -> MultiLegLimitOrder:
-        """
-        Close entire spread → one MultiLegLimitOrder.
-
-        Both legs are closing positions — no uncovered short is created,
-        so Alpaca MLEG accepts this.
-        """
+        """Close entire spread → one MultiLegLimitOrder (BTC near + STC leap)."""
         legs = [
-            OptionLeg(contract=payload.near.contract, side=OrderSide.BUY,  ratio=1),  # BTC near
-            OptionLeg(contract=payload.leap.contract, side=OrderSide.SELL, ratio=1),  # STC leap
+            OptionLeg(contract=payload.near.contract, side=OrderSide.BUY,  ratio=1),
+            OptionLeg(contract=payload.leap.contract, side=OrderSide.SELL, ratio=1),
         ]
         order = MultiLegLimitOrder(
             client_order_id=_coid(),
             underlying=Symbol(str(payload.underlying_symbol)),
             legs=legs,
             quantity=1,
-            limit_price=Decimal("0.00"),   # market-ish — caller can override
+            limit_price=Decimal("0.00"),
             time_in_force=TimeInForce.DAY,
         )
         logger.info(
@@ -3412,7 +3571,52 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.near.option_symbol,
             payload.leap.option_symbol,
         )
+        self._record(payload.near.option_symbol, "BTC",
+                     str(payload.underlying_symbol), 1, "near")
+        self._record(payload.leap.option_symbol, "STC",
+                     str(payload.underlying_symbol), 1, "leap")
         return order
+
+    # ------------------------------------------------------------------
+    # Fill recording — private, called only from _build_* methods.
+    # Fill price is unknown at submission; recorded as 0.0 for now.
+    # ------------------------------------------------------------------
+
+    def _record(
+        self,
+        symbol:     str,
+        action:     str,
+        underlying: str,
+        qty:        int,
+        leg_role:   str,
+    ) -> None:
+        if self.dry_run:
+            logger.debug(
+                "DRY RUN — fill not recorded | symbol=%s action=%s role=%s",
+                symbol, action, leg_role,
+            )
+            return
+        expiry, strike, right = _parse_osi(symbol)
+        try:
+            self.db.record_fill(
+                action=action,
+                symbol=symbol,
+                underlying=underlying,
+                qty=qty,
+                fill_price=0.0,
+                fill_date=date.today(),
+                expiry=expiry,
+                strike=strike,
+                option_right=right,
+                cost_basis_usd=0.0,
+                leg_role=leg_role,
+                notes="recorded at submission — fill price TBD",
+            )
+        except Exception:
+            logger.exception(
+                "Fill recording failed | symbol=%s action=%s role=%s",
+                symbol, action, leg_role,
+            )
 
 ============================================================
 FILE: .\src\execution\execution_policy_interface.py
@@ -3445,7 +3649,7 @@ FILE: .\src\orchestration\cycle_snapshot.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
@@ -3457,8 +3661,6 @@ from src.domain.types import AssetQuote, Symbol
 class AccountSnapshot:
     """
     Typed account state — fetched once per cycle via broker.get_account_snapshot().
-
-    Replaces the old Dict[str, Any] return from ExecutionBrokerABC.get_account_snapshot().
     All downstream code reads typed fields — no .get("equity") string parsing.
     """
     equity:               float
@@ -3474,17 +3676,23 @@ class CycleSnapshot:
     Immutable snapshot of all data available at the start of a cycle.
 
     Built by CycleSnapshotBuilder — never mutated after construction.
-    No ABC needed: there is one snapshot type and one builder.
-    Clock injection (not subclassing) handles live vs backtest timestamps.
+    with_* methods return new instances (immutable value object pattern).
+
+    position_roles: {underlying → {osi_symbol → 'leap'|'near'}}
+      Populated by the orchestrator from TradeDatabase before strategies run.
+      Strategies read this instead of depending on the DB directly.
+      Empty dict = no roles recorded yet (new deployment or pre-role positions).
+      Classifier falls back to DTE heuristics for symbols not in this dict.
     """
-    as_of_utc:     datetime
-    account:       AccountSnapshot
-    asset_quotes:  Dict[Symbol, AssetQuote]
-    option_chains: Dict[Tuple[Symbol, str], List[Dict[str, Any]]]
-    signals:       SignalSnapshot
+    as_of_utc:       datetime
+    account:         AccountSnapshot
+    asset_quotes:    Dict[Symbol, AssetQuote]
+    option_chains:   Dict[Tuple[Symbol, str], List[Dict[str, Any]]]
+    signals:         SignalSnapshot
+    position_roles:  Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
-    # Convenience accessors — delegate to AccountSnapshot
+    # Convenience accessors
     # ------------------------------------------------------------------
 
     def equity(self) -> float:
@@ -3499,8 +3707,21 @@ class CycleSnapshot:
     def open_orders(self) -> List[Dict[str, Any]]:
         return list(self.account.open_orders)
 
+    def get_position_roles(self, underlying: str) -> Dict[str, str]:
+        """Return {osi_symbol: role} for the given underlying. Empty dict if unknown."""
+        return self.position_roles.get(underlying.strip().upper(), {})
+
+    # ------------------------------------------------------------------
+    # Immutable update — returns new snapshot, original unchanged
+    # ------------------------------------------------------------------
+
     def with_signals(self, signals: SignalSnapshot) -> "CycleSnapshot":
         return replace(self, signals=signals)
+
+    def with_position_roles(
+        self, position_roles: Dict[str, Dict[str, str]]
+    ) -> "CycleSnapshot":
+        return replace(self, position_roles=position_roles)
 
 ============================================================
 FILE: .\src\orchestration\cycle_snapshot_builder.py
@@ -3629,17 +3850,18 @@ FILE: .\src\orchestration\orchestrator.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List, Set
 
 from src.brokers.interfaces import BrokerABC
-from src.persistence.interfaces import TradeDatabaseABC, NullTradeDatabase
 from src.domain.intents import TradeIntent
 from src.domain.orders import OrderABC
 from src.domain.types import OptionChainRequest, Symbol
 from src.execution.execution_policy_interface import ExecutionPolicyABC
 from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+from src.persistence.interfaces import NullTradeDatabase, TradeDatabaseABC
+from src.persistence.reconciler import NullPositionReconciler, PositionReconcilerABC
 from src.risk.risk_engine import RiskEngine
 from src.signals.signal_pipeline import SignalPipelineABC
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
@@ -3651,11 +3873,11 @@ logger = setup_logger("TradingOrchestrator")
 
 @dataclass(frozen=True)
 class CycleRunResult:
-    orders_submitted:  int
-    intents_generated: int
-    intents_approved:  int
-    intents_rejected:  int
-    has_pending_orders: bool = False  # True if open orders exist after this cycle
+    orders_submitted:   int
+    intents_generated:  int
+    intents_approved:   int
+    intents_rejected:   int
+    has_pending_orders: bool = False
 
 
 @dataclass
@@ -3663,21 +3885,25 @@ class TradingOrchestrator:
     """
     Fixed cycle skeleton — all steps delegated to composed parts.
 
-    Depends on BrokerABC, StrategyABC[], RiskEngine, ExecutionPolicyABC,
-    CycleSnapshotBuilder, SignalPipelineABC. No OrchestratorABC above it —
-    Scheduler holds TradingOrchestrator directly. One orchestrator exists;
-    the ABC earned nothing.
+    db         — enriches the snapshot with position roles (cycle coordination).
+    reconciler — prunes phantom DB rows before roles are read (ISP-compliant
+                 separation: live wires LivePositionReconciler, backtest wires
+                 NullPositionReconciler).
+
+    Fill recording is the ExecutionPolicy's responsibility.
 
     Cycle sequence:
-      1. Collect universe (symbols declared by all strategies)
-      2. Pre-snapshot — account + quotes, no chains yet
-      3. Signal computation on pre-snapshot
-      4. Collect chain requests from OptionChainConsumer strategies
-      5. Full snapshot — adds option chains
-      6. generate_intents from each strategy
-      7. RiskEngine.evaluate — gates then sizes
-      8. ExecutionPolicy.to_orders — semantic payloads → broker orders
-      9. broker.submit_order — skipped if dry_run
+      1.  Collect universe
+      2.  Build snapshot (account + quotes)
+      3.  Reconcile DB positions against live broker positions
+      4.  Enrich snapshot with position roles from DB
+      5.  Compute signals
+      6.  Collect chain requests from strategies
+      7.  Add option chains to snapshot
+      8.  generate_intents from each strategy
+      9.  RiskEngine.evaluate
+      10. ExecutionPolicy.to_orders (also records fills in DB)
+      11. broker.submit_order — skipped if dry_run
     """
 
     broker:           BrokerABC
@@ -3686,20 +3912,20 @@ class TradingOrchestrator:
     execution_policy: ExecutionPolicyABC
     snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
-    dry_run:          bool = False
-    db:               TradeDatabaseABC = None  # type: ignore[assignment]
+    dry_run:          bool                   = False
+    db:               TradeDatabaseABC       = field(default_factory=NullTradeDatabase)
+    reconciler:       PositionReconcilerABC  = field(default_factory=NullPositionReconciler)
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
             universe = self._collect_universe()
 
-            # One account + quote fetch for the whole cycle.
             snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            self._reconcile(snapshot, universe)
+            snapshot = self._enrich_position_roles(snapshot, universe)
             signals  = self.signal_pipeline.compute(snapshot)
             snapshot = snapshot.with_signals(signals)
 
-            # Determine chain requests from the pre-snapshot, then attach
-            # chains without re-fetching account or quotes.
             chain_requests = self._collect_chain_requests(snapshot)
             snapshot       = self.snapshot_builder.add_option_chains(
                 snapshot, chain_requests,
@@ -3708,7 +3934,7 @@ class TradingOrchestrator:
             intents   = self._collect_intents(snapshot)
             decisions = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
             orders    = self.execution_policy.to_orders(approvals=decisions.approved)
-            submitted = self._submit_orders(orders, decisions.approved)
+            submitted = self._submit_orders(orders)
 
         pending = len(snapshot.account.open_orders) > 0 or submitted > 0
         return CycleRunResult(
@@ -3731,7 +3957,51 @@ class TradingOrchestrator:
                     symbols.append(sym)
         return symbols
 
-    def _collect_chain_requests(self, snapshot: CycleSnapshot) -> List[OptionChainRequest]:
+    def _reconcile(
+        self,
+        snapshot: CycleSnapshot,
+        universe: List[Symbol],
+    ) -> None:
+        """
+        For each underlying, extract live broker symbols from the already-fetched
+        AccountSnapshot and call the reconciler to prune any phantom DB rows.
+
+        Zero extra broker calls — we reuse positions already in memory.
+        """
+        all_positions = snapshot.account.positions
+        for sym in universe:
+            ul = str(sym).upper()
+            broker_symbols: Set[str] = {
+                str(p.get("symbol", "")).strip().upper()
+                for p in all_positions
+                if str(p.get("symbol", "")).strip().upper().startswith(ul)
+                and str(p.get("asset_class", "")).lower() == "us_option"
+            }
+            self.reconciler.reconcile(ul, broker_symbols)
+
+    def _enrich_position_roles(
+        self,
+        snapshot: CycleSnapshot,
+        universe: List[Symbol],
+    ) -> CycleSnapshot:
+        """
+        Fetch position roles from the DB for every symbol in the universe
+        and attach them to the snapshot.
+
+        Strategies read snapshot.get_position_roles(sym) — they never
+        touch the DB directly, keeping strategy concerns pure.
+        """
+        roles: Dict[str, Dict[str, str]] = {}
+        for sym in universe:
+            sym_str = str(sym).upper()
+            result  = self.db.get_position_roles(sym_str)
+            if result:
+                roles[sym_str] = result
+        return snapshot.with_position_roles(roles)
+
+    def _collect_chain_requests(
+        self, snapshot: CycleSnapshot
+    ) -> List[OptionChainRequest]:
         requests: List[OptionChainRequest] = []
         for strategy in self.strategies:
             if isinstance(strategy, OptionChainConsumerABC):
@@ -3744,11 +4014,7 @@ class TradingOrchestrator:
             intents.extend(strategy.generate_intents(snapshot))
         return intents
 
-    def _submit_orders(
-        self,
-        orders:    List[OrderABC],
-        approvals: List,
-    ) -> int:
+    def _submit_orders(self, orders: List[OrderABC]) -> int:
         if not orders:
             return 0
         if self.dry_run:
@@ -3759,107 +4025,9 @@ class TradingOrchestrator:
             try:
                 self.broker.submit_order(order)
                 submitted += 1
-                logger.info("Order submitted | type=%s", type(order).__name__)
             except Exception:
-                logger.exception("Order submission failed | type=%s", type(order).__name__)
-        if submitted > 0:
-            self._record_fills_from_approvals(approvals)
+                logger.exception("Order submission failed | order=%s", order)
         return submitted
-
-    def _record_fills_from_approvals(self, approvals: List) -> None:
-        """
-        Record fills in the DB after successful order submission.
-        Derives leg_role from the payload type so the classifier has a
-        reliable source of truth going forward.
-        """
-        from src.domain.intents import (
-            EnterPmccPayload, RollNearPayload, CloseLegPayload,
-            CloseSpreadPayload, PositionIntent,
-        )
-        from src.risk.evaluators import _EnterPmccApproved
-        from src.risk.pmcc_sizer import parse_osi
-        from datetime import date as _date
-
-        db = self.db or NullTradeDatabase()
-        today = _date.today()
-
-        for approval in approvals:
-            payload = approval.payload
-            try:
-                if isinstance(payload, _EnterPmccApproved):
-                    # BTO leap + STO near
-                    for sym, role, action in [
-                        (payload.leap.option_symbol, "leap", "BTO"),
-                        (payload.near.option_symbol, "near", "STO"),
-                    ]:
-                        parsed = parse_osi(sym)
-                        db.record_fill(
-                            action=action, symbol=sym,
-                            underlying=str(payload.underlying_symbol),
-                            qty=payload.quantity,
-                            fill_price=0.0,   # actual fill price unknown until broker confirms
-                            fill_date=today,
-                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
-                            strike=float(parsed.strike),
-                            option_right="C",
-                            cost_basis_usd=0.0,
-                            leg_role=role,
-                            notes="recorded at submission — fill price TBD",
-                        )
-
-                elif isinstance(payload, RollNearPayload):
-                    # BTC old near + STO new near
-                    for sym, action in [
-                        (payload.close.option_symbol, "BTC"),
-                        (payload.open.option_symbol, "STO"),
-                    ]:
-                        parsed = parse_osi(sym)
-                        db.record_fill(
-                            action=action, symbol=sym,
-                            underlying=str(payload.underlying_symbol),
-                            qty=1, fill_price=0.0, fill_date=today,
-                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
-                            strike=float(parsed.strike), option_right="C",
-                            cost_basis_usd=0.0, leg_role="near",
-                            notes="roll — fill price TBD",
-                        )
-
-                elif isinstance(payload, CloseLegPayload):
-                    intent = payload.position_intent.value  # BTC or STC
-                    role   = "near" if intent == "BTC" else "leap"
-                    sym    = payload.contract.option_symbol
-                    parsed = parse_osi(sym)
-                    db.record_fill(
-                        action=intent, symbol=sym,
-                        underlying=str(payload.underlying_symbol),
-                        qty=payload.qty, fill_price=0.0, fill_date=today,
-                        expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
-                        strike=float(parsed.strike), option_right="C",
-                        cost_basis_usd=0.0, leg_role=role,
-                        notes="close leg — fill price TBD",
-                    )
-
-                elif isinstance(payload, CloseSpreadPayload):
-                    for sym, role, action in [
-                        (payload.near.option_symbol, "near", "BTC"),
-                        (payload.leap.option_symbol, "leap", "STC"),
-                    ]:
-                        parsed = parse_osi(sym)
-                        db.record_fill(
-                            action=action, symbol=sym,
-                            underlying=str(payload.underlying_symbol),
-                            qty=1, fill_price=0.0, fill_date=today,
-                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
-                            strike=float(parsed.strike), option_right="C",
-                            cost_basis_usd=0.0, leg_role=role,
-                            notes="close spread — fill price TBD",
-                        )
-
-            except Exception:
-                logger.exception(
-                    "Failed to record fill for payload type=%s",
-                    type(payload).__name__,
-                )
 
 ============================================================
 FILE: .\src\orchestration\__init__.py
@@ -4397,6 +4565,99 @@ class NullTradeDatabase(TradeDatabaseABC):
     def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]: return []
 
 ============================================================
+FILE: .\src\persistence\reconciler.py
+============================================================
+
+from __future__ import annotations
+
+"""
+src/persistence/reconciler.py
+------------------------------
+Reconciles the positions table against live broker positions each cycle.
+
+ISP rationale:
+  Reconciliation is NOT a persistence concern — it is a sync operation
+  between two external systems (the local DB and the broker). Putting it
+  on TradeDatabaseABC would force every DB implementor (backtest, test
+  doubles) to carry a method they have no need for.
+
+  PositionReconcilerABC is injected into the orchestrator alongside the DB.
+  The backtest wires in NullPositionReconciler; live trading wires in
+  LivePositionReconciler. Each implementor only does what it needs to.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Set
+
+from src.persistence.interfaces import TradeDatabaseABC
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("PositionReconciler")
+
+
+class PositionReconcilerABC(ABC):
+    """
+    Single responsibility: prune phantom DB positions before roles are read.
+
+    A phantom position is a DB row whose order was submitted but then
+    rejected, cancelled, or timed out — the DB was written at submission
+    but the broker never confirmed a fill.
+
+    reconcile() is called once per cycle, after the AccountSnapshot is
+    fetched but before get_position_roles() is called, so the state
+    classifier always reads from a clean DB.
+    """
+
+    @abstractmethod
+    def reconcile(self, underlying: str, broker_symbols: Set[str]) -> None:
+        """
+        underlying:     OSI ticker (e.g. 'SPY') — uppercase.
+        broker_symbols: set of OSI symbols Alpaca currently holds for this
+                        underlying, extracted from AccountSnapshot.positions.
+        """
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class LivePositionReconciler(PositionReconcilerABC):
+    """
+    Reconciler for live trading.
+
+    Computes the diff between what the DB thinks we hold and what the
+    broker actually shows, then deletes any DB rows not in the broker set.
+    """
+
+    db: TradeDatabaseABC
+
+    def reconcile(self, underlying: str, broker_symbols: Set[str]) -> None:
+        ul          = underlying.strip().upper()
+        db_symbols  = set(self.db.get_db_symbols(ul))
+        phantoms    = db_symbols - broker_symbols
+
+        if not phantoms:
+            return
+
+        logger.warning(
+            "Reconcile | underlying=%s removing %d phantom position(s): %s",
+            ul, len(phantoms), sorted(phantoms),
+        )
+        self.db.remove_positions(list(phantoms))
+
+
+class NullPositionReconciler(PositionReconcilerABC):
+    """
+    No-op reconciler for backtests and unit tests.
+
+    The backtest controls every fill directly — there are no order
+    rejections or cancellations, so phantom positions cannot exist.
+    Reconciliation would be meaningless and wasteful.
+    """
+
+    def reconcile(self, underlying: str, broker_symbols: Set[str]) -> None:
+        pass
+
+============================================================
 FILE: .\src\persistence\trade_database.py
 ============================================================
 
@@ -4407,13 +4668,17 @@ src/persistence/trade_database.py
 ----------------------------------
 SQLite-backed implementation of TradeDatabaseABC.
 
-leg_role field (added):
-  Every fill and position now carries a leg_role: 'leap' | 'near' | ''.
+leg_role field:
+  Every fill and position carries a leg_role: 'leap' | 'near' | ''.
   This is the source of truth for the state classifier — no more guessing
   from DTE thresholds whether a position is a LEAP or a NEAR.
 
   _run_migrations() adds the column to existing DBs on first startup.
   Safe to run repeatedly — idempotent.
+
+remove_positions() / get_db_symbols():
+  Narrow mutation/query methods used exclusively by LivePositionReconciler.
+  The reconciler calls these — the orchestrator and strategies never do.
 """
 
 import json
@@ -4528,6 +4793,29 @@ class TradeDatabase(TradeDatabaseABC):
                     pass  # column already exists
 
     # ------------------------------------------------------------------
+    # Reconciler support — called only by LivePositionReconciler
+    # ------------------------------------------------------------------
+
+    def get_db_symbols(self, underlying: str) -> List[str]:
+        """Return all OSI symbols in the positions table for this underlying."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol FROM positions WHERE underlying = ?",
+                (underlying.strip().upper(),),
+            ).fetchall()
+        return [row["symbol"] for row in rows]
+
+    def remove_positions(self, symbols: List[str]) -> None:
+        """Delete positions by OSI symbol. Called by LivePositionReconciler only."""
+        if not symbols:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM positions WHERE symbol = ?",
+                [(sym.upper(),) for sym in symbols],
+            )
+
+    # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
 
@@ -4619,8 +4907,7 @@ class TradeDatabase(TradeDatabaseABC):
                          new_role, fill_date.isoformat(), cost_basis_usd, 0.0),
                     )
                 else:
-                    new_qty  = float(row["qty"]) + (qty if action == "BTO" else -qty)
-                    # Only overwrite role if we have one — don't blank out an existing role
+                    new_qty     = float(row["qty"]) + (qty if action == "BTO" else -qty)
                     stored_role = new_role or (row["leg_role"] or "")
                     conn.execute(
                         "UPDATE positions SET qty=?, leg_role=?, "
@@ -4636,7 +4923,8 @@ class TradeDatabase(TradeDatabaseABC):
                         conn.execute("DELETE FROM positions WHERE symbol=?", (sym,))
                     else:
                         conn.execute(
-                            "UPDATE positions SET qty=?, last_updated=datetime('now') WHERE symbol=?",
+                            "UPDATE positions SET qty=?, last_updated=datetime('now') "
+                            "WHERE symbol=?",
                             (new_qty, sym),
                         )
 
@@ -4691,9 +4979,6 @@ class TradeDatabase(TradeDatabaseABC):
         """
         Return {osi_symbol: leg_role} for all open positions on this underlying
         where leg_role is known ('leap' or 'near').
-
-        The state classifier calls this first. Positions not in the result
-        (role='') fall back to DTE heuristics in the classifier.
         """
         with self._connect() as conn:
             rows = conn.execute(
@@ -4751,10 +5036,11 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT snapshot_json FROM chain_snapshots WHERE snapshot_date=? AND underlying=?",
+                "SELECT snapshot_json FROM chain_snapshots "
+                "WHERE snapshot_date=? AND underlying=?",
                 (snapshot_date.isoformat(), underlying.upper()),
             ).fetchall()
-        return [json.loads(r["snapshot_json"]) for r in rows]
+        return [json.loads(row["snapshot_json"]) for row in rows]
 
 ============================================================
 FILE: .\src\persistence\__init__.py
@@ -6215,7 +6501,6 @@ from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
 from src.strategies.pmcc_selector import PmccContractSelector
 from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
 from src.domain.signals import IvRegime
-from src.persistence.interfaces import TradeDatabaseABC
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("PmccStrategy")
@@ -6226,7 +6511,6 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     config:      PmccConfig
     strategy_id: str = "pmcc"
 
-    db: TradeDatabaseABC = None  # type: ignore[assignment]  # injected for position role lookup
     _classifier: PmccStateClassifier  = field(init=False)
     _selector:   PmccContractSelector = field(init=False)
 
@@ -6254,7 +6538,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=str(sym),
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
-            position_roles=self.db.get_position_roles(str(sym)) if self.db else {},
+            position_roles=snapshot.get_position_roles(str(sym)),
         )
 
         logger.info(
@@ -6305,7 +6589,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=sym,
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
-            position_roles=self.db.get_position_roles(str(sym)) if self.db else {},
+            position_roles=snapshot.get_position_roles(str(sym)),
         )
 
         leap_req = OptionChainRequest(

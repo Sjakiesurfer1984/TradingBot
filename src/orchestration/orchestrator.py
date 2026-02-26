@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Dict, List, Set
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.intents import TradeIntent
@@ -11,6 +11,7 @@ from src.execution.execution_policy_interface import ExecutionPolicyABC
 from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.persistence.interfaces import NullTradeDatabase, TradeDatabaseABC
+from src.persistence.reconciler import NullPositionReconciler, PositionReconcilerABC
 from src.risk.risk_engine import RiskEngine
 from src.signals.signal_pipeline import SignalPipelineABC
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
@@ -34,24 +35,25 @@ class TradingOrchestrator:
     """
     Fixed cycle skeleton — all steps delegated to composed parts.
 
-    db is injected for ONE purpose: enriching the CycleSnapshot with
-    position_roles before strategies run. This is cycle coordination —
-    the same reason the orchestrator enriches the snapshot with signals
-    and option chains. It is NOT persistence logic.
+    db         — enriches the snapshot with position roles (cycle coordination).
+    reconciler — prunes phantom DB rows before roles are read (ISP-compliant
+                 separation: live wires LivePositionReconciler, backtest wires
+                 NullPositionReconciler).
 
     Fill recording is the ExecutionPolicy's responsibility.
 
     Cycle sequence:
-      1. Collect universe
-      2. Build snapshot (account + quotes)
-      3. Enrich snapshot with position roles from DB
-      4. Compute signals
-      5. Collect chain requests from strategies (using enriched snapshot)
-      6. Add option chains to snapshot
-      7. generate_intents from each strategy
-      8. RiskEngine.evaluate
-      9. ExecutionPolicy.to_orders (also records fills in DB)
-     10. broker.submit_order — skipped if dry_run
+      1.  Collect universe
+      2.  Build snapshot (account + quotes)
+      3.  Reconcile DB positions against live broker positions
+      4.  Enrich snapshot with position roles from DB
+      5.  Compute signals
+      6.  Collect chain requests from strategies
+      7.  Add option chains to snapshot
+      8.  generate_intents from each strategy
+      9.  RiskEngine.evaluate
+      10. ExecutionPolicy.to_orders (also records fills in DB)
+      11. broker.submit_order — skipped if dry_run
     """
 
     broker:           BrokerABC
@@ -60,14 +62,16 @@ class TradingOrchestrator:
     execution_policy: ExecutionPolicyABC
     snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
-    dry_run:          bool             = False
-    db:               TradeDatabaseABC = field(default_factory=NullTradeDatabase)
+    dry_run:          bool                   = False
+    db:               TradeDatabaseABC       = field(default_factory=NullTradeDatabase)
+    reconciler:       PositionReconcilerABC  = field(default_factory=NullPositionReconciler)
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
             universe = self._collect_universe()
 
             snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            self._reconcile(snapshot, universe)
             snapshot = self._enrich_position_roles(snapshot, universe)
             signals  = self.signal_pipeline.compute(snapshot)
             snapshot = snapshot.with_signals(signals)
@@ -103,6 +107,28 @@ class TradingOrchestrator:
                     symbols.append(sym)
         return symbols
 
+    def _reconcile(
+        self,
+        snapshot: CycleSnapshot,
+        universe: List[Symbol],
+    ) -> None:
+        """
+        For each underlying, extract live broker symbols from the already-fetched
+        AccountSnapshot and call the reconciler to prune any phantom DB rows.
+
+        Zero extra broker calls — we reuse positions already in memory.
+        """
+        all_positions = snapshot.account.positions
+        for sym in universe:
+            ul = str(sym).upper()
+            broker_symbols: Set[str] = {
+                str(p.get("symbol", "")).strip().upper()
+                for p in all_positions
+                if str(p.get("symbol", "")).strip().upper().startswith(ul)
+                and str(p.get("asset_class", "")).lower() == "us_option"
+            }
+            self.reconciler.reconcile(ul, broker_symbols)
+
     def _enrich_position_roles(
         self,
         snapshot: CycleSnapshot,
@@ -112,8 +138,8 @@ class TradingOrchestrator:
         Fetch position roles from the DB for every symbol in the universe
         and attach them to the snapshot.
 
-        Strategies read snapshot.get_position_roles(sym) instead of
-        depending on the DB directly — keeping strategy concerns pure.
+        Strategies read snapshot.get_position_roles(sym) — they never
+        touch the DB directly, keeping strategy concerns pure.
         """
         roles: Dict[str, Dict[str, str]] = {}
         for sym in universe:
@@ -149,7 +175,6 @@ class TradingOrchestrator:
             try:
                 self.broker.submit_order(order)
                 submitted += 1
-                logger.info("Order submitted | type=%s", type(order).__name__)
             except Exception:
-                logger.exception("Order submission failed | type=%s", type(order).__name__)
+                logger.exception("Order submission failed | order=%s", order)
         return submitted

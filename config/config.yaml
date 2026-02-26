@@ -112,7 +112,7 @@ strategies:
 
 # Run the full pipeline but skip broker.submit_order(). Safe for testing.
 # Set to false when ready to trade live.
-default_dry_run: true
+default_dry_run: false
 
 # Two-speed cycle:
 #   cycle_seconds       — normal cadence when no orders are in flight.
