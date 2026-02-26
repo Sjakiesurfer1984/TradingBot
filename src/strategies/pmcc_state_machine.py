@@ -143,10 +143,16 @@ class PmccStateClassifier:
     def classify(
         self,
         *,
-        underlying:  str,
-        positions:   List[Dict[str, Any]],
-        open_orders: List[Dict[str, Any]],
+        underlying:     str,
+        positions:      List[Dict[str, Any]],
+        open_orders:    List[Dict[str, Any]],
+        position_roles: Dict[str, str] = None,
     ) -> PmccHoldings:
+        # position_roles: {osi_symbol: 'leap'|'near'} from TradeDatabase.
+        # Primary source of truth — avoids relying on DTE thresholds for
+        # positions that were opened before config changes.
+        if position_roles is None:
+            position_roles = {}
         sym = underlying.strip().upper()
 
         enriched = [_enrich_position(p) for p in positions]
@@ -167,8 +173,8 @@ class PmccStateClassifier:
             and str(p.get("asset_class", "")).lower() == "us_option"
         ]
 
-        leaps = [p for p in opt_pos if self._is_leap(p)]
-        nears = [p for p in opt_pos if self._is_near(p)]
+        leaps = [p for p in opt_pos if self._is_leap(p, position_roles)]
+        nears = [p for p in opt_pos if self._is_near(p, position_roles)]
 
         # Count contracts (qty), not positions.
         # qty=2 on one LEAP position = 2 long contracts, not 1.
@@ -187,10 +193,13 @@ class PmccStateClassifier:
             self.leap_dte_min, self.near_dte_max,
         )
         for p in opt_pos:
+            sym_upper = str(p.get("symbol", "")).upper()
+            db_role   = position_roles.get(sym_upper, "?")
             logger.info(
-                "  OptionPos | symbol=%s qty=%s dte=%d is_leap=%s is_near=%s",
+                "  OptionPos | symbol=%s qty=%s dte=%d role=%s is_leap=%s is_near=%s",
                 p.get("symbol"), p.get("qty"), p["derived_dte"],
-                self._is_leap(p), self._is_near(p),
+                db_role,
+                self._is_leap(p, position_roles), self._is_near(p, position_roles),
             )
 
         all_pending    = [o for o in open_orders if self._order_is_for(o, sym)]
@@ -245,22 +254,41 @@ class PmccStateClassifier:
             uncovered=uncovered,
         )
 
-    def _is_leap(self, position: Dict[str, Any]) -> bool:
+    def _is_leap(self, position: Dict[str, Any], position_roles: Dict[str, str] = None) -> bool:
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty <= 0:
             return False
-        return position.get("derived_dte", -1) >= self.leap_dte_min
+        # DB role is the primary source of truth
+        sym  = str(position.get("symbol", "")).upper()
+        role = (position_roles or {}).get(sym, "")
+        if role == "leap":
+            return True
+        if role == "near":
+            return False
+        # Fallback for positions opened before role tracking:
+        # treat any long call with DTE >= 180 as a LEAP.
+        # 180 is a generous floor — it will never misclassify a NEAR (max 45 DTE).
+        dte = position.get("derived_dte", -1)
+        return dte >= 180
 
-    def _is_near(self, position: Dict[str, Any]) -> bool:
+    def _is_near(self, position: Dict[str, Any], position_roles: Dict[str, str] = None) -> bool:
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty >= 0:
             return False
+        # DB role is the primary source of truth
+        sym  = str(position.get("symbol", "")).upper()
+        role = (position_roles or {}).get(sym, "")
+        if role == "near":
+            return True
+        if role == "leap":
+            return False
+        # Fallback for positions opened before role tracking
         dte = position.get("derived_dte", -1)
         return 0 <= dte <= self.near_dte_max
 

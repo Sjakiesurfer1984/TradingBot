@@ -57,6 +57,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=str(sym),
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
+            position_roles=snapshot.get_position_roles(str(sym)),
         )
 
         logger.info(
@@ -107,6 +108,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=sym,
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
+            position_roles=snapshot.get_position_roles(str(sym)),
         )
 
         leap_req = OptionChainRequest(

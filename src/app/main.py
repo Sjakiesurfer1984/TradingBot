@@ -83,10 +83,11 @@ def main() -> int:
         broker=broker,
         strategies=strategies,
         risk_engine=risk_engine,
-        execution_policy=DefaultExecutionPolicy(),
+        execution_policy=DefaultExecutionPolicy(db=db, dry_run=app_cfg.default_dry_run),
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
         signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
         dry_run=app_cfg.default_dry_run,
+        db=db,
     )
 
     scheduler = Scheduler(

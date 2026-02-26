@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.intents import TradeIntent
@@ -10,6 +10,7 @@ from src.domain.types import OptionChainRequest, Symbol
 from src.execution.execution_policy_interface import ExecutionPolicyABC
 from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
+from src.persistence.interfaces import NullTradeDatabase, TradeDatabaseABC
 from src.risk.risk_engine import RiskEngine
 from src.signals.signal_pipeline import SignalPipelineABC
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
@@ -21,11 +22,11 @@ logger = setup_logger("TradingOrchestrator")
 
 @dataclass(frozen=True)
 class CycleRunResult:
-    orders_submitted:  int
-    intents_generated: int
-    intents_approved:  int
-    intents_rejected:  int
-    has_pending_orders: bool = False  # True if open orders exist after this cycle
+    orders_submitted:   int
+    intents_generated:  int
+    intents_approved:   int
+    intents_rejected:   int
+    has_pending_orders: bool = False
 
 
 @dataclass
@@ -33,21 +34,24 @@ class TradingOrchestrator:
     """
     Fixed cycle skeleton — all steps delegated to composed parts.
 
-    Depends on BrokerABC, StrategyABC[], RiskEngine, ExecutionPolicyABC,
-    CycleSnapshotBuilder, SignalPipelineABC. No OrchestratorABC above it —
-    Scheduler holds TradingOrchestrator directly. One orchestrator exists;
-    the ABC earned nothing.
+    db is injected for ONE purpose: enriching the CycleSnapshot with
+    position_roles before strategies run. This is cycle coordination —
+    the same reason the orchestrator enriches the snapshot with signals
+    and option chains. It is NOT persistence logic.
+
+    Fill recording is the ExecutionPolicy's responsibility.
 
     Cycle sequence:
-      1. Collect universe (symbols declared by all strategies)
-      2. Pre-snapshot — account + quotes, no chains yet
-      3. Signal computation on pre-snapshot
-      4. Collect chain requests from OptionChainConsumer strategies
-      5. Full snapshot — adds option chains
-      6. generate_intents from each strategy
-      7. RiskEngine.evaluate — gates then sizes
-      8. ExecutionPolicy.to_orders — semantic payloads → broker orders
-      9. broker.submit_order — skipped if dry_run
+      1. Collect universe
+      2. Build snapshot (account + quotes)
+      3. Enrich snapshot with position roles from DB
+      4. Compute signals
+      5. Collect chain requests from strategies (using enriched snapshot)
+      6. Add option chains to snapshot
+      7. generate_intents from each strategy
+      8. RiskEngine.evaluate
+      9. ExecutionPolicy.to_orders (also records fills in DB)
+     10. broker.submit_order — skipped if dry_run
     """
 
     broker:           BrokerABC
@@ -56,19 +60,18 @@ class TradingOrchestrator:
     execution_policy: ExecutionPolicyABC
     snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
-    dry_run:          bool = False
+    dry_run:          bool             = False
+    db:               TradeDatabaseABC = field(default_factory=NullTradeDatabase)
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
             universe = self._collect_universe()
 
-            # One account + quote fetch for the whole cycle.
             snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            snapshot = self._enrich_position_roles(snapshot, universe)
             signals  = self.signal_pipeline.compute(snapshot)
             snapshot = snapshot.with_signals(signals)
 
-            # Determine chain requests from the pre-snapshot, then attach
-            # chains without re-fetching account or quotes.
             chain_requests = self._collect_chain_requests(snapshot)
             snapshot       = self.snapshot_builder.add_option_chains(
                 snapshot, chain_requests,
@@ -100,7 +103,29 @@ class TradingOrchestrator:
                     symbols.append(sym)
         return symbols
 
-    def _collect_chain_requests(self, snapshot: CycleSnapshot) -> List[OptionChainRequest]:
+    def _enrich_position_roles(
+        self,
+        snapshot: CycleSnapshot,
+        universe: List[Symbol],
+    ) -> CycleSnapshot:
+        """
+        Fetch position roles from the DB for every symbol in the universe
+        and attach them to the snapshot.
+
+        Strategies read snapshot.get_position_roles(sym) instead of
+        depending on the DB directly — keeping strategy concerns pure.
+        """
+        roles: Dict[str, Dict[str, str]] = {}
+        for sym in universe:
+            sym_str = str(sym).upper()
+            result  = self.db.get_position_roles(sym_str)
+            if result:
+                roles[sym_str] = result
+        return snapshot.with_position_roles(roles)
+
+    def _collect_chain_requests(
+        self, snapshot: CycleSnapshot
+    ) -> List[OptionChainRequest]:
         requests: List[OptionChainRequest] = []
         for strategy in self.strategies:
             if isinstance(strategy, OptionChainConsumerABC):

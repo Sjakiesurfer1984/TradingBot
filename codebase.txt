@@ -158,9 +158,16 @@ strategies:
 # Set to false when ready to trade live.
 default_dry_run: true
 
-# How often to run a cycle in seconds. 60s is sensible for options —
-# conditions don't change fast enough to need sub-minute polling.
-cycle_seconds: 60
+# Two-speed cycle:
+#   cycle_seconds       — normal cadence when no orders are in flight.
+#                         5 min is plenty for PMCC/Wheel — DTE, IV regime,
+#                         and delta all move on the timescale of hours.
+#   order_check_seconds — fast cadence when an open order exists.
+#                         Check more often to detect fills quickly so the
+#                         state machine transitions correctly (PENDING → COVERED).
+#                         Once open_orders is empty, drops back to cycle_seconds.
+cycle_seconds: 300
+order_check_seconds: 30
 
 backtest:
   initial_cash: 100000
@@ -245,8 +252,8 @@ _DEFAULT_DB_PATH = Path("data/trades.db")
 #               "register": Callable[[StrategySpec, RiskEngine]] }
 # Add a new strategy by adding one entry here.
 # ---------------------------------------------------------------------------
-def _pmcc_build(spec):
-    return PmccStrategy(config=spec.pmcc)
+def _pmcc_build(spec, db=None):
+    return PmccStrategy(config=spec.pmcc, db=db)
 
 def _pmcc_register(spec, engine: RiskEngine) -> None:
     r = spec.pmcc.risk
@@ -284,7 +291,7 @@ def main() -> int:
     broker = _build_broker(settings.env_cfg)
     db     = _build_database()
 
-    strategies  = _build_strategies(app_cfg.strategies)
+    strategies  = _build_strategies(app_cfg.strategies, db=db)
     risk_engine = _build_risk_engine(app_cfg)
 
     orchestrator = TradingOrchestrator(
@@ -295,11 +302,12 @@ def main() -> int:
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
         signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
         dry_run=app_cfg.default_dry_run,
+        db=db,
     )
 
     scheduler = Scheduler(
         orchestrator=orchestrator,
-        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds),
+        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds, order_check_seconds=app_cfg.order_check_seconds),
     )
     scheduler.run()
     return 0
@@ -315,14 +323,14 @@ def _build_broker(env_cfg):
     return BrokerFactoryFacade(registry=registry).build_broker(env_cfg=env_cfg)
 
 
-def _build_strategies(specs):
+def _build_strategies(specs, db=None):
     strategies = []
     for spec in specs:
         entry = STRATEGY_REGISTRY.get(spec.name)
         if entry is None:
             logger.error("No strategy registered for name '%s'", spec.name)
             sys.exit(1)
-        strategies.append(entry["build"](spec))
+        strategies.append(entry["build"](spec, db=db))
     return strategies
 
 
@@ -371,47 +379,97 @@ logger = setup_logger("Scheduler")
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    cycle_seconds: float = 60.0
-    max_cycles:    int   = 0   # 0 = run forever
+    cycle_seconds:       float = 300.0  # normal cadence — no pending orders
+    order_check_seconds: float = 30.0   # fast cadence — open order in flight
+    max_cycles:          int   = 0      # 0 = run forever
 
 
 @dataclass
 class Scheduler:
     """
-    Runs TradingOrchestrator.run_cycle() on a timer.
+    Two-speed scheduler for TradingOrchestrator.
 
-    Holds TradingOrchestrator directly — OrchestratorABC removed.
-    One orchestrator exists; the ABC earned nothing.
+    Normal cadence (cycle_seconds, default 300s / 5 min):
+        Used when no orders are in flight. PMCC decisions are driven by
+        DTE, IV regime, and delta — all of which move on the timescale
+        of hours, not seconds. Polling faster wastes API quota and burns
+        through option chain fetch time for no benefit.
+
+    Fast cadence (order_check_seconds, default 30s):
+        Used when the previous cycle submitted an order OR the account
+        snapshot shows open orders. We want to detect fills quickly so
+        the state machine transitions correctly (e.g. PENDING → COVERED).
+        Once open_orders is empty the scheduler drops back to normal cadence.
+
+    The speed decision is made from CycleRunResult.has_pending_orders,
+    which the orchestrator populates from snapshot.account.open_orders
+    plus whether any orders were submitted this cycle.
     """
+
     orchestrator: TradingOrchestrator
     config:       SchedulerConfig
 
     def run(self) -> None:
-        cycle_count = 0
-        logger.info("Scheduler started | cycle_seconds=%.1f", self.config.cycle_seconds)
+        cycle_count  = 0
+        fast_mode    = False
+
+        logger.info(
+            "Scheduler started | cycle_seconds=%.0f order_check_seconds=%.0f",
+            self.config.cycle_seconds,
+            self.config.order_check_seconds,
+        )
 
         while True:
             try:
-                result = self.orchestrator.run_cycle()
+                result      = self.orchestrator.run_cycle()
                 cycle_count += 1
+
+                # Decide next sleep interval based on whether orders are pending
+                prev_fast = fast_mode
+                fast_mode = result.has_pending_orders
+                sleep_for = (
+                    self.config.order_check_seconds if fast_mode
+                    else self.config.cycle_seconds
+                )
+
+                # Log speed transitions so they're visible in logs
+                if fast_mode and not prev_fast:
+                    logger.info(
+                        "Scheduler → FAST mode | open orders detected — "
+                        "checking every %.0fs",
+                        self.config.order_check_seconds,
+                    )
+                elif not fast_mode and prev_fast:
+                    logger.info(
+                        "Scheduler → NORMAL mode | no open orders — "
+                        "resuming %.0fs cycle",
+                        self.config.cycle_seconds,
+                    )
+
                 logger.info(
-                    "Cycle %d complete | submitted=%d approved=%d rejected=%d",
+                    "Cycle %d complete | submitted=%d approved=%d rejected=%d "
+                    "pending=%s next_in=%.0fs",
                     cycle_count,
                     result.orders_submitted,
                     result.intents_approved,
                     result.intents_rejected,
+                    result.has_pending_orders,
+                    sleep_for,
                 )
+
             except KeyboardInterrupt:
                 logger.info("Scheduler interrupted — shutting down")
                 break
             except Exception:
                 logger.exception("Unhandled exception in cycle %d", cycle_count + 1)
+                # On unexpected error, use normal cadence — don't hammer the API
+                sleep_for = self.config.cycle_seconds
 
             if self.config.max_cycles > 0 and cycle_count >= self.config.max_cycles:
                 logger.info("Max cycles reached (%d) — stopping", self.config.max_cycles)
                 break
 
-            time.sleep(self.config.cycle_seconds)
+            time.sleep(sleep_for)
 
 ============================================================
 FILE: .\src\app\__init__.py
@@ -2690,12 +2748,13 @@ class GlobalRiskConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    config_path:     Path
-    default_dry_run: bool
-    cycle_seconds:   float
-    risk:            GlobalRiskConfig
-    strategies:      List[StrategySpec]
-    backtest:        Optional[BacktestConfig] = None
+    config_path:          Path
+    default_dry_run:      bool
+    cycle_seconds:        float   # normal cadence — no pending orders
+    order_check_seconds:  float   # fast cadence — open order in flight
+    risk:                 GlobalRiskConfig
+    strategies:           List[StrategySpec]
+    backtest:             Optional[BacktestConfig] = None
 
 
 # ===========================================================================
@@ -2751,7 +2810,8 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
     return AppConfig(
         config_path=path,
         default_dry_run=bool(raw.get("default_dry_run", False)),
-        cycle_seconds=float(raw.get("cycle_seconds", 60)),
+        cycle_seconds=float(raw.get("cycle_seconds", 300)),
+        order_check_seconds=float(raw.get("order_check_seconds", 30)),
         risk=global_risk,
         strategies=strategies,
         backtest=backtest_cfg,
@@ -3448,7 +3508,7 @@ FILE: .\src\orchestration\cycle_snapshot_builder.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Tuple
 
 from src.brokers.interfaces import BrokerABC
@@ -3466,16 +3526,17 @@ class CycleSnapshotBuilder:
     """
     Builds a CycleSnapshot from live broker data.
 
-    Composed from BrokerABC + ClockABC — no inheritance, no ABC of its own.
-    One class, two clock variants:
-      clock=LiveClock()      → production
-      clock=BacktestClock()  → backtest (set by BacktestRunner before each cycle)
+    Two entry points:
+      build_snapshot()    — full build: account + quotes (no chains).
+                            Called once per cycle for the pre-snapshot.
+      add_option_chains() — extend an existing snapshot with chain data,
+                            reusing the account + quote data already fetched.
+                            Called once per cycle after chain requests are known.
 
-    Build sequence:
-      1. broker.get_account_snapshot() — one call, returns typed AccountSnapshot
-         (equity, cash, buying_power, positions, open_orders)
-      2. broker.get_asset_quote(sym) — once per symbol in universe
-      3. broker.get_option_chain(req) — once per OptionChainRequest, cached per cycle
+    This split avoids the previous double-fetch: account and quote data were
+    being re-fetched for the full snapshot even though they hadn't changed
+    since the pre-snapshot 2 seconds earlier. Saving ~2 broker round-trips
+    per cycle (~4s on SPY).
     """
 
     broker: BrokerABC
@@ -3488,12 +3549,13 @@ class CycleSnapshotBuilder:
     def build_snapshot(
         self,
         *,
-        universe:             List[Symbol],
-        option_chain_requests: List[OptionChainRequest],
+        universe: List[Symbol],
     ) -> CycleSnapshot:
-        as_of = self.clock.now_utc()
-
-        # One call — typed AccountSnapshot covers everything about the account.
+        """
+        Fetch account state and asset quotes. No option chains.
+        Call add_option_chains() afterwards to attach chains.
+        """
+        as_of   = self.clock.now_utc()
         account = self.broker.get_account_snapshot()
 
         logger.info(
@@ -3510,8 +3572,36 @@ class CycleSnapshotBuilder:
             for sym in universe
         }
 
+        return CycleSnapshot(
+            as_of_utc=as_of,
+            account=account,
+            asset_quotes=quotes,
+            option_chains={},
+            signals=SignalSnapshot.empty(as_of_utc=as_of),
+        )
+
+    def add_option_chains(
+        self,
+        snapshot:              CycleSnapshot,
+        option_chain_requests: List[OptionChainRequest],
+    ) -> CycleSnapshot:
+        """
+        Extend snapshot with option chains. Reuses account + quote data.
+        Returns a new CycleSnapshot (original is immutable).
+        """
+        if not option_chain_requests:
+            return snapshot
+
+        new_chains = dict(snapshot.option_chains)
+        new_chains.update(self._fetch_chains(option_chain_requests))
+        return replace(snapshot, option_chains=new_chains)
+
+    def _fetch_chains(
+        self,
+        requests: List[OptionChainRequest],
+    ) -> Dict[Tuple[Symbol, str], List[Any]]:
         chains: Dict[Tuple[Symbol, str], List[Any]] = {}
-        for req in option_chain_requests:
+        for req in requests:
             logger.info(
                 "Fetching option chain | underlying=%s id=%s expiry=[%s → %s]",
                 req.underlying, req.request_id,
@@ -3531,14 +3621,7 @@ class CycleSnapshotBuilder:
                 req.underlying, req.request_id, len(result),
             )
             chains[(Symbol(req.underlying), req.request_id)] = result
-
-        return CycleSnapshot(
-            as_of_utc=as_of,
-            account=account,
-            asset_quotes=quotes,
-            option_chains=chains,
-            signals=SignalSnapshot.empty(as_of_utc=as_of),
-        )
+        return chains
 
 ============================================================
 FILE: .\src\orchestration\orchestrator.py
@@ -3550,6 +3633,7 @@ from dataclasses import dataclass
 from typing import List
 
 from src.brokers.interfaces import BrokerABC
+from src.persistence.interfaces import TradeDatabaseABC, NullTradeDatabase
 from src.domain.intents import TradeIntent
 from src.domain.orders import OrderABC
 from src.domain.types import OptionChainRequest, Symbol
@@ -3571,6 +3655,7 @@ class CycleRunResult:
     intents_generated: int
     intents_approved:  int
     intents_rejected:  int
+    has_pending_orders: bool = False  # True if open orders exist after this cycle
 
 
 @dataclass
@@ -3602,34 +3687,36 @@ class TradingOrchestrator:
     snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
     dry_run:          bool = False
+    db:               TradeDatabaseABC = None  # type: ignore[assignment]
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
-            universe     = self._collect_universe()
-            pre_snapshot = self.snapshot_builder.build_snapshot(
-                universe=universe,
-                option_chain_requests=[],
-            )
-            signals      = self.signal_pipeline.compute(pre_snapshot)
-            pre_snapshot = pre_snapshot.with_signals(signals)
+            universe = self._collect_universe()
 
-            chain_requests = self._collect_chain_requests(pre_snapshot)
-            snapshot       = self.snapshot_builder.build_snapshot(
-                universe=universe,
-                option_chain_requests=chain_requests,
-            )
+            # One account + quote fetch for the whole cycle.
+            snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            signals  = self.signal_pipeline.compute(snapshot)
             snapshot = snapshot.with_signals(signals)
+
+            # Determine chain requests from the pre-snapshot, then attach
+            # chains without re-fetching account or quotes.
+            chain_requests = self._collect_chain_requests(snapshot)
+            snapshot       = self.snapshot_builder.add_option_chains(
+                snapshot, chain_requests,
+            )
 
             intents   = self._collect_intents(snapshot)
             decisions = self.risk_engine.evaluate(snapshot=snapshot, intents=intents)
             orders    = self.execution_policy.to_orders(approvals=decisions.approved)
-            submitted = self._submit_orders(orders)
+            submitted = self._submit_orders(orders, decisions.approved)
 
+        pending = len(snapshot.account.open_orders) > 0 or submitted > 0
         return CycleRunResult(
             orders_submitted=submitted,
             intents_generated=len(intents),
             intents_approved=len(decisions.approved),
             intents_rejected=len(decisions.rejected),
+            has_pending_orders=pending,
         )
 
     # ------------------------------------------------------------------
@@ -3657,7 +3744,11 @@ class TradingOrchestrator:
             intents.extend(strategy.generate_intents(snapshot))
         return intents
 
-    def _submit_orders(self, orders: List[OrderABC]) -> int:
+    def _submit_orders(
+        self,
+        orders:    List[OrderABC],
+        approvals: List,
+    ) -> int:
         if not orders:
             return 0
         if self.dry_run:
@@ -3671,7 +3762,104 @@ class TradingOrchestrator:
                 logger.info("Order submitted | type=%s", type(order).__name__)
             except Exception:
                 logger.exception("Order submission failed | type=%s", type(order).__name__)
+        if submitted > 0:
+            self._record_fills_from_approvals(approvals)
         return submitted
+
+    def _record_fills_from_approvals(self, approvals: List) -> None:
+        """
+        Record fills in the DB after successful order submission.
+        Derives leg_role from the payload type so the classifier has a
+        reliable source of truth going forward.
+        """
+        from src.domain.intents import (
+            EnterPmccPayload, RollNearPayload, CloseLegPayload,
+            CloseSpreadPayload, PositionIntent,
+        )
+        from src.risk.evaluators import _EnterPmccApproved
+        from src.risk.pmcc_sizer import parse_osi
+        from datetime import date as _date
+
+        db = self.db or NullTradeDatabase()
+        today = _date.today()
+
+        for approval in approvals:
+            payload = approval.payload
+            try:
+                if isinstance(payload, _EnterPmccApproved):
+                    # BTO leap + STO near
+                    for sym, role, action in [
+                        (payload.leap.option_symbol, "leap", "BTO"),
+                        (payload.near.option_symbol, "near", "STO"),
+                    ]:
+                        parsed = parse_osi(sym)
+                        db.record_fill(
+                            action=action, symbol=sym,
+                            underlying=str(payload.underlying_symbol),
+                            qty=payload.quantity,
+                            fill_price=0.0,   # actual fill price unknown until broker confirms
+                            fill_date=today,
+                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
+                            strike=float(parsed.strike),
+                            option_right="C",
+                            cost_basis_usd=0.0,
+                            leg_role=role,
+                            notes="recorded at submission — fill price TBD",
+                        )
+
+                elif isinstance(payload, RollNearPayload):
+                    # BTC old near + STO new near
+                    for sym, action in [
+                        (payload.close.option_symbol, "BTC"),
+                        (payload.open.option_symbol, "STO"),
+                    ]:
+                        parsed = parse_osi(sym)
+                        db.record_fill(
+                            action=action, symbol=sym,
+                            underlying=str(payload.underlying_symbol),
+                            qty=1, fill_price=0.0, fill_date=today,
+                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
+                            strike=float(parsed.strike), option_right="C",
+                            cost_basis_usd=0.0, leg_role="near",
+                            notes="roll — fill price TBD",
+                        )
+
+                elif isinstance(payload, CloseLegPayload):
+                    intent = payload.position_intent.value  # BTC or STC
+                    role   = "near" if intent == "BTC" else "leap"
+                    sym    = payload.contract.option_symbol
+                    parsed = parse_osi(sym)
+                    db.record_fill(
+                        action=intent, symbol=sym,
+                        underlying=str(payload.underlying_symbol),
+                        qty=payload.qty, fill_price=0.0, fill_date=today,
+                        expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
+                        strike=float(parsed.strike), option_right="C",
+                        cost_basis_usd=0.0, leg_role=role,
+                        notes="close leg — fill price TBD",
+                    )
+
+                elif isinstance(payload, CloseSpreadPayload):
+                    for sym, role, action in [
+                        (payload.near.option_symbol, "near", "BTC"),
+                        (payload.leap.option_symbol, "leap", "STC"),
+                    ]:
+                        parsed = parse_osi(sym)
+                        db.record_fill(
+                            action=action, symbol=sym,
+                            underlying=str(payload.underlying_symbol),
+                            qty=1, fill_price=0.0, fill_date=today,
+                            expiry=parsed.expiry.date() if hasattr(parsed.expiry, "date") else parsed.expiry,
+                            strike=float(parsed.strike), option_right="C",
+                            cost_basis_usd=0.0, leg_role=role,
+                            notes="close spread — fill price TBD",
+                        )
+
+            except Exception:
+                logger.exception(
+                    "Failed to record fill for payload type=%s",
+                    type(payload).__name__,
+                )
 
 ============================================================
 FILE: .\src\orchestration\__init__.py
@@ -4110,37 +4298,40 @@ class TradeDatabaseABC(ABC):
     """
     Interface for the trade persistence layer.
 
-    All components that need to write or read trade data depend on this
-    interface, not on the SQLite implementation. This means:
-      - Unit tests can inject a NullTradeDatabase or InMemoryTradeDatabase.
-      - A future Postgres implementation requires zero changes to callers.
+    leg_role is passed on every record_fill() call:
+      'leap' — this fill opens/closes a long LEAP leg
+      'near' — this fill opens/closes a short NEAR leg
+      ''     — unknown or not applicable
 
-    SOLID — DIP: depend on abstraction, not concretion.
+    get_position_roles() is the primary source of truth for the state
+    classifier. The classifier reads this first and falls back to DTE
+    heuristics only for symbols with role=''.
     """
-
-    # ------------------------------------------------------------------
-    # Writes — called by the broker on every fill
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def record_fill(
         self,
         *,
-        action:          str,          # BTO | STO | BTC | STC
-        symbol:          str,          # OSI symbol
-        underlying:      str,          # SPY, QQQ, etc.
+        action:          str,
+        symbol:          str,
+        underlying:      str,
         qty:             int,
-        fill_price:      float,        # per-share (multiply by 100 for contract cost)
+        fill_price:      float,
         fill_date:       date,
         expiry:          Optional[date],
         strike:          Optional[float],
-        option_right:    Optional[str], # C | P
-        cost_basis_usd:  float,        # total cost/credit in USD (qty * price * 100)
+        option_right:    Optional[str],
+        cost_basis_usd:  float,
+        leg_role:        str = "",
         brokerage_fee:   float = 0.0,
         usd_aud_rate:    Optional[float] = None,
         notes:           str = "",
     ) -> int:
-        """Insert a fill record. Returns the new row id."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_position_roles(self, underlying: str) -> Dict[str, str]:
+        """Return {osi_symbol: leg_role} for open positions where role is known."""
         raise NotImplementedError
 
     @abstractmethod
@@ -4149,9 +4340,8 @@ class TradeDatabaseABC(ABC):
         *,
         snapshot_date: date,
         underlying:    str,
-        contracts:     List[Dict[str, Any]],   # raw Alpaca snapshot rows
+        contracts:     List[Dict[str, Any]],
     ) -> None:
-        """Persist a full option chain snapshot for future backtesting."""
         raise NotImplementedError
 
     @abstractmethod
@@ -4164,12 +4354,7 @@ class TradeDatabaseABC(ABC):
         option_buying_power: float,
         open_positions:      int,
     ) -> None:
-        """Record daily equity/account state."""
         raise NotImplementedError
-
-    # ------------------------------------------------------------------
-    # Reads — called by reporting tools
-    # ------------------------------------------------------------------
 
     @abstractmethod
     def get_fills(
@@ -4180,7 +4365,6 @@ class TradeDatabaseABC(ABC):
         underlying: Optional[str]  = None,
         action:     Optional[str]  = None,
     ) -> List[Dict[str, Any]]:
-        """Return fill records matching the given filters."""
         raise NotImplementedError
 
     @abstractmethod
@@ -4190,7 +4374,6 @@ class TradeDatabaseABC(ABC):
         from_date: Optional[date] = None,
         to_date:   Optional[date] = None,
     ) -> List[Dict[str, Any]]:
-        """Return daily equity snapshots."""
         raise NotImplementedError
 
     @abstractmethod
@@ -4200,20 +4383,16 @@ class TradeDatabaseABC(ABC):
         snapshot_date: date,
         underlying:    str,
     ) -> List[Dict[str, Any]]:
-        """Return stored chain contracts for a given date and underlying."""
         raise NotImplementedError
 
 
 class NullTradeDatabase(TradeDatabaseABC):
-    """
-    No-op implementation. Accepts all writes silently, returns empty reads.
-    Use in tests or when persistence is disabled.
-    """
-
-    def record_fill(self, **kwargs) -> int:                    return 0
-    def record_chain_snapshot(self, **kwargs) -> None:         pass
-    def record_equity_snapshot(self, **kwargs) -> None:        pass
-    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:     return []
+    """No-op implementation for tests or when persistence is disabled."""
+    def record_fill(self, **kwargs) -> int:                       return 0
+    def get_position_roles(self, underlying: str) -> Dict[str, str]: return {}
+    def record_chain_snapshot(self, **kwargs) -> None:            pass
+    def record_equity_snapshot(self, **kwargs) -> None:           pass
+    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:        return []
     def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]: return []
     def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]: return []
 
@@ -4228,24 +4407,13 @@ src/persistence/trade_database.py
 ----------------------------------
 SQLite-backed implementation of TradeDatabaseABC.
 
-Four tables:
-  fills            — every order fill (open and close), one row per leg
-  positions        — current open positions (updated on every fill)
-  chain_snapshots  — daily option chain data for future backtesting
-  equity_curve     — daily equity/cash/BP snapshot
+leg_role field (added):
+  Every fill and position now carries a leg_role: 'leap' | 'near' | ''.
+  This is the source of truth for the state classifier — no more guessing
+  from DTE thresholds whether a position is a LEAP or a NEAR.
 
-ATO requirements captured per fill:
-  - Date acquired / date disposed
-  - Asset description (OSI symbol)
-  - Cost base (what was paid, including fees)
-  - Capital proceeds (what was received on close)
-  - USD → AUD exchange rate at time of transaction
-  - Whether held > 12 months (CGT discount eligibility)
-
-Usage:
-    from src.persistence.trade_database import TradeDatabase
-    db = TradeDatabase(Path("data/trades.db"))
-    db.record_fill(action="BTO", symbol="SPY260320C00580000", ...)
+  _run_migrations() adds the column to existing DBs on first startup.
+  Safe to run repeatedly — idempotent.
 """
 
 import json
@@ -4264,37 +4432,23 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
--- Every fill: one row per leg per order.
--- Both opening (BTO/STO) and closing (BTC/STC) fills are recorded here.
--- The ATO requires every acquisition and disposal to be documented.
 CREATE TABLE IF NOT EXISTS fills (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-
-    -- Trade identification
-    action          TEXT NOT NULL,     -- BTO | STO | BTC | STC
-    fill_date       TEXT NOT NULL,     -- ISO date YYYY-MM-DD
-    symbol          TEXT NOT NULL,     -- full OSI symbol e.g. SPY260320C00580000
-    underlying      TEXT NOT NULL,     -- e.g. SPY
-
-    -- Contract details (derived from OSI at insert time)
-    expiry          TEXT,              -- ISO date of option expiry
-    strike          REAL,              -- strike price in USD
-    option_right    TEXT,              -- C or P
-
-    -- Quantity and price
+    action          TEXT NOT NULL,
+    fill_date       TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    underlying      TEXT NOT NULL,
+    leg_role        TEXT DEFAULT '',
+    expiry          TEXT,
+    strike          REAL,
+    option_right    TEXT,
     qty             INTEGER NOT NULL,
-    fill_price      REAL NOT NULL,     -- per share (USD)
-    cost_basis_usd  REAL NOT NULL,     -- qty * fill_price * 100 (total USD)
-    brokerage_fee   REAL DEFAULT 0.0,  -- USD, added to cost basis for ATO
-
-    -- ATO: foreign currency translation
-    usd_aud_rate    REAL,              -- USD/AUD exchange rate at fill time
-    cost_basis_aud  REAL,              -- cost_basis_usd / usd_aud_rate (if rate known)
-
-    -- Notes
+    fill_price      REAL NOT NULL,
+    cost_basis_usd  REAL NOT NULL,
+    brokerage_fee   REAL DEFAULT 0.0,
+    usd_aud_rate    REAL,
+    cost_basis_aud  REAL,
     notes           TEXT DEFAULT '',
-
-    -- Audit
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -4302,35 +4456,30 @@ CREATE INDEX IF NOT EXISTS idx_fills_date       ON fills(fill_date);
 CREATE INDEX IF NOT EXISTS idx_fills_symbol     ON fills(symbol);
 CREATE INDEX IF NOT EXISTS idx_fills_underlying ON fills(underlying);
 
--- Open positions: maintained in sync with fills.
--- One row per OSI symbol currently held.
 CREATE TABLE IF NOT EXISTS positions (
     symbol              TEXT PRIMARY KEY,
     underlying          TEXT NOT NULL,
-    side                TEXT NOT NULL,     -- long | short
+    side                TEXT NOT NULL,
     qty                 REAL NOT NULL,
+    leg_role            TEXT DEFAULT '',
     open_date           TEXT NOT NULL,
     cost_basis_usd      REAL NOT NULL,
     market_value_usd    REAL DEFAULT 0.0,
     last_updated        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Daily option chain snapshots for future backtesting.
--- Raw Alpaca JSON stored per underlying per date.
--- Growing this table over time gives you real historical chain data.
 CREATE TABLE IF NOT EXISTS chain_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   TEXT NOT NULL,
     underlying      TEXT NOT NULL,
     contract_symbol TEXT NOT NULL,
-    snapshot_json   TEXT NOT NULL,     -- full Alpaca snapshot row as JSON
+    snapshot_json   TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(snapshot_date, contract_symbol)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_date_ul ON chain_snapshots(snapshot_date, underlying);
 
--- Daily equity/account snapshot.
 CREATE TABLE IF NOT EXISTS equity_curve (
     snapshot_date        TEXT PRIMARY KEY,
     equity               REAL NOT NULL,
@@ -4341,32 +4490,22 @@ CREATE TABLE IF NOT EXISTS equity_curve (
 );
 """
 
+# Migrations for existing DBs. Each is idempotent — fails silently if column exists.
+_MIGRATIONS = [
+    "ALTER TABLE fills     ADD COLUMN leg_role TEXT DEFAULT ''",
+    "ALTER TABLE positions ADD COLUMN leg_role TEXT DEFAULT ''",
+]
+
 
 @dataclass
 class TradeDatabase(TradeDatabaseABC):
-    """
-    SQLite-backed trade and chain persistence.
-
-    Thread safety: SQLite in WAL mode supports concurrent readers and one
-    writer. The bot is single-threaded so this is fine. If you add async
-    later, use a connection-per-thread pattern.
-
-    SOLID:
-      - SRP: this class only persists data. Reporting is in ato_report.py.
-      - OCP: new tables can be added without touching existing methods.
-      - DIP: callers depend on TradeDatabaseABC, not this class directly.
-    """
-
     db_path: Path
 
     def __post_init__(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._run_migrations()
         logger.info("TradeDatabase initialised | path=%s", self.db_path)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=10)
@@ -4378,6 +4517,15 @@ class TradeDatabase(TradeDatabaseABC):
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+
+    def _run_migrations(self) -> None:
+        """Add new columns to existing DBs. Safe to run on every startup."""
+        with self._connect() as conn:
+            for sql in _MIGRATIONS:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     # ------------------------------------------------------------------
     # Writes
@@ -4396,6 +4544,7 @@ class TradeDatabase(TradeDatabaseABC):
         strike:          Optional[float],
         option_right:    Optional[str],
         cost_basis_usd:  float,
+        leg_role:        str = "",
         brokerage_fee:   float = 0.0,
         usd_aud_rate:    Optional[float] = None,
         notes:           str = "",
@@ -4404,24 +4553,19 @@ class TradeDatabase(TradeDatabaseABC):
             round(cost_basis_usd / usd_aud_rate, 2)
             if usd_aud_rate and usd_aud_rate > 0 else None
         )
-
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO fills (
-                    action, fill_date, symbol, underlying,
+                    action, fill_date, symbol, underlying, leg_role,
                     expiry, strike, option_right,
                     qty, fill_price, cost_basis_usd, brokerage_fee,
                     usd_aud_rate, cost_basis_aud, notes
-                ) VALUES (
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?
-                )
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     action.upper(), fill_date.isoformat(), symbol.upper(), underlying.upper(),
+                    leg_role.lower(),
                     expiry.isoformat() if expiry else None,
                     strike, option_right.upper() if option_right else None,
                     qty, fill_price, cost_basis_usd, brokerage_fee,
@@ -4431,13 +4575,13 @@ class TradeDatabase(TradeDatabaseABC):
             row_id = cur.lastrowid
 
         logger.info(
-            "Fill recorded | id=%d action=%s symbol=%s qty=%d price=%.2f cost_usd=%.2f",
-            row_id, action, symbol, qty, fill_price, cost_basis_usd,
+            "Fill recorded | id=%d action=%s symbol=%s role=%s qty=%d price=%.2f cost_usd=%.2f",
+            row_id, action, symbol, leg_role or "?", qty, fill_price, cost_basis_usd,
         )
         self._sync_position(
             action=action, symbol=symbol, underlying=underlying,
             qty=qty, fill_price=fill_price, fill_date=fill_date,
-            cost_basis_usd=cost_basis_usd,
+            cost_basis_usd=cost_basis_usd, leg_role=leg_role,
         )
         return row_id
 
@@ -4451,52 +4595,49 @@ class TradeDatabase(TradeDatabaseABC):
         fill_price:     float,
         fill_date:      date,
         cost_basis_usd: float,
+        leg_role:       str = "",
     ) -> None:
-        """Keep the positions table in sync after every fill."""
         action = action.upper()
+        sym    = symbol.upper()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM positions WHERE symbol = ?", (symbol.upper(),)
+                "SELECT * FROM positions WHERE symbol = ?", (sym,)
             ).fetchone()
 
             if action in ("BTO", "STO"):
-                # Opening a position
-                side = "long" if action == "BTO" else "short"
+                side     = "long" if action == "BTO" else "short"
+                new_role = leg_role.lower()
                 if row is None:
                     conn.execute(
                         """
                         INSERT INTO positions
-                            (symbol, underlying, side, qty, open_date,
+                            (symbol, underlying, side, qty, leg_role, open_date,
                              cost_basis_usd, market_value_usd)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (
-                            symbol.upper(), underlying.upper(), side,
-                            float(qty), fill_date.isoformat(),
-                            cost_basis_usd, 0.0,
-                        ),
+                        (sym, underlying.upper(), side, float(qty),
+                         new_role, fill_date.isoformat(), cost_basis_usd, 0.0),
                     )
                 else:
-                    new_qty = float(row["qty"]) + (qty if action == "BTO" else -qty)
+                    new_qty  = float(row["qty"]) + (qty if action == "BTO" else -qty)
+                    # Only overwrite role if we have one — don't blank out an existing role
+                    stored_role = new_role or (row["leg_role"] or "")
                     conn.execute(
-                        "UPDATE positions SET qty=?, cost_basis_usd=cost_basis_usd+?, "
-                        "last_updated=datetime('now') WHERE symbol=?",
-                        (new_qty, cost_basis_usd, symbol.upper()),
+                        "UPDATE positions SET qty=?, leg_role=?, "
+                        "cost_basis_usd=cost_basis_usd+?, last_updated=datetime('now') "
+                        "WHERE symbol=?",
+                        (new_qty, stored_role, cost_basis_usd, sym),
                     )
 
             elif action in ("BTC", "STC"):
-                # Closing a position
                 if row is not None:
                     new_qty = float(row["qty"]) - qty
                     if abs(new_qty) < 0.001:
-                        conn.execute(
-                            "DELETE FROM positions WHERE symbol=?", (symbol.upper(),)
-                        )
+                        conn.execute("DELETE FROM positions WHERE symbol=?", (sym,))
                     else:
                         conn.execute(
-                            "UPDATE positions SET qty=?, last_updated=datetime('now') "
-                            "WHERE symbol=?",
-                            (new_qty, symbol.upper()),
+                            "UPDATE positions SET qty=?, last_updated=datetime('now') WHERE symbol=?",
+                            (new_qty, sym),
                         )
 
     def record_chain_snapshot(
@@ -4508,31 +4649,18 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> None:
         date_str   = snapshot_date.isoformat()
         underlying = underlying.upper()
-
         rows = [
-            (
-                date_str,
-                underlying,
-                str(c.get("contract_symbol", "")).upper(),
-                json.dumps(c),
-            )
-            for c in contracts
-            if c.get("contract_symbol")
+            (date_str, underlying, str(c.get("contract_symbol", "")).upper(), json.dumps(c))
+            for c in contracts if c.get("contract_symbol")
         ]
-
         if not rows:
             return
-
         with self._connect() as conn:
             conn.executemany(
-                """
-                INSERT OR REPLACE INTO chain_snapshots
-                    (snapshot_date, underlying, contract_symbol, snapshot_json)
-                VALUES (?, ?, ?, ?)
-                """,
+                "INSERT OR REPLACE INTO chain_snapshots "
+                "(snapshot_date, underlying, contract_symbol, snapshot_json) VALUES (?, ?, ?, ?)",
                 rows,
             )
-
         logger.info(
             "Chain snapshot recorded | date=%s underlying=%s contracts=%d",
             date_str, underlying, len(rows),
@@ -4549,20 +4677,31 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO equity_curve
-                    (snapshot_date, equity, cash, option_buying_power, open_positions)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_date.isoformat(),
-                    equity, cash, option_buying_power, open_positions,
-                ),
+                "INSERT OR REPLACE INTO equity_curve "
+                "(snapshot_date, equity, cash, option_buying_power, open_positions) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (snapshot_date.isoformat(), equity, cash, option_buying_power, open_positions),
             )
 
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
+
+    def get_position_roles(self, underlying: str) -> Dict[str, str]:
+        """
+        Return {osi_symbol: leg_role} for all open positions on this underlying
+        where leg_role is known ('leap' or 'near').
+
+        The state classifier calls this first. Positions not in the result
+        (role='') fall back to DTE heuristics in the classifier.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, leg_role FROM positions "
+                "WHERE underlying=? AND leg_role != ''",
+                (underlying.upper(),),
+            ).fetchall()
+        return {row["symbol"]: row["leg_role"] for row in rows}
 
     def get_fills(
         self,
@@ -4574,7 +4713,6 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         query  = "SELECT * FROM fills WHERE 1=1"
         params = []
-
         if from_date:
             query += " AND fill_date >= ?"; params.append(from_date.isoformat())
         if to_date:
@@ -4583,9 +4721,7 @@ class TradeDatabase(TradeDatabaseABC):
             query += " AND underlying = ?"; params.append(underlying.upper())
         if action:
             query += " AND action = ?"; params.append(action.upper())
-
         query += " ORDER BY fill_date, id"
-
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
@@ -4603,7 +4739,6 @@ class TradeDatabase(TradeDatabaseABC):
         if to_date:
             query += " AND snapshot_date <= ?"; params.append(to_date.isoformat())
         query += " ORDER BY snapshot_date"
-
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
@@ -4616,8 +4751,7 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT snapshot_json FROM chain_snapshots "
-                "WHERE snapshot_date=? AND underlying=?",
+                "SELECT snapshot_json FROM chain_snapshots WHERE snapshot_date=? AND underlying=?",
                 (snapshot_date.isoformat(), underlying.upper()),
             ).fetchall()
         return [json.loads(r["snapshot_json"]) for r in rows]
@@ -5883,10 +6017,16 @@ class PmccStateClassifier:
     def classify(
         self,
         *,
-        underlying:  str,
-        positions:   List[Dict[str, Any]],
-        open_orders: List[Dict[str, Any]],
+        underlying:     str,
+        positions:      List[Dict[str, Any]],
+        open_orders:    List[Dict[str, Any]],
+        position_roles: Dict[str, str] = None,
     ) -> PmccHoldings:
+        # position_roles: {osi_symbol: 'leap'|'near'} from TradeDatabase.
+        # Primary source of truth — avoids relying on DTE thresholds for
+        # positions that were opened before config changes.
+        if position_roles is None:
+            position_roles = {}
         sym = underlying.strip().upper()
 
         enriched = [_enrich_position(p) for p in positions]
@@ -5907,8 +6047,8 @@ class PmccStateClassifier:
             and str(p.get("asset_class", "")).lower() == "us_option"
         ]
 
-        leaps = [p for p in opt_pos if self._is_leap(p)]
-        nears = [p for p in opt_pos if self._is_near(p)]
+        leaps = [p for p in opt_pos if self._is_leap(p, position_roles)]
+        nears = [p for p in opt_pos if self._is_near(p, position_roles)]
 
         # Count contracts (qty), not positions.
         # qty=2 on one LEAP position = 2 long contracts, not 1.
@@ -5927,10 +6067,13 @@ class PmccStateClassifier:
             self.leap_dte_min, self.near_dte_max,
         )
         for p in opt_pos:
+            sym_upper = str(p.get("symbol", "")).upper()
+            db_role   = position_roles.get(sym_upper, "?")
             logger.info(
-                "  OptionPos | symbol=%s qty=%s dte=%d is_leap=%s is_near=%s",
+                "  OptionPos | symbol=%s qty=%s dte=%d role=%s is_leap=%s is_near=%s",
                 p.get("symbol"), p.get("qty"), p["derived_dte"],
-                self._is_leap(p), self._is_near(p),
+                db_role,
+                self._is_leap(p, position_roles), self._is_near(p, position_roles),
             )
 
         all_pending    = [o for o in open_orders if self._order_is_for(o, sym)]
@@ -5985,22 +6128,41 @@ class PmccStateClassifier:
             uncovered=uncovered,
         )
 
-    def _is_leap(self, position: Dict[str, Any]) -> bool:
+    def _is_leap(self, position: Dict[str, Any], position_roles: Dict[str, str] = None) -> bool:
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty <= 0:
             return False
-        return position.get("derived_dte", -1) >= self.leap_dte_min
+        # DB role is the primary source of truth
+        sym  = str(position.get("symbol", "")).upper()
+        role = (position_roles or {}).get(sym, "")
+        if role == "leap":
+            return True
+        if role == "near":
+            return False
+        # Fallback for positions opened before role tracking:
+        # treat any long call with DTE >= 180 as a LEAP.
+        # 180 is a generous floor — it will never misclassify a NEAR (max 45 DTE).
+        dte = position.get("derived_dte", -1)
+        return dte >= 180
 
-    def _is_near(self, position: Dict[str, Any]) -> bool:
+    def _is_near(self, position: Dict[str, Any], position_roles: Dict[str, str] = None) -> bool:
         try:
             qty = float(position.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
         if qty >= 0:
             return False
+        # DB role is the primary source of truth
+        sym  = str(position.get("symbol", "")).upper()
+        role = (position_roles or {}).get(sym, "")
+        if role == "near":
+            return True
+        if role == "leap":
+            return False
+        # Fallback for positions opened before role tracking
         dte = position.get("derived_dte", -1)
         return 0 <= dte <= self.near_dte_max
 
@@ -6053,6 +6215,7 @@ from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
 from src.strategies.pmcc_selector import PmccContractSelector
 from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
 from src.domain.signals import IvRegime
+from src.persistence.interfaces import TradeDatabaseABC
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("PmccStrategy")
@@ -6063,6 +6226,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     config:      PmccConfig
     strategy_id: str = "pmcc"
 
+    db: TradeDatabaseABC = None  # type: ignore[assignment]  # injected for position role lookup
     _classifier: PmccStateClassifier  = field(init=False)
     _selector:   PmccContractSelector = field(init=False)
 
@@ -6090,6 +6254,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=str(sym),
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
+            position_roles=self.db.get_position_roles(str(sym)) if self.db else {},
         )
 
         logger.info(
@@ -6140,6 +6305,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             underlying=sym,
             positions=list(snapshot.positions()),
             open_orders=list(snapshot.open_orders()),
+            position_roles=self.db.get_position_roles(str(sym)) if self.db else {},
         )
 
         leap_req = OptionChainRequest(

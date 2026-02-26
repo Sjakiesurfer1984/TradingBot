@@ -1,8 +1,29 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+"""
+src/execution/default_execution_policy.py
+
+Converts ApprovedIntents to broker orders and records fills in the DB.
+
+SRP:  this class owns "translate an approved intent into broker effects".
+      Two outputs of the same action:
+        Output 1 — OrderABC objects sent to the broker
+        Output 2 — fill records written to the DB with leg_role
+      Both are consequences of the same decision; they belong together.
+
+OCP:  add a new payload type → add one _build_* method + one _record() call.
+      Zero other changes required.
+
+DIP:  depends on TradeDatabaseABC (abstraction), not TradeDatabase (concretion).
+      Defaults to NullTradeDatabase so callers without persistence need not change.
+
+Composition: db injected, never inherited.
+"""
+
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
-from typing import List
+from typing import List, Optional, Tuple
 from uuid import uuid4
 
 from src.domain.intents import (
@@ -20,6 +41,7 @@ from src.domain.orders import (
 )
 from src.domain.types import ClientOrderId, Symbol
 from src.execution.execution_policy_interface import ExecutionPolicyABC
+from src.persistence.interfaces import NullTradeDatabase, TradeDatabaseABC
 from src.risk.decisions import ApprovedIntent
 from src.risk.evaluators import _EnterPmccApproved
 from src.utilities.logger import setup_logger
@@ -32,27 +54,47 @@ def _coid() -> ClientOrderId:
     return ClientOrderId(str(uuid4())[:16])
 
 
+def _parse_osi(symbol: str) -> Tuple[Optional[date], Optional[float], Optional[str]]:
+    """
+    Extract (expiry, strike, right) from an OSI option symbol.
+    Single point of OSI parsing — delegates to pmcc_sizer.parse_osi.
+    Returns (None, None, None) on failure rather than raising.
+    """
+    try:
+        from src.risk.pmcc_sizer import parse_osi
+        parsed = parse_osi(symbol)
+        expiry = parsed.expiry
+        if hasattr(expiry, "date"):
+            expiry = expiry.date()
+        return expiry, float(parsed.strike), parsed.right
+    except Exception:
+        return None, None, None
+
+
 @dataclass
 class DefaultExecutionPolicy(ExecutionPolicyABC):
     """
     Converts ApprovedIntents to broker-domain orders.
 
-    No isinstance ladder — each payload type is handled in its own method.
-    Adding a new payload type = add one elif + one _build_* method.
+    db is injected for fill recording. Each _build_* method records its
+    own fills — one payload type, one method, one place to change (OCP).
 
-    Alpaca MLEG constraints respected:
-      EnterPmccPayload   → 1x MultiLegLimitOrder  (BTO leap + STO near — covered ✅)
-      RollNearPayload    → 2x MarketOrder sequential (MLEG rejects rolls — uncovered ❌)
+    Alpaca MLEG constraints:
+      EnterPmccPayload   → 1x MultiLegLimitOrder  (BTO leap + STO near, covered ✅)
+      RollNearPayload    → 2x MarketOrder sequential (MLEG rejects rolls ❌)
       CloseLegPayload    → 1x MarketOrder
-      CloseSpreadPayload → 1x MultiLegLimitOrder   (both legs closing — no new short ✅)
+      CloseSpreadPayload → 1x MultiLegLimitOrder   (both legs closing ✅)
     """
+
+    db:      TradeDatabaseABC = field(default_factory=NullTradeDatabase)
+    dry_run: bool             = False  # when True, _record() is a no-op
 
     def to_orders(self, approvals: List[ApprovedIntent]) -> List[OrderABC]:
         orders: List[OrderABC] = []
         for approval in approvals:
-            with log_scope("execution_policy.to_orders", logger, extra=type(approval.payload).__name__):
-                new_orders = self._build(approval)
-                orders.extend(new_orders)
+            with log_scope("execution_policy.to_orders", logger,
+                           extra=type(approval.payload).__name__):
+                orders.extend(self._build(approval))
         return orders
 
     def _build(self, approval: ApprovedIntent) -> List[OrderABC]:
@@ -60,13 +102,10 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
 
         if isinstance(payload, _EnterPmccApproved):
             return [self._build_entry(payload)]
-
         if isinstance(payload, RollNearPayload):
             return self._build_roll(payload)
-
         if isinstance(payload, CloseLegPayload):
             return [self._build_close_leg(payload)]
-
         if isinstance(payload, CloseSpreadPayload):
             return [self._build_close_spread(payload)]
 
@@ -77,17 +116,12 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
         return []
 
     # ------------------------------------------------------------------
-    # Builders
+    # Builders — each builds its orders AND records its fills.
+    # One payload type → one method → one place to change (OCP).
     # ------------------------------------------------------------------
 
     def _build_entry(self, payload: _EnterPmccApproved) -> MultiLegLimitOrder:
-        """
-        PMCC entry → one MultiLegLimitOrder.
-
-        BTO leap + STO near submitted as a single MLEG spread.
-        Alpaca fills both legs atomically — no partial-fill risk on entry.
-        """
-        from src.domain.orders import OptionLeg
+        """PMCC entry → one MultiLegLimitOrder (BTO leap + STO near)."""
         legs = [
             OptionLeg(contract=payload.leap.contract, side=OrderSide.BUY,  ratio=1),
             OptionLeg(contract=payload.near.contract, side=OrderSide.SELL, ratio=1),
@@ -108,19 +142,14 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.quantity,
             payload.limit_price,
         )
+        self._record(payload.leap.option_symbol, "BTO",
+                     str(payload.underlying_symbol), payload.quantity, "leap")
+        self._record(payload.near.option_symbol, "STO",
+                     str(payload.underlying_symbol), payload.quantity, "near")
         return order
 
     def _build_roll(self, payload: RollNearPayload) -> List[MarketOrder]:
-        """
-        NEAR roll → two sequential MarketOrders.
-
-        Alpaca Level 3 rejects a roll as a single MLEG: the STO leg would be
-        uncovered at submission time (the BTC hasn't filled yet). Sequential
-        single-leg orders are the only valid path.
-
-        Order: BTC first (eliminates the short), then STO (opens new short,
-        now covered by the existing LEAP).
-        """
+        """NEAR roll → two sequential MarketOrders (BTC then STO)."""
         btc = MarketOrder(
             client_order_id=_coid(),
             symbol=payload.close.option_symbol,
@@ -140,16 +169,23 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.close.option_symbol,
             payload.open.option_symbol,
         )
+        self._record(payload.close.option_symbol, "BTC",
+                     str(payload.underlying_symbol), 1, "near")
+        self._record(payload.open.option_symbol,  "STO",
+                     str(payload.underlying_symbol), 1, "near")
         return [btc, sto]
 
     def _build_close_leg(self, payload: CloseLegPayload) -> MarketOrder:
-        """Single-leg close — BTC a short or STC a long."""
-        side = (
-            OrderSide.BUY
-            if payload.position_intent.value in ("BTC", "BTO")
-            else OrderSide.SELL
-        )
-        order = MarketOrder(
+        """
+        Single-leg order — covers both opening and closing actions:
+          BTO → buy to open  (new long LEAP)
+          STO → sell to open (new short NEAR)
+          BTC → buy to close (close short NEAR)
+          STC → sell to close (close long LEAP)
+        """
+        intent = payload.position_intent.value
+        side   = OrderSide.BUY if intent in ("BTC", "BTO") else OrderSide.SELL
+        order  = MarketOrder(
             client_order_id=_coid(),
             symbol=payload.contract.option_symbol,
             side=side,
@@ -157,31 +193,27 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             time_in_force=TimeInForce.DAY,
         )
         logger.info(
-            "Close leg order | symbol=%s side=%s qty=%d intent=%s",
-            payload.contract.option_symbol,
-            side.value,
-            payload.qty,
-            payload.position_intent.value,
+            "Single leg order | symbol=%s side=%s qty=%d intent=%s",
+            payload.contract.option_symbol, side.value, payload.qty, intent,
         )
+        # Role: BTC/STO = near leg, BTO/STC = leap leg
+        role = "near" if intent in ("BTC", "STO") else "leap"
+        self._record(payload.contract.option_symbol, intent,
+                     str(payload.underlying_symbol), payload.qty, role)
         return order
 
     def _build_close_spread(self, payload: CloseSpreadPayload) -> MultiLegLimitOrder:
-        """
-        Close entire spread → one MultiLegLimitOrder.
-
-        Both legs are closing positions — no uncovered short is created,
-        so Alpaca MLEG accepts this.
-        """
+        """Close entire spread → one MultiLegLimitOrder (BTC near + STC leap)."""
         legs = [
-            OptionLeg(contract=payload.near.contract, side=OrderSide.BUY,  ratio=1),  # BTC near
-            OptionLeg(contract=payload.leap.contract, side=OrderSide.SELL, ratio=1),  # STC leap
+            OptionLeg(contract=payload.near.contract, side=OrderSide.BUY,  ratio=1),
+            OptionLeg(contract=payload.leap.contract, side=OrderSide.SELL, ratio=1),
         ]
         order = MultiLegLimitOrder(
             client_order_id=_coid(),
             underlying=Symbol(str(payload.underlying_symbol)),
             legs=legs,
             quantity=1,
-            limit_price=Decimal("0.00"),   # market-ish — caller can override
+            limit_price=Decimal("0.00"),
             time_in_force=TimeInForce.DAY,
         )
         logger.info(
@@ -190,4 +222,49 @@ class DefaultExecutionPolicy(ExecutionPolicyABC):
             payload.near.option_symbol,
             payload.leap.option_symbol,
         )
+        self._record(payload.near.option_symbol, "BTC",
+                     str(payload.underlying_symbol), 1, "near")
+        self._record(payload.leap.option_symbol, "STC",
+                     str(payload.underlying_symbol), 1, "leap")
         return order
+
+    # ------------------------------------------------------------------
+    # Fill recording — private, called only from _build_* methods.
+    # Fill price is unknown at submission; recorded as 0.0 for now.
+    # ------------------------------------------------------------------
+
+    def _record(
+        self,
+        symbol:     str,
+        action:     str,
+        underlying: str,
+        qty:        int,
+        leg_role:   str,
+    ) -> None:
+        if self.dry_run:
+            logger.debug(
+                "DRY RUN — fill not recorded | symbol=%s action=%s role=%s",
+                symbol, action, leg_role,
+            )
+            return
+        expiry, strike, right = _parse_osi(symbol)
+        try:
+            self.db.record_fill(
+                action=action,
+                symbol=symbol,
+                underlying=underlying,
+                qty=qty,
+                fill_price=0.0,
+                fill_date=date.today(),
+                expiry=expiry,
+                strike=strike,
+                option_right=right,
+                cost_basis_usd=0.0,
+                leg_role=leg_role,
+                notes="recorded at submission — fill price TBD",
+            )
+        except Exception:
+            logger.exception(
+                "Fill recording failed | symbol=%s action=%s role=%s",
+                symbol, action, leg_role,
+            )

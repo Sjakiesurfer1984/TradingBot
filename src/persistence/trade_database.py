@@ -5,24 +5,13 @@ src/persistence/trade_database.py
 ----------------------------------
 SQLite-backed implementation of TradeDatabaseABC.
 
-Four tables:
-  fills            — every order fill (open and close), one row per leg
-  positions        — current open positions (updated on every fill)
-  chain_snapshots  — daily option chain data for future backtesting
-  equity_curve     — daily equity/cash/BP snapshot
+leg_role field (added):
+  Every fill and position now carries a leg_role: 'leap' | 'near' | ''.
+  This is the source of truth for the state classifier — no more guessing
+  from DTE thresholds whether a position is a LEAP or a NEAR.
 
-ATO requirements captured per fill:
-  - Date acquired / date disposed
-  - Asset description (OSI symbol)
-  - Cost base (what was paid, including fees)
-  - Capital proceeds (what was received on close)
-  - USD → AUD exchange rate at time of transaction
-  - Whether held > 12 months (CGT discount eligibility)
-
-Usage:
-    from src.persistence.trade_database import TradeDatabase
-    db = TradeDatabase(Path("data/trades.db"))
-    db.record_fill(action="BTO", symbol="SPY260320C00580000", ...)
+  _run_migrations() adds the column to existing DBs on first startup.
+  Safe to run repeatedly — idempotent.
 """
 
 import json
@@ -41,37 +30,23 @@ _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
--- Every fill: one row per leg per order.
--- Both opening (BTO/STO) and closing (BTC/STC) fills are recorded here.
--- The ATO requires every acquisition and disposal to be documented.
 CREATE TABLE IF NOT EXISTS fills (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-
-    -- Trade identification
-    action          TEXT NOT NULL,     -- BTO | STO | BTC | STC
-    fill_date       TEXT NOT NULL,     -- ISO date YYYY-MM-DD
-    symbol          TEXT NOT NULL,     -- full OSI symbol e.g. SPY260320C00580000
-    underlying      TEXT NOT NULL,     -- e.g. SPY
-
-    -- Contract details (derived from OSI at insert time)
-    expiry          TEXT,              -- ISO date of option expiry
-    strike          REAL,              -- strike price in USD
-    option_right    TEXT,              -- C or P
-
-    -- Quantity and price
+    action          TEXT NOT NULL,
+    fill_date       TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    underlying      TEXT NOT NULL,
+    leg_role        TEXT DEFAULT '',
+    expiry          TEXT,
+    strike          REAL,
+    option_right    TEXT,
     qty             INTEGER NOT NULL,
-    fill_price      REAL NOT NULL,     -- per share (USD)
-    cost_basis_usd  REAL NOT NULL,     -- qty * fill_price * 100 (total USD)
-    brokerage_fee   REAL DEFAULT 0.0,  -- USD, added to cost basis for ATO
-
-    -- ATO: foreign currency translation
-    usd_aud_rate    REAL,              -- USD/AUD exchange rate at fill time
-    cost_basis_aud  REAL,              -- cost_basis_usd / usd_aud_rate (if rate known)
-
-    -- Notes
+    fill_price      REAL NOT NULL,
+    cost_basis_usd  REAL NOT NULL,
+    brokerage_fee   REAL DEFAULT 0.0,
+    usd_aud_rate    REAL,
+    cost_basis_aud  REAL,
     notes           TEXT DEFAULT '',
-
-    -- Audit
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -79,35 +54,30 @@ CREATE INDEX IF NOT EXISTS idx_fills_date       ON fills(fill_date);
 CREATE INDEX IF NOT EXISTS idx_fills_symbol     ON fills(symbol);
 CREATE INDEX IF NOT EXISTS idx_fills_underlying ON fills(underlying);
 
--- Open positions: maintained in sync with fills.
--- One row per OSI symbol currently held.
 CREATE TABLE IF NOT EXISTS positions (
     symbol              TEXT PRIMARY KEY,
     underlying          TEXT NOT NULL,
-    side                TEXT NOT NULL,     -- long | short
+    side                TEXT NOT NULL,
     qty                 REAL NOT NULL,
+    leg_role            TEXT DEFAULT '',
     open_date           TEXT NOT NULL,
     cost_basis_usd      REAL NOT NULL,
     market_value_usd    REAL DEFAULT 0.0,
     last_updated        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Daily option chain snapshots for future backtesting.
--- Raw Alpaca JSON stored per underlying per date.
--- Growing this table over time gives you real historical chain data.
 CREATE TABLE IF NOT EXISTS chain_snapshots (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_date   TEXT NOT NULL,
     underlying      TEXT NOT NULL,
     contract_symbol TEXT NOT NULL,
-    snapshot_json   TEXT NOT NULL,     -- full Alpaca snapshot row as JSON
+    snapshot_json   TEXT NOT NULL,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(snapshot_date, contract_symbol)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chain_date_ul ON chain_snapshots(snapshot_date, underlying);
 
--- Daily equity/account snapshot.
 CREATE TABLE IF NOT EXISTS equity_curve (
     snapshot_date        TEXT PRIMARY KEY,
     equity               REAL NOT NULL,
@@ -118,32 +88,22 @@ CREATE TABLE IF NOT EXISTS equity_curve (
 );
 """
 
+# Migrations for existing DBs. Each is idempotent — fails silently if column exists.
+_MIGRATIONS = [
+    "ALTER TABLE fills     ADD COLUMN leg_role TEXT DEFAULT ''",
+    "ALTER TABLE positions ADD COLUMN leg_role TEXT DEFAULT ''",
+]
+
 
 @dataclass
 class TradeDatabase(TradeDatabaseABC):
-    """
-    SQLite-backed trade and chain persistence.
-
-    Thread safety: SQLite in WAL mode supports concurrent readers and one
-    writer. The bot is single-threaded so this is fine. If you add async
-    later, use a connection-per-thread pattern.
-
-    SOLID:
-      - SRP: this class only persists data. Reporting is in ato_report.py.
-      - OCP: new tables can be added without touching existing methods.
-      - DIP: callers depend on TradeDatabaseABC, not this class directly.
-    """
-
     db_path: Path
 
     def __post_init__(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._run_migrations()
         logger.info("TradeDatabase initialised | path=%s", self.db_path)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=10)
@@ -155,6 +115,15 @@ class TradeDatabase(TradeDatabaseABC):
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+
+    def _run_migrations(self) -> None:
+        """Add new columns to existing DBs. Safe to run on every startup."""
+        with self._connect() as conn:
+            for sql in _MIGRATIONS:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     # ------------------------------------------------------------------
     # Writes
@@ -173,6 +142,7 @@ class TradeDatabase(TradeDatabaseABC):
         strike:          Optional[float],
         option_right:    Optional[str],
         cost_basis_usd:  float,
+        leg_role:        str = "",
         brokerage_fee:   float = 0.0,
         usd_aud_rate:    Optional[float] = None,
         notes:           str = "",
@@ -181,24 +151,19 @@ class TradeDatabase(TradeDatabaseABC):
             round(cost_basis_usd / usd_aud_rate, 2)
             if usd_aud_rate and usd_aud_rate > 0 else None
         )
-
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO fills (
-                    action, fill_date, symbol, underlying,
+                    action, fill_date, symbol, underlying, leg_role,
                     expiry, strike, option_right,
                     qty, fill_price, cost_basis_usd, brokerage_fee,
                     usd_aud_rate, cost_basis_aud, notes
-                ) VALUES (
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?
-                )
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     action.upper(), fill_date.isoformat(), symbol.upper(), underlying.upper(),
+                    leg_role.lower(),
                     expiry.isoformat() if expiry else None,
                     strike, option_right.upper() if option_right else None,
                     qty, fill_price, cost_basis_usd, brokerage_fee,
@@ -208,13 +173,13 @@ class TradeDatabase(TradeDatabaseABC):
             row_id = cur.lastrowid
 
         logger.info(
-            "Fill recorded | id=%d action=%s symbol=%s qty=%d price=%.2f cost_usd=%.2f",
-            row_id, action, symbol, qty, fill_price, cost_basis_usd,
+            "Fill recorded | id=%d action=%s symbol=%s role=%s qty=%d price=%.2f cost_usd=%.2f",
+            row_id, action, symbol, leg_role or "?", qty, fill_price, cost_basis_usd,
         )
         self._sync_position(
             action=action, symbol=symbol, underlying=underlying,
             qty=qty, fill_price=fill_price, fill_date=fill_date,
-            cost_basis_usd=cost_basis_usd,
+            cost_basis_usd=cost_basis_usd, leg_role=leg_role,
         )
         return row_id
 
@@ -228,52 +193,49 @@ class TradeDatabase(TradeDatabaseABC):
         fill_price:     float,
         fill_date:      date,
         cost_basis_usd: float,
+        leg_role:       str = "",
     ) -> None:
-        """Keep the positions table in sync after every fill."""
         action = action.upper()
+        sym    = symbol.upper()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM positions WHERE symbol = ?", (symbol.upper(),)
+                "SELECT * FROM positions WHERE symbol = ?", (sym,)
             ).fetchone()
 
             if action in ("BTO", "STO"):
-                # Opening a position
-                side = "long" if action == "BTO" else "short"
+                side     = "long" if action == "BTO" else "short"
+                new_role = leg_role.lower()
                 if row is None:
                     conn.execute(
                         """
                         INSERT INTO positions
-                            (symbol, underlying, side, qty, open_date,
+                            (symbol, underlying, side, qty, leg_role, open_date,
                              cost_basis_usd, market_value_usd)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (
-                            symbol.upper(), underlying.upper(), side,
-                            float(qty), fill_date.isoformat(),
-                            cost_basis_usd, 0.0,
-                        ),
+                        (sym, underlying.upper(), side, float(qty),
+                         new_role, fill_date.isoformat(), cost_basis_usd, 0.0),
                     )
                 else:
-                    new_qty = float(row["qty"]) + (qty if action == "BTO" else -qty)
+                    new_qty  = float(row["qty"]) + (qty if action == "BTO" else -qty)
+                    # Only overwrite role if we have one — don't blank out an existing role
+                    stored_role = new_role or (row["leg_role"] or "")
                     conn.execute(
-                        "UPDATE positions SET qty=?, cost_basis_usd=cost_basis_usd+?, "
-                        "last_updated=datetime('now') WHERE symbol=?",
-                        (new_qty, cost_basis_usd, symbol.upper()),
+                        "UPDATE positions SET qty=?, leg_role=?, "
+                        "cost_basis_usd=cost_basis_usd+?, last_updated=datetime('now') "
+                        "WHERE symbol=?",
+                        (new_qty, stored_role, cost_basis_usd, sym),
                     )
 
             elif action in ("BTC", "STC"):
-                # Closing a position
                 if row is not None:
                     new_qty = float(row["qty"]) - qty
                     if abs(new_qty) < 0.001:
-                        conn.execute(
-                            "DELETE FROM positions WHERE symbol=?", (symbol.upper(),)
-                        )
+                        conn.execute("DELETE FROM positions WHERE symbol=?", (sym,))
                     else:
                         conn.execute(
-                            "UPDATE positions SET qty=?, last_updated=datetime('now') "
-                            "WHERE symbol=?",
-                            (new_qty, symbol.upper()),
+                            "UPDATE positions SET qty=?, last_updated=datetime('now') WHERE symbol=?",
+                            (new_qty, sym),
                         )
 
     def record_chain_snapshot(
@@ -285,31 +247,18 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> None:
         date_str   = snapshot_date.isoformat()
         underlying = underlying.upper()
-
         rows = [
-            (
-                date_str,
-                underlying,
-                str(c.get("contract_symbol", "")).upper(),
-                json.dumps(c),
-            )
-            for c in contracts
-            if c.get("contract_symbol")
+            (date_str, underlying, str(c.get("contract_symbol", "")).upper(), json.dumps(c))
+            for c in contracts if c.get("contract_symbol")
         ]
-
         if not rows:
             return
-
         with self._connect() as conn:
             conn.executemany(
-                """
-                INSERT OR REPLACE INTO chain_snapshots
-                    (snapshot_date, underlying, contract_symbol, snapshot_json)
-                VALUES (?, ?, ?, ?)
-                """,
+                "INSERT OR REPLACE INTO chain_snapshots "
+                "(snapshot_date, underlying, contract_symbol, snapshot_json) VALUES (?, ?, ?, ?)",
                 rows,
             )
-
         logger.info(
             "Chain snapshot recorded | date=%s underlying=%s contracts=%d",
             date_str, underlying, len(rows),
@@ -326,20 +275,31 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                """
-                INSERT OR REPLACE INTO equity_curve
-                    (snapshot_date, equity, cash, option_buying_power, open_positions)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    snapshot_date.isoformat(),
-                    equity, cash, option_buying_power, open_positions,
-                ),
+                "INSERT OR REPLACE INTO equity_curve "
+                "(snapshot_date, equity, cash, option_buying_power, open_positions) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (snapshot_date.isoformat(), equity, cash, option_buying_power, open_positions),
             )
 
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
+
+    def get_position_roles(self, underlying: str) -> Dict[str, str]:
+        """
+        Return {osi_symbol: leg_role} for all open positions on this underlying
+        where leg_role is known ('leap' or 'near').
+
+        The state classifier calls this first. Positions not in the result
+        (role='') fall back to DTE heuristics in the classifier.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, leg_role FROM positions "
+                "WHERE underlying=? AND leg_role != ''",
+                (underlying.upper(),),
+            ).fetchall()
+        return {row["symbol"]: row["leg_role"] for row in rows}
 
     def get_fills(
         self,
@@ -351,7 +311,6 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         query  = "SELECT * FROM fills WHERE 1=1"
         params = []
-
         if from_date:
             query += " AND fill_date >= ?"; params.append(from_date.isoformat())
         if to_date:
@@ -360,9 +319,7 @@ class TradeDatabase(TradeDatabaseABC):
             query += " AND underlying = ?"; params.append(underlying.upper())
         if action:
             query += " AND action = ?"; params.append(action.upper())
-
         query += " ORDER BY fill_date, id"
-
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
@@ -380,7 +337,6 @@ class TradeDatabase(TradeDatabaseABC):
         if to_date:
             query += " AND snapshot_date <= ?"; params.append(to_date.isoformat())
         query += " ORDER BY snapshot_date"
-
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
@@ -393,8 +349,7 @@ class TradeDatabase(TradeDatabaseABC):
     ) -> List[Dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT snapshot_json FROM chain_snapshots "
-                "WHERE snapshot_date=? AND underlying=?",
+                "SELECT snapshot_json FROM chain_snapshots WHERE snapshot_date=? AND underlying=?",
                 (snapshot_date.isoformat(), underlying.upper()),
             ).fetchall()
         return [json.loads(r["snapshot_json"]) for r in rows]
