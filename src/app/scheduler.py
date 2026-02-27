@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from src.app.market_calendar import AlwaysOpenMarketCalendar, MarketCalendarABC
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.utilities.logger import setup_logger
 
@@ -11,39 +12,40 @@ logger = setup_logger("Scheduler")
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    cycle_seconds:       float = 300.0  # normal cadence — no pending orders
-    order_check_seconds: float = 30.0   # fast cadence — open order in flight
-    max_cycles:          int   = 0      # 0 = run forever
+    cycle_seconds:       float = 300.0   # normal cadence — no pending orders
+    order_check_seconds: float = 30.0    # fast cadence — open order in flight
+    max_cycles:          int   = 0       # 0 = run forever
 
 
 @dataclass
 class Scheduler:
     """
-    Two-speed scheduler for TradingOrchestrator.
+    Two-speed scheduler for TradingOrchestrator with market hours guard.
+
+    Market hours guard:
+        Before each cycle, the scheduler asks the MarketCalendarABC whether
+        the market is open. If it is closed, the scheduler sleeps until the
+        next open (reported by the calendar) rather than running a cycle.
+        This prevents phantom DB writes and wasted API calls outside trading
+        hours — and means it does not matter if the bot is left running
+        overnight or over a weekend.
 
     Normal cadence (cycle_seconds, default 300s / 5 min):
-        Used when no orders are in flight. PMCC decisions are driven by
-        DTE, IV regime, and delta — all of which move on the timescale
-        of hours, not seconds. Polling faster wastes API quota and burns
-        through option chain fetch time for no benefit.
+        Used when no orders are in flight.
 
     Fast cadence (order_check_seconds, default 30s):
-        Used when the previous cycle submitted an order OR the account
-        snapshot shows open orders. We want to detect fills quickly so
-        the state machine transitions correctly (e.g. PENDING → COVERED).
-        Once open_orders is empty the scheduler drops back to normal cadence.
-
-    The speed decision is made from CycleRunResult.has_pending_orders,
-    which the orchestrator populates from snapshot.account.open_orders
-    plus whether any orders were submitted this cycle.
+        Used when orders are pending. Drops back to normal once clear.
     """
 
     orchestrator: TradingOrchestrator
     config:       SchedulerConfig
+    calendar:     MarketCalendarABC = field(
+        default_factory=AlwaysOpenMarketCalendar # default to always-open calendar if not provided, meaning the scheduler will never skip cycles due to market hours. This is a safe default for testing and development, but in production you should provide a real calendar that reflects your market's hours.
+    )
 
     def run(self) -> None:
-        cycle_count  = 0
-        fast_mode    = False
+        cycle_count = 0
+        fast_mode   = False
 
         logger.info(
             "Scheduler started | cycle_seconds=%.0f order_check_seconds=%.0f",
@@ -53,10 +55,28 @@ class Scheduler:
 
         while True:
             try:
-                result      = self.orchestrator.run_cycle()
+                # ----------------------------------------------------------
+                # Market hours guard — skip cycle entirely if market is closed
+                # ----------------------------------------------------------
+                if not self.calendar.is_open():
+                    wait = self.calendar.seconds_until_open()
+                    hours, remainder = divmod(int(wait), 3600)
+                    minutes          = remainder // 60
+                    logger.info(
+                        "Market closed — sleeping %.0fs until next open "
+                        "(%dh %02dm)",
+                        wait, hours, minutes,
+                    )
+                    # Sleep in chunks so KeyboardInterrupt is still responsive
+                    _interruptible_sleep(wait)
+                    continue
+
+                # ----------------------------------------------------------
+                # Normal cycle
+                # ----------------------------------------------------------
+                result       = self.orchestrator.run_cycle()
                 cycle_count += 1
 
-                # Decide next sleep interval based on whether orders are pending
                 prev_fast = fast_mode
                 fast_mode = result.has_pending_orders
                 sleep_for = (
@@ -64,7 +84,6 @@ class Scheduler:
                     else self.config.cycle_seconds
                 )
 
-                # Log speed transitions so they're visible in logs
                 if fast_mode and not prev_fast:
                     logger.info(
                         "Scheduler → FAST mode | open orders detected — "
@@ -89,16 +108,23 @@ class Scheduler:
                     sleep_for,
                 )
 
+                _interruptible_sleep(sleep_for)
+
             except KeyboardInterrupt:
                 logger.info("Scheduler interrupted — shutting down")
                 break
             except Exception:
                 logger.exception("Unhandled exception in cycle %d", cycle_count + 1)
-                # On unexpected error, use normal cadence — don't hammer the API
-                sleep_for = self.config.cycle_seconds
+                _interruptible_sleep(self.config.cycle_seconds)
 
-            if self.config.max_cycles > 0 and cycle_count >= self.config.max_cycles:
-                logger.info("Max cycles reached (%d) — stopping", self.config.max_cycles)
-                break
 
-            time.sleep(sleep_for)
+def _interruptible_sleep(seconds: float, chunk: float = 5.0) -> None:
+    """
+    Sleep for `seconds` total, waking every `chunk` seconds.
+    This keeps KeyboardInterrupt responsive even during long waits
+    (e.g. sleeping until next market open several hours away).
+    """
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(min(chunk, remaining))
+        remaining -= chunk

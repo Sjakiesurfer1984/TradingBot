@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.signals import SignalSnapshot
@@ -20,15 +20,12 @@ class CycleSnapshotBuilder:
 
     Two entry points:
       build_snapshot()    — full build: account + quotes (no chains).
-                            Called once per cycle for the pre-snapshot.
+                            Accepts an optional pre-fetched AccountSnapshot
+                            so the orchestrator can avoid a duplicate broker
+                            call when it has already fetched the account for
+                            the pending-order fast-path check.
       add_option_chains() — extend an existing snapshot with chain data,
                             reusing the account + quote data already fetched.
-                            Called once per cycle after chain requests are known.
-
-    This split avoids the previous double-fetch: account and quote data were
-    being re-fetched for the full snapshot even though they hadn't changed
-    since the pre-snapshot 2 seconds earlier. Saving ~2 broker round-trips
-    per cycle (~4s on SPY).
     """
 
     broker: BrokerABC
@@ -42,16 +39,20 @@ class CycleSnapshotBuilder:
         self,
         *,
         universe: List[Symbol],
+        account:  Optional[AccountSnapshot] = None,
     ) -> CycleSnapshot:
         """
-        Fetch account state and asset quotes. No option chains.
-        Call add_option_chains() afterwards to attach chains.
+        Fetch asset quotes and build the pre-chain snapshot.
+
+        account — pass the AccountSnapshot already fetched by the caller to
+                  avoid a redundant broker round-trip. If None, one
+                  get_account_snapshot() call is made here.
         """
         as_of   = self.clock.now_utc()
-        account = self.broker.get_account_snapshot()
+        account = account or self.broker.get_account_snapshot()
 
         logger.info(
-            "Account snapshot | equity=%.2f option_buying_power=%.2f "
+            "Account snapshot | equity=%.2f buying_power=%.2f "
             "positions=%d open_orders=%d",
             account.equity,
             account.option_buying_power,

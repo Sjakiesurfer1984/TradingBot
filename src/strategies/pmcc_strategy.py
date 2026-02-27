@@ -6,20 +6,20 @@ from typing import Any, Dict, List, Optional
 
 from src.config.yaml_config import PmccConfig
 from src.domain.intents import (
-    CloseLegPayload,
-    CloseSpreadPayload,
-    EnterPmccPayload,
+    OptionLegSpec,
     PositionIntent,
-    RollNearPayload,
+    RollPayload,
     SelectedOption,
+    SingleLegPayload,
+    SpreadPayload,
     TradeIntent,
 )
+from src.domain.signals import IvRegime
 from src.domain.types import OptionChainRequest, Symbol
 from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.strategies.interfaces import OptionChainConsumerABC, StrategyABC
 from src.strategies.pmcc_selector import PmccContractSelector
 from src.strategies.pmcc_state_machine import PmccState, PmccStateClassifier
-from src.domain.signals import IvRegime
 from src.utilities.logger import setup_logger
 
 logger = setup_logger("PmccStrategy")
@@ -134,7 +134,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
 
         if holdings.state == PmccState.FLAT:
             buying_power = snapshot.option_buying_power()
-            units_held = sum(
+            units_held   = sum(
                 abs(int(float(p.get("qty") or 0)))
                 for p in snapshot.positions()
                 if str(p.get("asset_class", "")).lower() == "us_option"
@@ -164,19 +164,16 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
         if holdings.state == PmccState.COVERED:
             spot = _get_spot(snapshot, sym)
 
-            # Priority 1: LEAP danger — all closes use known symbols
             for leap in holdings.leap_positions:
                 leap_strike = leap.get("derived_strike") or 0.0
                 if leap_strike > 0 and spot > 0:
                     if (spot / leap_strike) <= roll_cfg.leap_strike_danger:
                         return []
 
-            # Priority 2: LEAP roll
             for leap in holdings.leap_positions:
                 if (leap.get("derived_dte") or 999) <= roll_cfg.leap_dte_threshold:
                     return [leap_req, short_req]
 
-            # Priority 3: NEAR roll
             for near in holdings.near_positions:
                 near_dte    = near.get("derived_dte") or 999
                 near_strike = near.get("derived_strike") or 0.0
@@ -189,7 +186,7 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 if cost_basis < 0:
                     premium_received = abs(cost_basis)
                     current_cost     = abs(market_value)
-                    profit_target = self._near_profit_target(snapshot)
+                    profit_target    = self._near_profit_target(snapshot)
                     if premium_received > 0:
                         profit_captured = (premium_received - current_cost) / premium_received
                         if profit_captured >= profit_target:
@@ -209,22 +206,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
     # ------------------------------------------------------------------
 
     def _near_profit_target(self, snapshot: CycleSnapshot) -> float:
-        """
-        Return the appropriate profit target for the NEAR based on the current
-        IV regime signal in the snapshot.
-
-          HIGH IV   (IVR > 50) → near_profit_pct_high_iv   (exit early, vol compresses)
-          NORMAL IV (IVR 25-50) → near_profit_pct_normal_iv
-          LOW IV    (IVR < 25) → near_profit_pct_low_iv    (stay in, capture more decay)
-          UNKNOWN              → near_profit_pct_normal_iv (safe fallback)
-        """
         regime = snapshot.signals.iv_regime.regime
         roll   = self.config.roll
         if regime == IvRegime.HIGH:
             return roll.near_profit_pct_high_iv
         if regime == IvRegime.LOW:
             return roll.near_profit_pct_low_iv
-        return roll.near_profit_pct_normal_iv   # NORMAL or UNKNOWN
+        return roll.near_profit_pct_normal_iv
 
     def _intents_entry(self, sym: Symbol, snapshot: CycleSnapshot) -> List[TradeIntent]:
         chains    = snapshot.option_chains
@@ -269,10 +257,18 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             "PMCC entry intent CREATED | symbol=%s leap=%s near=%s spot=%.2f",
             sym_str, leap_sel.option_symbol, near_sel.option_symbol, spot,
         )
-        payload = EnterPmccPayload(
+        payload = SpreadPayload(
             underlying_symbol=sym,
-            leap=leap_sel,
-            near=near_sel,
+            leg_a=OptionLegSpec(
+                contract=leap_sel,
+                position_intent=PositionIntent.BUY_TO_OPEN,
+                role="leap",
+            ),
+            leg_b=OptionLegSpec(
+                contract=near_sel,
+                position_intent=PositionIntent.SELL_TO_OPEN,
+                role="near",
+            ),
             max_debit=self.config.risk.max_debit_per_spread_usd / 100,
         )
         return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
@@ -319,10 +315,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
 
         logger.info("NEAR sell intent | symbol=%s near=%s", sym_str, near_sel.option_symbol)
-        payload = CloseLegPayload(
+        payload = SingleLegPayload(
             underlying_symbol=sym,
-            contract=near_sel,
-            position_intent=PositionIntent.SELL_TO_OPEN,
+            leg=OptionLegSpec(
+                contract=near_sel,
+                position_intent=PositionIntent.SELL_TO_OPEN,
+                role="near",
+            ),
             qty=1,
         )
         return [TradeIntent.create(strategy_id=self.strategy_id, symbol=sym, payload=payload)]
@@ -354,30 +353,31 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                     leap_sym = str(leap.get("symbol", ""))
                     if not leap_sym:
                         continue
+                    near_sel = _make_selected(near_sym)
+                    leap_sel = _make_selected(leap_sym)
                     intents.append(TradeIntent.create(
                         strategy_id=self.strategy_id,
                         symbol=sym,
-                        payload=CloseSpreadPayload(
+                        payload=SpreadPayload(
                             underlying_symbol=sym,
-                            near=SelectedOption(
-                                option_symbol=near_sym,
-                                contract=near["_contract"],
-                            ) if "_contract" in near else _make_dummy_selected(near_sym),
-                            leap=SelectedOption(
-                                option_symbol=leap_sym,
-                                contract=leap["_contract"],
-                            ) if "_contract" in leap else _make_dummy_selected(leap_sym),
+                            leg_a=OptionLegSpec(
+                                contract=near_sel,
+                                position_intent=PositionIntent.BUY_TO_CLOSE,
+                                role="near",
+                            ),
+                            leg_b=OptionLegSpec(
+                                contract=leap_sel,
+                                position_intent=PositionIntent.SELL_TO_CLOSE,
+                                role="leap",
+                            ),
                         ),
                         tags=("danger_close",),
                     ))
             return intents
 
         # Priority 2: LEAP roll
-        leap_needs_roll = any(
-            (leap.get("derived_dte") or 999) <= roll_cfg.leap_dte_threshold
-            for leap in holdings.leap_positions
-        )
-        if leap_needs_roll:
+        if any((leap.get("derived_dte") or 999) <= roll_cfg.leap_dte_threshold
+               for leap in holdings.leap_positions):
             return self._intents_leap_roll(sym, snapshot, holdings, spot)
 
         # Priority 3: NEAR roll(s)
@@ -402,17 +402,19 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 continue
             qty = abs(int(float(leap.get("qty") or 1)))
 
-            # Close all NEARs + the expiring LEAP
             for near in holdings.near_positions:
                 near_sym = str(near.get("symbol", ""))
                 if not near_sym:
                     continue
                 intents.append(TradeIntent.create(
                     strategy_id=self.strategy_id, symbol=sym,
-                    payload=CloseLegPayload(
+                    payload=SingleLegPayload(
                         underlying_symbol=sym,
-                        contract=_make_dummy_selected(near_sym),
-                        position_intent=PositionIntent.BUY_TO_CLOSE,
+                        leg=OptionLegSpec(
+                            contract=_make_selected(near_sym),
+                            position_intent=PositionIntent.BUY_TO_CLOSE,
+                            role="near",
+                        ),
                         qty=abs(int(float(near.get("qty") or 1))),
                     ),
                     tags=("leap_roll_btc_near",),
@@ -420,31 +422,35 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
 
             intents.append(TradeIntent.create(
                 strategy_id=self.strategy_id, symbol=sym,
-                payload=CloseLegPayload(
+                payload=SingleLegPayload(
                     underlying_symbol=sym,
-                    contract=_make_dummy_selected(leap_sym),
-                    position_intent=PositionIntent.SELL_TO_CLOSE,
+                    leg=OptionLegSpec(
+                        contract=_make_selected(leap_sym),
+                        position_intent=PositionIntent.SELL_TO_CLOSE,
+                        role="leap",
+                    ),
                     qty=qty,
                 ),
                 tags=("leap_roll_stc",),
             ))
 
-            # Open new LEAP
             if leap_key:
                 new_leap = self._selector.select_leap(str(sym), list(chains[leap_key]), spot)
                 if new_leap:
                     logger.info("LEAP roll — new LEAP | symbol=%s new=%s", sym, new_leap.option_symbol)
                     intents.append(TradeIntent.create(
                         strategy_id=self.strategy_id, symbol=sym,
-                        payload=CloseLegPayload(
+                        payload=SingleLegPayload(
                             underlying_symbol=sym,
-                            contract=new_leap,
-                            position_intent=PositionIntent.BUY_TO_OPEN,
+                            leg=OptionLegSpec(
+                                contract=new_leap,
+                                position_intent=PositionIntent.BUY_TO_OPEN,
+                                role="leap",
+                            ),
                             qty=qty,
                         ),
                         tags=("leap_roll_bto",),
                     ))
-                    # Open new NEAR
                     if short_key:
                         new_near = self._selector.select_near(
                             str(sym), list(chains[short_key]),
@@ -456,10 +462,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                             logger.info("LEAP roll — new NEAR | symbol=%s new=%s", sym, new_near.option_symbol)
                             intents.append(TradeIntent.create(
                                 strategy_id=self.strategy_id, symbol=sym,
-                                payload=CloseLegPayload(
+                                payload=SingleLegPayload(
                                     underlying_symbol=sym,
-                                    contract=new_near,
-                                    position_intent=PositionIntent.SELL_TO_OPEN,
+                                    leg=OptionLegSpec(
+                                        contract=new_near,
+                                        position_intent=PositionIntent.SELL_TO_OPEN,
+                                        role="near",
+                                    ),
                                     qty=qty,
                                 ),
                                 tags=("leap_roll_sto_near",),
@@ -503,14 +512,17 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 cost_basis   = float(near.get("cost_basis")   or 0.0)
                 market_value = float(near.get("market_value") or 0.0)
                 if cost_basis < 0:
-                    premium   = abs(cost_basis)
-                    current   = abs(market_value)
+                    premium = abs(cost_basis)
+                    current = abs(market_value)
                     if premium > 0:
-                        captured = (premium - current) / premium
+                        captured      = (premium - current) / premium
                         profit_target = self._near_profit_target(snapshot)
                         if captured >= profit_target:
                             roll_near = True
-                            reason    = f"profit {captured:.1%} >= {profit_target:.1%} (regime={snapshot.signals.iv_regime.regime.value})"
+                            reason    = (
+                                f"profit {captured:.1%} >= {profit_target:.1%} "
+                                f"(regime={snapshot.signals.iv_regime.regime.value})"
+                            )
 
             if not roll_near and near_strike > 0 and spot > 0:
                 if (spot / near_strike) >= roll_cfg.near_strike_proximity:
@@ -530,13 +542,15 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             short_key = _find_key(chains, str(sym), "shorts")
             if short_key is None:
                 logger.warning("Shorts chain missing for roll | symbol=%s", sym)
-                # Emit close-only — will re-sell next cycle
                 intents.append(TradeIntent.create(
                     strategy_id=self.strategy_id, symbol=sym,
-                    payload=CloseLegPayload(
+                    payload=SingleLegPayload(
                         underlying_symbol=sym,
-                        contract=_make_dummy_selected(near_sym),
-                        position_intent=PositionIntent.BUY_TO_CLOSE,
+                        leg=OptionLegSpec(
+                            contract=_make_selected(near_sym),
+                            position_intent=PositionIntent.BUY_TO_CLOSE,
+                            role="near",
+                        ),
                         qty=1,
                     ),
                     tags=("roll_btc_only",),
@@ -552,10 +566,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
                 logger.warning("No new NEAR for roll | symbol=%s", sym)
                 intents.append(TradeIntent.create(
                     strategy_id=self.strategy_id, symbol=sym,
-                    payload=CloseLegPayload(
+                    payload=SingleLegPayload(
                         underlying_symbol=sym,
-                        contract=_make_dummy_selected(near_sym),
-                        position_intent=PositionIntent.BUY_TO_CLOSE,
+                        leg=OptionLegSpec(
+                            contract=_make_selected(near_sym),
+                            position_intent=PositionIntent.BUY_TO_CLOSE,
+                            role="near",
+                        ),
                         qty=1,
                     ),
                     tags=("roll_btc_only",),
@@ -565,10 +582,18 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             logger.info("Roll | symbol=%s btc=%s sto=%s", sym, near_sym, new_near.option_symbol)
             intents.append(TradeIntent.create(
                 strategy_id=self.strategy_id, symbol=sym,
-                payload=RollNearPayload(
+                payload=RollPayload(
                     underlying_symbol=sym,
-                    close=_make_dummy_selected(near_sym),
-                    open=new_near,
+                    close=OptionLegSpec(
+                        contract=_make_selected(near_sym),
+                        position_intent=PositionIntent.BUY_TO_CLOSE,
+                        role="near",
+                    ),
+                    open_=OptionLegSpec(
+                        contract=new_near,
+                        position_intent=PositionIntent.SELL_TO_OPEN,
+                        role="near",
+                    ),
                     max_net_debit=self.config.roll.near_max_roll_debit,
                 ),
                 tags=("roll_near",),
@@ -586,10 +611,13 @@ class PmccStrategy(StrategyABC, OptionChainConsumerABC):
             return []
         return [TradeIntent.create(
             strategy_id=self.strategy_id, symbol=sym,
-            payload=CloseLegPayload(
+            payload=SingleLegPayload(
                 underlying_symbol=sym,
-                contract=_make_dummy_selected(near_sym),
-                position_intent=PositionIntent.BUY_TO_CLOSE,
+                leg=OptionLegSpec(
+                    contract=_make_selected(near_sym),
+                    position_intent=PositionIntent.BUY_TO_CLOSE,
+                    role="near",
+                ),
                 qty=1,
             ),
         )]
@@ -613,18 +641,17 @@ def _get_spot(snapshot: CycleSnapshot, sym_str: str) -> float:
     return 0.0
 
 
-def _make_dummy_selected(option_symbol: str) -> SelectedOption:
+def _make_selected(option_symbol: str) -> SelectedOption:
     """
     Build a SelectedOption from a known OSI symbol when the full contract
     object isn't available (e.g. closing an existing position by symbol).
-    The contract fields are derived from OSI parsing; Greeks/quote not needed.
     """
     from src.domain.orders import OptionContract, OptionRight
     from src.risk.pmcc_sizer import parse_osi
     from decimal import Decimal
 
     try:
-        parsed = parse_osi(option_symbol)
+        parsed   = parse_osi(option_symbol)
         contract = OptionContract(
             underlying=parsed.underlying,
             expiry=parsed.expiry,
@@ -633,7 +660,6 @@ def _make_dummy_selected(option_symbol: str) -> SelectedOption:
             option_symbol=option_symbol,
         )
     except ValueError:
-        from datetime import datetime
         from src.domain.orders import OptionContract, OptionRight
         contract = OptionContract(
             underlying="",

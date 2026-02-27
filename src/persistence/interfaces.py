@@ -9,6 +9,8 @@ class TradeDatabaseABC(ABC):
     """
     Interface for the trade persistence layer.
 
+    Responsibility: store and retrieve trade data. Nothing else.
+
     leg_role is passed on every record_fill() call:
       'leap' — this fill opens/closes a long LEAP leg
       'near' — this fill opens/closes a short NEAR leg
@@ -43,6 +45,22 @@ class TradeDatabaseABC(ABC):
     @abstractmethod
     def get_position_roles(self, underlying: str) -> Dict[str, str]:
         """Return {osi_symbol: leg_role} for open positions where role is known."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def remove_positions(self, symbols: List[str]) -> None:
+        """
+        Delete positions by OSI symbol.
+        Called only by PositionReconcilerABC.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_db_symbols(self, underlying: str) -> List[str]:
+        """
+        Return all OSI symbols in the positions table for this underlying.
+        Called only by PositionReconcilerABC.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -99,10 +117,12 @@ class TradeDatabaseABC(ABC):
 
 class NullTradeDatabase(TradeDatabaseABC):
     """No-op implementation for tests or when persistence is disabled."""
-    def record_fill(self, **kwargs) -> int:                       return 0
+    def record_fill(self, **kwargs) -> int:                          return 0
     def get_position_roles(self, underlying: str) -> Dict[str, str]: return {}
-    def record_chain_snapshot(self, **kwargs) -> None:            pass
-    def record_equity_snapshot(self, **kwargs) -> None:           pass
-    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:        return []
-    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]: return []
-    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]: return []
+    def remove_positions(self, symbols: List[str]) -> None:          pass
+    def get_db_symbols(self, underlying: str) -> List[str]:          return []
+    def record_chain_snapshot(self, **kwargs) -> None:               pass
+    def record_equity_snapshot(self, **kwargs) -> None:              pass
+    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:           return []
+    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]:    return []
+    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]:  return []

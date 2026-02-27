@@ -29,14 +29,14 @@ class PmccShortConfig:
 
 @dataclass(frozen=True)
 class PmccRollConfig:
-    near_dte_threshold:       int    # roll the short NEAR when DTE reaches this
-    near_profit_pct_high_iv:  float  # profit target when IV regime is HIGH  (IVR > 50)
-    near_profit_pct_normal_iv: float # profit target when IV regime is NORMAL (IVR 25-50)
-    near_profit_pct_low_iv:   float  # profit target when IV regime is LOW    (IVR < 25)
-    near_strike_proximity:    float  # roll when spot / near_strike >= this ratio
-    leap_dte_threshold:       int    # rebuild the spread when LEAP DTE reaches this
-    leap_strike_danger:       float  # close everything when spot / leap_strike <= this ratio
-    near_max_roll_debit:      float  # max net debit allowed on a NEAR roll (points)
+    near_dte_threshold:        int
+    near_profit_pct_high_iv:   float
+    near_profit_pct_normal_iv: float
+    near_profit_pct_low_iv:    float
+    near_strike_proximity:     float
+    leap_dte_threshold:        int
+    leap_strike_danger:        float
+    near_max_roll_debit:       float
 
 
 @dataclass(frozen=True)
@@ -67,12 +67,21 @@ class PmccConfig:
 
 # ===========================================================================
 # StrategySpec
+#
+# underlying_symbol is declared here — on the spec, not inside PmccConfig —
+# because it is a concept shared by all strategy types. main.py reads it
+# without ever knowing which concrete strategy config is attached.
+#
+# asset_class drives calendar selection. Valid: "equity" | "crypto" | "forex".
+# Defaults to "equity" so existing configs without the field keep working.
 # ===========================================================================
 
 @dataclass(frozen=True)
 class StrategySpec:
-    name:   str
-    config: Any
+    name:              str
+    asset_class:       str   # "equity" | "crypto" | "forex"
+    underlying_symbol: str   # broker-agnostic symbol, e.g. "SPY" or "BTC/USD"
+    config:            Any
 
     @property
     def pmcc(self) -> Optional[PmccConfig]:
@@ -89,11 +98,14 @@ class BacktestConfig:
     start_date:   date
     end_date:     date
     output_dir:   Path
-    log_mode:     str   # "progress" | "verbose"
+    log_mode:     str
 
 
 # ===========================================================================
 # Strategy config parser registry
+#
+# OCP: adding a new strategy = one new parser + one registry entry.
+#      load_app_config() is never modified.
 # ===========================================================================
 
 StrategyConfigParser = Callable[[Dict[str, Any]], Any]
@@ -131,8 +143,17 @@ def _parse_pmcc_config(raw: Dict[str, Any]) -> Optional[PmccConfig]:
     )
 
 
+def _underlying_from_pmcc(raw: Dict[str, Any]) -> str:
+    return str(raw.get("pmcc", {}).get("underlying_symbol", ""))
+
+
+# Each entry: (config_parser, underlying_extractor)
 _STRATEGY_CONFIG_PARSERS: Dict[str, StrategyConfigParser] = {
     "pmcc": _parse_pmcc_config,
+}
+
+_STRATEGY_UNDERLYING_EXTRACTORS: Dict[str, Callable[[Dict[str, Any]], str]] = {
+    "pmcc": _underlying_from_pmcc,
 }
 
 
@@ -147,13 +168,13 @@ class GlobalRiskConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    config_path:          Path
-    default_dry_run:      bool
-    cycle_seconds:        float   # normal cadence — no pending orders
-    order_check_seconds:  float   # fast cadence — open order in flight
-    risk:                 GlobalRiskConfig
-    strategies:           List[StrategySpec]
-    backtest:             Optional[BacktestConfig] = None
+    config_path:         Path
+    default_dry_run:     bool
+    cycle_seconds:       float
+    order_check_seconds: float
+    risk:                GlobalRiskConfig
+    strategies:          List[StrategySpec]
+    backtest:            Optional[BacktestConfig] = None
 
 
 # ===========================================================================
@@ -165,6 +186,8 @@ _SEARCH_PATHS = [
     Path("config.yaml"),
     Path("../config/config.yaml"),
 ]
+
+_VALID_ASSET_CLASSES = {"equity", "crypto", "forex"}
 
 
 def load_app_config(path: Optional[Path] = None) -> AppConfig:
@@ -185,14 +208,40 @@ def load_app_config(path: Optional[Path] = None) -> AppConfig:
 
     strategies: List[StrategySpec] = []
     for entry in raw.get("strategies", []):
-        name   = str(entry.get("name", "")).strip().lower()
+        name        = str(entry.get("name", "")).strip().lower()
+        asset_class = str(entry.get("asset_class", "equity")).strip().lower()
+
+        if asset_class not in _VALID_ASSET_CLASSES:
+            raise ValueError(
+                f"Invalid asset_class '{asset_class}' for strategy '{name}'. "
+                f"Valid values: {sorted(_VALID_ASSET_CLASSES)}"
+            )
+
         parser = _STRATEGY_CONFIG_PARSERS.get(name)
         if parser is None:
             raise KeyError(
                 f"No config parser registered for strategy '{name}'. "
                 f"Registered: {list(_STRATEGY_CONFIG_PARSERS)}"
             )
-        strategies.append(StrategySpec(name=name, config=parser(entry)))
+
+        underlying_extractor = _STRATEGY_UNDERLYING_EXTRACTORS.get(name)
+        if underlying_extractor is None:
+            raise KeyError(
+                f"No underlying extractor registered for strategy '{name}'."
+            )
+
+        underlying = underlying_extractor(entry)
+        if not underlying:
+            raise ValueError(
+                f"Could not extract underlying_symbol for strategy '{name}'."
+            )
+
+        strategies.append(StrategySpec(
+            name=name,
+            asset_class=asset_class,
+            underlying_symbol=underlying,
+            config=parser(entry),
+        ))
 
     bt_raw         = raw.get("backtest") or {}
     _default_start = (date.today() - timedelta(days=365)).isoformat()

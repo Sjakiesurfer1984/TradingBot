@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Type
 
+from src.app.market_calendar import AlpacaMarketCalendar, MarketCalendarABC
 from src.brokers.broker_base import BrokerBase
-from src.brokers.interfaces import BrokerABC
+from src.brokers.interfaces import BrokerABC, MarketCalendarProviderABC
 from src.domain.orders import MarketOrder, MultiLegLimitOrder, OrderABC, OrderSide
 from src.domain.types import AssetQuote
 from src.orchestration.cycle_snapshot import AccountSnapshot
@@ -16,11 +17,15 @@ logger = setup_logger("AlpacaBroker")
 
 
 @dataclass
-class AlpacaBroker(BrokerABC, BrokerBase):
+class AlpacaBroker(BrokerABC, MarketCalendarProviderABC, BrokerBase):
+    # The field() specifier is used to customize each field of a data class individually. You can use it to set default values, 
+    # specify whether a field should be included in the generated __init__ method, and more. In this case, we use it 
+    # to set default values for the clock and to initialize the order handlers dictionary after the object is created.
+
     api_key:    str
     secret_key: str
-    paper:      bool     = True
-    clock:      ClockABC = field(default_factory=LiveClock)
+    paper:      bool     = True # Always defaults to true, unless explicitly set to false in config.yaml. 
+    clock:      ClockABC = field(default_factory=LiveClock) # We use field to be able to customize the default factory for the clock, allowing for easier testing with mock clocks.
 
     _trading_client: Any = field(default=None, init=False)
     _data_client:    Any = field(default=None, init=False)
@@ -28,6 +33,9 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         default_factory=dict, init=False,
     )
 
+    # post init is a special method in data classes that is called immediately after the generated __init__ method. This allows us to perform additional initialization steps, 
+    # such as setting up the trading and data clients, and populating the order handlers dictionary, 
+    # without having to override the __init__ method itself. This keeps our code cleaner and more focused on the specific initialization logic we need for the AlpacaBroker.
     def __post_init__(self) -> None:
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
@@ -45,6 +53,19 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             MarketOrder:        self._submit_market_order,
             MultiLegLimitOrder: self._submit_multileg_limit_order,
         }
+
+    # ------------------------------------------------------------------
+    # MarketCalendarProviderABC
+    # ------------------------------------------------------------------
+
+    def get_market_calendar(self) -> MarketCalendarABC:
+        """
+        Return a market calendar backed by this broker's trading client.
+
+        _trading_client never leaves this class — the calendar is
+        constructed here so no external caller ever accesses private state.
+        """
+        return AlpacaMarketCalendar(_trading_client=self._trading_client)
 
     # ------------------------------------------------------------------
     # ExecutionBrokerABC
@@ -125,7 +146,7 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
-            feed=DataFeed.IEX,  # IEX is free; SIP requires a paid subscription
+            feed=DataFeed.IEX,
         )
         return self._data_client.get_stock_bars(req)
 
@@ -146,19 +167,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch option chain with quotes and greeks via two Alpaca SDK calls:
-
-          1. TradingClient.get_option_contracts(GetOptionContractsRequest)
-             Server-side filtering by expiry/type/strike. Returns contract
-             metadata only — no quotes, no greeks.
-
-          2. OptionHistoricalDataClient.get_option_chain(OptionChainRequest)
-             Returns latest quote + greeks keyed by contract symbol.
-
-        We merge: contract list defines what passes filters, data client
-        provides prices. Contracts without live quote data are dropped.
-        """
         self._log_io_boundary("get_option_chain")
 
         from alpaca.trading.requests import GetOptionContractsRequest
@@ -168,9 +176,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
 
         sym = underlying.strip().upper()
 
-        # ------------------------------------------------------------------
-        # Step 1: contract list with server-side filters
-        # ------------------------------------------------------------------
         contract_type = None
         if include_calls and not include_puts:
             contract_type = ContractType.CALL
@@ -219,11 +224,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         contract_symbols = [str(c.symbol) for c in contracts if c.symbol]
         logger.info("Contracts fetched | sym=%s count=%d", sym, len(contract_symbols))
 
-        # ------------------------------------------------------------------
-        # Step 2: quotes + greeks from OptionHistoricalDataClient
-        # get_option_chain returns { contract_sym: Snapshot } for the whole
-        # underlying — we filter down to the contracts we care about.
-        # ------------------------------------------------------------------
         option_data_client = OptionHistoricalDataClient(
             api_key=self.api_key,
             secret_key=self.secret_key,
@@ -238,9 +238,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         except Exception as exc:
             logger.warning("get_option_chain data fetch failed for %s: %s", sym, exc)
 
-        # ------------------------------------------------------------------
-        # Merge contract list + quote data
-        # ------------------------------------------------------------------
         results: List[Dict[str, Any]] = []
         for contract_sym in contract_symbols:
             snapshot = chain_data.get(contract_sym.upper())
@@ -275,7 +272,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         )
         return results
 
-
     # ------------------------------------------------------------------
     # Order submission
     # ------------------------------------------------------------------
@@ -287,13 +283,11 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce as AlpacaTIF
 
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
-        tif  = AlpacaTIF.DAY  # always DAY for options
-
-        req = MarketOrderRequest(
+        req  = MarketOrderRequest(
             symbol=order.symbol,
             qty=order.quantity,
             side=side,
-            time_in_force=tif,
+            time_in_force=AlpacaTIF.DAY,
         )
         logger.info(
             "Submitting market order | symbol=%s side=%s qty=%d",
@@ -309,15 +303,11 @@ class AlpacaBroker(BrokerABC, BrokerBase):
 
         legs = []
         for leg in order.legs:
-            side_str = "buy" if leg.side == OrderSide.BUY else "sell"
-            # Determine position intent from contract + side
-            # BUY = BTO (opening), SELL = STO (opening) for entries
-            # For closing legs the execution policy sets position_intent
             pi = PositionIntent.BUY_TO_OPEN if leg.side == OrderSide.BUY else PositionIntent.SELL_TO_OPEN
             legs.append(OptionLegRequest(
                 symbol=leg.contract.option_symbol,
                 ratio_qty=leg.ratio,
-                side=side_str,
+                side="buy" if leg.side == OrderSide.BUY else "sell",
                 position_intent=pi,
             ))
 
@@ -335,27 +325,16 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         return self._trading_client.submit_order(req)
 
     # ------------------------------------------------------------------
-    # Dict converters — Alpaca SDK objects → plain dicts the app expects
+    # Dict converters
     # ------------------------------------------------------------------
 
     @staticmethod
     def _position_to_dict(p: Any) -> Dict[str, Any]:
         def _enum_val(v: Any) -> str:
-            """
-            Alpaca SDK returns enum objects like AssetClass.US_OPTION.
-            str(AssetClass.US_OPTION) → "AssetClass.US_OPTION" (useless).
-            getattr(v, "value", str(v)) → "us_option" (what we need).
-            The classifier and state machine always compare against lowercase
-            plain strings, so we normalise here at the boundary.
-            """
             return str(getattr(v, "value", v) or "").lower()
 
-        # qty: Alpaca returns positive for long, negative for short options.
-        # The SDK's PositionSide enum (LONG/SHORT) is on the `side` field.
-        # The classifier uses qty sign directly, so we preserve the raw number.
         qty_raw = getattr(p, "qty", 0) or 0
         side    = _enum_val(getattr(p, "side", ""))
-        # Enforce sign: LONG → positive, SHORT → negative
         try:
             qty_float = float(qty_raw)
         except (TypeError, ValueError):

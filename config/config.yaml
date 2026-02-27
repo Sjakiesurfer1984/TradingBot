@@ -1,127 +1,43 @@
 strategies:
   - name: pmcc
+    asset_class: crypto #equity   # "equity" | "crypto" | "forex"
     pmcc:
-      # The underlying equity. SPY is ideal for PMCC: deep liquidity,
-      # tight spreads, and consistent IV makes premium collection reliable.
       underlying_symbol: SPY
-
-      # Maximum number of simultaneous PMCC spreads on this underlying.
-      # Each spread = 1 LEAP + 1 short NEAR. With SPY at ~$680, one spread
-      # costs roughly $10k-$15k in buying power. 5 units = ~$50k-$75k max.
       max_units: 5
 
       leap:
-        # How far out to buy the long LEAP call.
-        # 450-560 days puts you in the flat part of the theta curve where
-        # time decay is slowest. 365 is the minimum viable but leaves less
-        # buffer — SPY can move 15-20% in a year and a 365-day LEAP gives
-        # little runway before the short threatens the long.
         dte_min: 450
         dte_max: 560
-
-        # Target delta for the LEAP. 0.80 delta means deep ITM — roughly
-        # $0.80 of movement per $1 move in SPY. This gives strong directional
-        # exposure while still benefiting from short premium collection.
-        # Range: 0.70 (cheaper, less exposure) to 0.90 (expensive, more stock-like).
         target_delta: 0.80
 
       short:
-        # How far out to sell the short NEAR call.
-        # 21-45 DTE is the sweet spot: theta decay accelerates inside 45 DTE
-        # and the position is manageable before 21 DTE gets risky.
         dte_min: 21
         dte_max: 45
-
-        # Target delta for the short NEAR. 0.20 delta means OTM — low
-        # probability of the short being tested. Lower = less premium but
-        # safer. Higher = more premium but more assignment risk.
-        # Range: 0.15 (conservative) to 0.30 (aggressive).
         target_delta: 0.20
 
       roll:
-        # Roll the short NEAR when it reaches this many days to expiry.
-        # 14 DTE avoids gamma risk (accelerating delta near expiry) while
-        # still capturing most of the premium. Use 21 DTE for more
-        # conservative management.
         near_dte_threshold: 14
-
-        # Profit target for rolling the NEAR — varies by IV regime.
-        # The IvRegimePipeline classifies the regime each cycle from IV Rank (IVR):
-        #   HIGH IV   (IVR > 50): exit early — vol will compress, don't overstay.
-        #   NORMAL IV (IVR 25-50): standard management.
-        #   LOW IV    (IVR < 25): stay in longer — premium is thin, capture more decay.
-        # If IV regime is UNKNOWN (insufficient history), normal_iv value is used.
         near_profit_pct_high_iv:   0.50
         near_profit_pct_normal_iv: 0.55
         near_profit_pct_low_iv:    0.65
-
-        # Roll when spot price reaches this fraction of the short strike.
-        # 0.95 = roll when SPY is within 5% of the short call strike.
-        # Prevents the short from going ITM and risking assignment.
         near_strike_proximity: 0.95
-
-        # Maximum net debit allowed when rolling the NEAR (points per contract).
-        # Roll cost = new_short_ask - old_short_bid. Negative = net credit (ideal).
-        # 2.00 means you'll pay at most $200/contract to roll forward.
-        # Lower this to only roll for credits; raise it if you must roll
-        # out of a tested position regardless of cost.
         near_max_roll_debit: 2.00
-
-        # Rebuild the entire spread when the LEAP reaches this many DTE.
-        # 90 DTE gives enough time to find a good replacement LEAP before
-        # theta decay accelerates and the position loses its edge.
         leap_dte_threshold: 90
-
-        # Emergency close: liquidate the entire spread when spot drops to
-        # this fraction of the LEAP strike. 0.90 = close everything if SPY
-        # falls to within 10% of the LEAP strike. At that point the spread
-        # risks going underwater and the theta advantage disappears.
         leap_strike_danger: 0.90
 
       liquidity:
-        # Maximum bid-ask spread as a fraction of ask price.
-        # Rejects contracts where the spread is too wide to fill cleanly.
-        # 0.10 = allow up to 10% spread. LEAPs are naturally less liquid
-        # than NEARs so 0.10 is permissive but necessary for deep ITM
-        # long-dated SPY calls. Tighten to 0.05 for NEARs if desired.
         max_leap_spread_pct: 0.10
         max_near_spread_pct: 0.10
 
       risk:
-        # Maximum fraction of option buying power to deploy per entry.
-        # 0.50 = use at most 50% of available buying power for one spread.
         max_buying_power_fraction: 0.50
-
-        # Hard ceiling on net debit per spread in USD.
-        # At SPY ~$680, a 0.80-delta LEAP costs ~$12,000-$15,000/contract.
-        # 50000 is permissive — tighten this to your actual per-spread budget.
         max_debit_per_spread_usd: 50000
-
-        # Maximum contracts per single entry intent.
-        # The sizer may request more if buying power allows — this caps it.
         max_contracts_per_intent: 3
-
-        # Multiply the theoretical fill price by this to account for slippage.
-        # 1.05 = assume you pay 5% more than mid-price. Makes sizing conservative.
         slippage_factor: 1.05
-
-        # Skip bid-ask spread liquidity checks during contract selection.
-        # false = enforce max_leap/near_spread_pct (recommended for live trading).
-        # true = accept any contract regardless of spread (testing only).
         ignore_spread_checks: false
 
-# Run the full pipeline but skip broker.submit_order(). Safe for testing.
-# Set to false when ready to trade live.
 default_dry_run: false
 
-# Two-speed cycle:
-#   cycle_seconds       — normal cadence when no orders are in flight.
-#                         5 min is plenty for PMCC/Wheel — DTE, IV regime,
-#                         and delta all move on the timescale of hours.
-#   order_check_seconds — fast cadence when an open order exists.
-#                         Check more often to detect fills quickly so the
-#                         state machine transitions correctly (PENDING → COVERED).
-#                         Once open_orders is empty, drops back to cycle_seconds.
 cycle_seconds: 300
 order_check_seconds: 30
 
@@ -130,4 +46,4 @@ backtest:
   start_date: "2025-02-24"
   end_date:   "2025-03-02"
   output_dir: backtest_results
-  log_mode: verbose  # "progress" = summary only | "verbose" = full logs
+  log_mode: verbose

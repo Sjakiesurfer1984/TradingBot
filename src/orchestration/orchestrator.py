@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.intents import TradeIntent
@@ -35,25 +35,30 @@ class TradingOrchestrator:
     """
     Fixed cycle skeleton — all steps delegated to composed parts.
 
-    db         — enriches the snapshot with position roles (cycle coordination).
-    reconciler — prunes phantom DB rows before roles are read (ISP-compliant
-                 separation: live wires LivePositionReconciler, backtest wires
-                 NullPositionReconciler).
+    Two execution paths:
 
-    Fill recording is the ExecutionPolicy's responsibility.
+    FAST PATH (pending orders in flight):
+        One broker call — get_account_snapshot() only.
+        If open_orders is still non-empty, return immediately.
+        Cost: ~1 API call, ~100ms.
+        No quotes, no bars, no IV pipeline, no chain fetches, no intents.
 
-    Cycle sequence:
-      1.  Collect universe
-      2.  Build snapshot (account + quotes)
-      3.  Reconcile DB positions against live broker positions
-      4.  Enrich snapshot with position roles from DB
-      5.  Compute signals
-      6.  Collect chain requests from strategies
-      7.  Add option chains to snapshot
-      8.  generate_intents from each strategy
-      9.  RiskEngine.evaluate
-      10. ExecutionPolicy.to_orders (also records fills in DB)
-      11. broker.submit_order — skipped if dry_run
+        When orders clear (open_orders becomes empty), the fast path
+        falls through to the full cycle on the same call. The transition
+        is instant — no extra cycle is wasted.
+
+    FULL CYCLE (no pending orders):
+        1.  Collect universe
+        2.  Build snapshot (account + quotes)
+        3.  Reconcile DB positions against live broker positions
+        4.  Enrich snapshot with position roles from DB
+        5.  Compute signals
+        6.  Collect chain requests from strategies
+        7.  Add option chains to snapshot
+        8.  generate_intents from each strategy
+        9.  RiskEngine.evaluate
+        10. ExecutionPolicy.to_orders (also records fills in DB)
+        11. broker.submit_order — skipped if dry_run
     """
 
     broker:           BrokerABC
@@ -62,15 +67,49 @@ class TradingOrchestrator:
     execution_policy: ExecutionPolicyABC
     snapshot_builder: CycleSnapshotBuilder
     signal_pipeline:  SignalPipelineABC
-    dry_run:          bool                   = False
-    db:               TradeDatabaseABC       = field(default_factory=NullTradeDatabase)
-    reconciler:       PositionReconcilerABC  = field(default_factory=NullPositionReconciler)
+    dry_run:          bool                  = False
+    db:               TradeDatabaseABC      = field(default_factory=NullTradeDatabase)
+    reconciler:       PositionReconcilerABC = field(default_factory=NullPositionReconciler)
 
     def run_cycle(self) -> CycleRunResult:
         with log_scope("orchestrator.run_cycle", logger):
+
+            # ----------------------------------------------------------
+            # FAST PATH — poll for order fills cheaply
+            #
+            # One API call. If orders are still in flight, skip everything
+            # and return. The scheduler will call us again in
+            # order_check_seconds (default 30s).
+            #
+            # When orders clear, fall through to the full cycle immediately
+            # on the same invocation — no cycle is wasted on the transition.
+            # ----------------------------------------------------------
+            account = self.broker.get_account_snapshot()
+            if account.open_orders:
+                logger.info(
+                    "Orders pending — skipping full cycle | open_orders=%d",
+                    len(account.open_orders),
+                )
+                return CycleRunResult(
+                    orders_submitted=0,
+                    intents_generated=0,
+                    intents_approved=0,
+                    intents_rejected=0,
+                    has_pending_orders=True,
+                )
+
+            # ----------------------------------------------------------
+            # FULL CYCLE
+            # ----------------------------------------------------------
             universe = self._collect_universe()
 
-            snapshot = self.snapshot_builder.build_snapshot(universe=universe)
+            # Reuse the account snapshot we already fetched above.
+            # snapshot_builder.build_snapshot() would call get_account_snapshot()
+            # again — we avoid that double call by passing the result through.
+            snapshot = self.snapshot_builder.build_snapshot(
+                universe=universe,
+                account=account,
+            )
             self._reconcile(snapshot, universe)
             snapshot = self._enrich_position_roles(snapshot, universe)
             signals  = self.signal_pipeline.compute(snapshot)
@@ -86,7 +125,7 @@ class TradingOrchestrator:
             orders    = self.execution_policy.to_orders(approvals=decisions.approved)
             submitted = self._submit_orders(orders)
 
-        pending = len(snapshot.account.open_orders) > 0 or submitted > 0
+        pending = submitted > 0
         return CycleRunResult(
             orders_submitted=submitted,
             intents_generated=len(intents),
@@ -112,12 +151,6 @@ class TradingOrchestrator:
         snapshot: CycleSnapshot,
         universe: List[Symbol],
     ) -> None:
-        """
-        For each underlying, extract live broker symbols from the already-fetched
-        AccountSnapshot and call the reconciler to prune any phantom DB rows.
-
-        Zero extra broker calls — we reuse positions already in memory.
-        """
         all_positions = snapshot.account.positions
         for sym in universe:
             ul = str(sym).upper()
@@ -134,13 +167,6 @@ class TradingOrchestrator:
         snapshot: CycleSnapshot,
         universe: List[Symbol],
     ) -> CycleSnapshot:
-        """
-        Fetch position roles from the DB for every symbol in the universe
-        and attach them to the snapshot.
-
-        Strategies read snapshot.get_position_roles(sym) — they never
-        touch the DB directly, keeping strategy concerns pure.
-        """
         roles: Dict[str, Dict[str, str]] = {}
         for sym in universe:
             sym_str = str(sym).upper()

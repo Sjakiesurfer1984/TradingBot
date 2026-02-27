@@ -47,7 +47,7 @@ strategies:
     pmcc:
       # The underlying equity. SPY is ideal for PMCC: deep liquidity,
       # tight spreads, and consistent IV makes premium collection reliable.
-      underlying_symbol: SPY
+      underlying_symbol: BTC/USD #SPY
 
       # Maximum number of simultaneous PMCC spreads on this underlying.
       # Each spread = 1 LEAP + 1 short NEAR. With SPY at ~$680, one spread
@@ -134,12 +134,12 @@ strategies:
       risk:
         # Maximum fraction of option buying power to deploy per entry.
         # 0.50 = use at most 50% of available buying power for one spread.
-        max_buying_power_fraction: 0.50
+        max_buying_power_fraction: 1 # 0.50
 
         # Hard ceiling on net debit per spread in USD.
         # At SPY ~$680, a 0.80-delta LEAP costs ~$12,000-$15,000/contract.
-        # 50000 is permissive — tighten this to your actual per-spread budget.
-        max_debit_per_spread_usd: 50000
+        # 500000 is permissive — tighten this to your actual per-spread budget.
+        max_debit_per_spread_usd: 500000
 
         # Maximum contracts per single entry intent.
         # The sizer may request more if buying power allows — this caps it.
@@ -219,8 +219,10 @@ import sys
 from pathlib import Path
 
 from src.app.container import build_settings_runtime
+from src.app.market_calendar import AlwaysOpenMarketCalendar
 from src.app.scheduler import Scheduler, SchedulerConfig
 from src.brokers.factory import BrokerFactoryFacade
+from src.brokers.interfaces import MarketCalendarProviderABC
 from src.brokers.registry import AlpacaBrokerBuilder, BrokerBuilderRegistry
 from src.domain.intents import (
     CloseLegPayload,
@@ -232,6 +234,7 @@ from src.execution.default_execution_policy import DefaultExecutionPolicy
 from src.orchestration.cycle_snapshot_builder import CycleSnapshotBuilder
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.persistence.interfaces import NullTradeDatabase
+from src.persistence.reconciler import LivePositionReconciler
 from src.persistence.trade_database import TradeDatabase
 from src.risk.evaluators import PmccEvaluator, _EnterPmccApproved
 from src.risk.pmcc_sizer import PmccSizer, PmccSizingConfig
@@ -247,11 +250,9 @@ logger = setup_logger("Main")
 _DEFAULT_DB_PATH = Path("data/trades.db")
 
 # ---------------------------------------------------------------------------
-# Strategy registry — plain dict, no ABC, no plugin class.
-# Each entry: { "build": Callable[[StrategySpec], StrategyABC],
-#               "register": Callable[[StrategySpec, RiskEngine]] }
-# Add a new strategy by adding one entry here.
+# Strategy registry
 # ---------------------------------------------------------------------------
+
 def _pmcc_build(spec):
     return PmccStrategy(config=spec.pmcc)
 
@@ -267,9 +268,6 @@ def _pmcc_register(spec, engine: RiskEngine) -> None:
         sizer=PmccSizer(config=sizing_cfg),
         max_units=spec.pmcc.max_units,
     )
-    # Register the evaluator for all PMCC payload types.
-    # _EnterPmccApproved is the internal sizing output — the evaluator
-    # already wraps it, but we register the source type for dispatch.
     engine.register(EnterPmccPayload,    evaluator)
     engine.register(RollNearPayload,     evaluator)
     engine.register(CloseLegPayload,     evaluator)
@@ -291,6 +289,31 @@ def main() -> int:
     broker = _build_broker(settings.env_cfg)
     db     = _build_database()
 
+    # If the broker supports market hours queries, use it.
+    # Otherwise fall back to AlwaysOpen (safe default — never silently skips cycles).
+    # If we wanted to test the scheduler's market hours guard logic, we could inject a mock calendar here that simulates open and closed markets at different times.
+    # Or we simply don't provide a calendar and rely on the AlwaysOpen default, which means the scheduler will never skip cycles due to market hours. 
+    # This is a safe default for testing and development, but in production you should provide a real calendar that reflects your market's hours.
+    
+    # the logic of isinstance() check is as follows: the first argument is the object we want to check (broker), and the second argument is the type or class we want to check against (MarketCalendarProviderABC). 
+    # If broker is an instance of MarketCalendarProviderABC, it means that it implements the get_market_calendar() method, which returns a MarketCalendarABC instance that we can use to check market hours. 
+    # If broker does not implement MarketCalendarProviderABC, then we fall back to using AlwaysOpenMarketCalendar, which means the scheduler will never skip cycles due to market hours. 
+    # This is a safe default for testing and development, but in production you should provide a real calendar that reflects your market's hours.
+    # and how can broker even be an instanc of MarketCalendarProviderABC if it's supposed to be a BrokerABC? well, it's possible that some brokers also 
+    # implement the MarketCalendarProviderABC interface, which means they have both the broker functionality and the ability to provide a market calendar. 
+    # In that case, we can use the same broker instance to get the market calendar. If the broker does not implement MarketCalendarProviderABC, then we simply use the AlwaysOpenMarketCalendar 
+    # as a fallback. This design allows for flexibility in how we obtain market calendar information, while still providing a safe default for cases where it's not available.
+    calendar = (
+        broker.get_market_calendar()
+        if isinstance(broker, MarketCalendarProviderABC) # isinstance check to see if the broker implements the MarketCalendarProviderABC interface, 
+        # which means it has a get_market_calendar() method that returns a MarketCalendarABC instance. If it does, we use that calendar to check market hours. 
+        # If not, we fall back to the AlwaysOpenMarketCalendar, which means the scheduler will never skip cycles due to market hours. 
+        # This is a safe default for testing and development, but in production you should provide a real calendar that reflects your market's hours.
+        else AlwaysOpenMarketCalendar()
+    )
+    # comment out the below to disable the the AlwaysOpenMarketCalendar.
+    calendar = AlwaysOpenMarketCalendar()
+
     strategies  = _build_strategies(app_cfg.strategies)
     risk_engine = _build_risk_engine(app_cfg)
 
@@ -300,14 +323,22 @@ def main() -> int:
         risk_engine=risk_engine,
         execution_policy=DefaultExecutionPolicy(db=db, dry_run=app_cfg.default_dry_run),
         snapshot_builder=CycleSnapshotBuilder(broker=broker, clock=clock),
-        signal_pipeline=IvRegimePipelineWithBars(underlying=app_cfg.strategies[0].pmcc.underlying_symbol, broker=broker),
+        signal_pipeline=IvRegimePipelineWithBars(
+            underlying=app_cfg.strategies[0].pmcc.underlying_symbol,
+            broker=broker,
+        ),
         dry_run=app_cfg.default_dry_run,
         db=db,
+        reconciler=LivePositionReconciler(db=db),
     )
 
     scheduler = Scheduler(
         orchestrator=orchestrator,
-        config=SchedulerConfig(cycle_seconds=app_cfg.cycle_seconds, order_check_seconds=app_cfg.order_check_seconds),
+        config=SchedulerConfig(
+            cycle_seconds=app_cfg.cycle_seconds,
+            order_check_seconds=app_cfg.order_check_seconds,
+        ),
+        calendar=calendar,
     )
     scheduler.run()
     return 0
@@ -363,14 +394,123 @@ if __name__ == "__main__":
     sys.exit(main())
 
 ============================================================
+FILE: .\src\app\market_calendar.py
+============================================================
+
+from __future__ import annotations
+
+"""
+src/app/market_calendar.py
+---------------------------
+Market hours abstraction for the scheduler.
+
+SRP:  knows only whether the market is open and when it opens next.
+ISP:  scheduler only calls is_open() and seconds_until_open() — nothing else.
+OCP:  new calendar implementations (e.g. for crypto 24/7, or a test stub)
+      require no changes to the scheduler.
+
+Implementations:
+  AlpacaMarketCalendar  — asks Alpaca's /v2/clock endpoint in real time.
+  AlwaysOpenMarketCalendar — no-op for backtests (market is always open).
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from src.utilities.logger import setup_logger
+
+logger = setup_logger("MarketCalendar")
+
+
+class MarketCalendarABC(ABC):
+
+    @abstractmethod
+    def is_open(self) -> bool:
+        """Return True if the market is currently open for trading."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def seconds_until_open(self) -> float:
+        """
+        Return the number of seconds until the next market open.
+        Returns 0 if the market is currently open.
+        """
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class AlpacaMarketCalendar(MarketCalendarABC):
+    """
+    Queries Alpaca's /v2/clock endpoint for real-time market status.
+
+    Alpaca's clock response includes:
+      is_open     — bool, whether the market is currently open
+      next_open   — datetime of the next market open (UTC)
+      next_close  — datetime of the next market close (UTC)
+
+    One API call per scheduler check. This is cheap — it's a lightweight
+    endpoint with no market data involved.
+    """
+
+    _trading_client: Any  # alpaca.trading.client.TradingClient
+
+    def is_open(self) -> bool:
+        try:
+            clock = self._trading_client.get_clock()
+            open_ = bool(clock.is_open)
+            logger.debug(
+                "Market clock | is_open=%s next_open=%s next_close=%s",
+                open_, clock.next_open, clock.next_close,
+            )
+            return open_
+        except Exception:
+            logger.exception("Failed to fetch market clock — assuming closed")
+            return False
+
+    def seconds_until_open(self) -> float:
+        try:
+            clock    = self._trading_client.get_clock()
+            if clock.is_open:
+                return 0.0
+            now_utc  = datetime.now(timezone.utc)
+            next_open = clock.next_open
+            # alpaca-py returns a timezone-aware datetime
+            if next_open.tzinfo is None:
+                next_open = next_open.replace(tzinfo=timezone.utc)
+            delta = (next_open - now_utc).total_seconds()
+            return max(0.0, delta)
+        except Exception:
+            logger.exception(
+                "Failed to fetch market clock for next open — "
+                "defaulting to 60s retry"
+            )
+            return 60.0
+
+
+class AlwaysOpenMarketCalendar(MarketCalendarABC):
+    """
+    No-op calendar for backtests and unit tests.
+    The backtest controls time directly — market hours are irrelevant.
+    """
+
+    def is_open(self) -> bool:
+        return True
+
+    def seconds_until_open(self) -> float:
+        return 0.0
+
+============================================================
 FILE: .\src\app\scheduler.py
 ============================================================
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from src.app.market_calendar import AlwaysOpenMarketCalendar, MarketCalendarABC
 from src.orchestration.orchestrator import TradingOrchestrator
 from src.utilities.logger import setup_logger
 
@@ -379,39 +519,40 @@ logger = setup_logger("Scheduler")
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    cycle_seconds:       float = 300.0  # normal cadence — no pending orders
-    order_check_seconds: float = 30.0   # fast cadence — open order in flight
-    max_cycles:          int   = 0      # 0 = run forever
+    cycle_seconds:       float = 300.0   # normal cadence — no pending orders
+    order_check_seconds: float = 30.0    # fast cadence — open order in flight
+    max_cycles:          int   = 0       # 0 = run forever
 
 
 @dataclass
 class Scheduler:
     """
-    Two-speed scheduler for TradingOrchestrator.
+    Two-speed scheduler for TradingOrchestrator with market hours guard.
+
+    Market hours guard:
+        Before each cycle, the scheduler asks the MarketCalendarABC whether
+        the market is open. If it is closed, the scheduler sleeps until the
+        next open (reported by the calendar) rather than running a cycle.
+        This prevents phantom DB writes and wasted API calls outside trading
+        hours — and means it does not matter if the bot is left running
+        overnight or over a weekend.
 
     Normal cadence (cycle_seconds, default 300s / 5 min):
-        Used when no orders are in flight. PMCC decisions are driven by
-        DTE, IV regime, and delta — all of which move on the timescale
-        of hours, not seconds. Polling faster wastes API quota and burns
-        through option chain fetch time for no benefit.
+        Used when no orders are in flight.
 
     Fast cadence (order_check_seconds, default 30s):
-        Used when the previous cycle submitted an order OR the account
-        snapshot shows open orders. We want to detect fills quickly so
-        the state machine transitions correctly (e.g. PENDING → COVERED).
-        Once open_orders is empty the scheduler drops back to normal cadence.
-
-    The speed decision is made from CycleRunResult.has_pending_orders,
-    which the orchestrator populates from snapshot.account.open_orders
-    plus whether any orders were submitted this cycle.
+        Used when orders are pending. Drops back to normal once clear.
     """
 
     orchestrator: TradingOrchestrator
     config:       SchedulerConfig
+    calendar:     MarketCalendarABC = field(
+        default_factory=AlwaysOpenMarketCalendar # default to always-open calendar if not provided, meaning the scheduler will never skip cycles due to market hours. This is a safe default for testing and development, but in production you should provide a real calendar that reflects your market's hours.
+    )
 
     def run(self) -> None:
-        cycle_count  = 0
-        fast_mode    = False
+        cycle_count = 0
+        fast_mode   = False
 
         logger.info(
             "Scheduler started | cycle_seconds=%.0f order_check_seconds=%.0f",
@@ -421,10 +562,28 @@ class Scheduler:
 
         while True:
             try:
-                result      = self.orchestrator.run_cycle()
+                # ----------------------------------------------------------
+                # Market hours guard — skip cycle entirely if market is closed
+                # ----------------------------------------------------------
+                if not self.calendar.is_open():
+                    wait = self.calendar.seconds_until_open()
+                    hours, remainder = divmod(int(wait), 3600)
+                    minutes          = remainder // 60
+                    logger.info(
+                        "Market closed — sleeping %.0fs until next open "
+                        "(%dh %02dm)",
+                        wait, hours, minutes,
+                    )
+                    # Sleep in chunks so KeyboardInterrupt is still responsive
+                    _interruptible_sleep(wait)
+                    continue
+
+                # ----------------------------------------------------------
+                # Normal cycle
+                # ----------------------------------------------------------
+                result       = self.orchestrator.run_cycle()
                 cycle_count += 1
 
-                # Decide next sleep interval based on whether orders are pending
                 prev_fast = fast_mode
                 fast_mode = result.has_pending_orders
                 sleep_for = (
@@ -432,7 +591,6 @@ class Scheduler:
                     else self.config.cycle_seconds
                 )
 
-                # Log speed transitions so they're visible in logs
                 if fast_mode and not prev_fast:
                     logger.info(
                         "Scheduler → FAST mode | open orders detected — "
@@ -457,19 +615,26 @@ class Scheduler:
                     sleep_for,
                 )
 
+                _interruptible_sleep(sleep_for)
+
             except KeyboardInterrupt:
                 logger.info("Scheduler interrupted — shutting down")
                 break
             except Exception:
                 logger.exception("Unhandled exception in cycle %d", cycle_count + 1)
-                # On unexpected error, use normal cadence — don't hammer the API
-                sleep_for = self.config.cycle_seconds
+                _interruptible_sleep(self.config.cycle_seconds)
 
-            if self.config.max_cycles > 0 and cycle_count >= self.config.max_cycles:
-                logger.info("Max cycles reached (%d) — stopping", self.config.max_cycles)
-                break
 
-            time.sleep(sleep_for)
+def _interruptible_sleep(seconds: float, chunk: float = 5.0) -> None:
+    """
+    Sleep for `seconds` total, waking every `chunk` seconds.
+    This keeps KeyboardInterrupt responsive even during long waits
+    (e.g. sleeping until next market open several hours away).
+    """
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(min(chunk, remaining))
+        remaining -= chunk
 
 ============================================================
 FILE: .\src\app\__init__.py
@@ -1822,8 +1987,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Type
 
+from src.app.market_calendar import AlpacaMarketCalendar, MarketCalendarABC
 from src.brokers.broker_base import BrokerBase
-from src.brokers.interfaces import BrokerABC
+from src.brokers.interfaces import BrokerABC, MarketCalendarProviderABC
 from src.domain.orders import MarketOrder, MultiLegLimitOrder, OrderABC, OrderSide
 from src.domain.types import AssetQuote
 from src.orchestration.cycle_snapshot import AccountSnapshot
@@ -1834,11 +2000,15 @@ logger = setup_logger("AlpacaBroker")
 
 
 @dataclass
-class AlpacaBroker(BrokerABC, BrokerBase):
+class AlpacaBroker(BrokerABC, MarketCalendarProviderABC, BrokerBase):
+    # The field() specifier is used to customize each field of a data class individually. You can use it to set default values, 
+    # specify whether a field should be included in the generated __init__ method, and more. In this case, we use it 
+    # to set default values for the clock and to initialize the order handlers dictionary after the object is created.
+
     api_key:    str
     secret_key: str
-    paper:      bool     = True
-    clock:      ClockABC = field(default_factory=LiveClock)
+    paper:      bool     = True # Always defaults to true, unless explicitly set to false in config.yaml. 
+    clock:      ClockABC = field(default_factory=LiveClock) # We use field to be able to customize the default factory for the clock, allowing for easier testing with mock clocks.
 
     _trading_client: Any = field(default=None, init=False)
     _data_client:    Any = field(default=None, init=False)
@@ -1846,6 +2016,9 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         default_factory=dict, init=False,
     )
 
+    # post init is a special method in data classes that is called immediately after the generated __init__ method. This allows us to perform additional initialization steps, 
+    # such as setting up the trading and data clients, and populating the order handlers dictionary, 
+    # without having to override the __init__ method itself. This keeps our code cleaner and more focused on the specific initialization logic we need for the AlpacaBroker.
     def __post_init__(self) -> None:
         from alpaca.trading.client import TradingClient
         from alpaca.data.historical import StockHistoricalDataClient
@@ -1863,6 +2036,19 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             MarketOrder:        self._submit_market_order,
             MultiLegLimitOrder: self._submit_multileg_limit_order,
         }
+
+    # ------------------------------------------------------------------
+    # MarketCalendarProviderABC
+    # ------------------------------------------------------------------
+
+    def get_market_calendar(self) -> MarketCalendarABC:
+        """
+        Return a market calendar backed by this broker's trading client.
+
+        _trading_client never leaves this class — the calendar is
+        constructed here so no external caller ever accesses private state.
+        """
+        return AlpacaMarketCalendar(_trading_client=self._trading_client)
 
     # ------------------------------------------------------------------
     # ExecutionBrokerABC
@@ -1943,7 +2129,7 @@ class AlpacaBroker(BrokerABC, BrokerBase):
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
-            feed=DataFeed.IEX,  # IEX is free; SIP requires a paid subscription
+            feed=DataFeed.IEX,
         )
         return self._data_client.get_stock_bars(req)
 
@@ -1964,19 +2150,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         root_symbol:         Optional[str]   = None,
         updated_since:       Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetch option chain with quotes and greeks via two Alpaca SDK calls:
-
-          1. TradingClient.get_option_contracts(GetOptionContractsRequest)
-             Server-side filtering by expiry/type/strike. Returns contract
-             metadata only — no quotes, no greeks.
-
-          2. OptionHistoricalDataClient.get_option_chain(OptionChainRequest)
-             Returns latest quote + greeks keyed by contract symbol.
-
-        We merge: contract list defines what passes filters, data client
-        provides prices. Contracts without live quote data are dropped.
-        """
         self._log_io_boundary("get_option_chain")
 
         from alpaca.trading.requests import GetOptionContractsRequest
@@ -1986,9 +2159,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
 
         sym = underlying.strip().upper()
 
-        # ------------------------------------------------------------------
-        # Step 1: contract list with server-side filters
-        # ------------------------------------------------------------------
         contract_type = None
         if include_calls and not include_puts:
             contract_type = ContractType.CALL
@@ -2037,11 +2207,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         contract_symbols = [str(c.symbol) for c in contracts if c.symbol]
         logger.info("Contracts fetched | sym=%s count=%d", sym, len(contract_symbols))
 
-        # ------------------------------------------------------------------
-        # Step 2: quotes + greeks from OptionHistoricalDataClient
-        # get_option_chain returns { contract_sym: Snapshot } for the whole
-        # underlying — we filter down to the contracts we care about.
-        # ------------------------------------------------------------------
         option_data_client = OptionHistoricalDataClient(
             api_key=self.api_key,
             secret_key=self.secret_key,
@@ -2056,9 +2221,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         except Exception as exc:
             logger.warning("get_option_chain data fetch failed for %s: %s", sym, exc)
 
-        # ------------------------------------------------------------------
-        # Merge contract list + quote data
-        # ------------------------------------------------------------------
         results: List[Dict[str, Any]] = []
         for contract_sym in contract_symbols:
             snapshot = chain_data.get(contract_sym.upper())
@@ -2093,7 +2255,6 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         )
         return results
 
-
     # ------------------------------------------------------------------
     # Order submission
     # ------------------------------------------------------------------
@@ -2105,13 +2266,11 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         from alpaca.trading.enums import OrderSide as AlpacaSide, TimeInForce as AlpacaTIF
 
         side = AlpacaSide.BUY if order.side == OrderSide.BUY else AlpacaSide.SELL
-        tif  = AlpacaTIF.DAY  # always DAY for options
-
-        req = MarketOrderRequest(
+        req  = MarketOrderRequest(
             symbol=order.symbol,
             qty=order.quantity,
             side=side,
-            time_in_force=tif,
+            time_in_force=AlpacaTIF.DAY,
         )
         logger.info(
             "Submitting market order | symbol=%s side=%s qty=%d",
@@ -2127,15 +2286,11 @@ class AlpacaBroker(BrokerABC, BrokerBase):
 
         legs = []
         for leg in order.legs:
-            side_str = "buy" if leg.side == OrderSide.BUY else "sell"
-            # Determine position intent from contract + side
-            # BUY = BTO (opening), SELL = STO (opening) for entries
-            # For closing legs the execution policy sets position_intent
             pi = PositionIntent.BUY_TO_OPEN if leg.side == OrderSide.BUY else PositionIntent.SELL_TO_OPEN
             legs.append(OptionLegRequest(
                 symbol=leg.contract.option_symbol,
                 ratio_qty=leg.ratio,
-                side=side_str,
+                side="buy" if leg.side == OrderSide.BUY else "sell",
                 position_intent=pi,
             ))
 
@@ -2153,27 +2308,16 @@ class AlpacaBroker(BrokerABC, BrokerBase):
         return self._trading_client.submit_order(req)
 
     # ------------------------------------------------------------------
-    # Dict converters — Alpaca SDK objects → plain dicts the app expects
+    # Dict converters
     # ------------------------------------------------------------------
 
     @staticmethod
     def _position_to_dict(p: Any) -> Dict[str, Any]:
         def _enum_val(v: Any) -> str:
-            """
-            Alpaca SDK returns enum objects like AssetClass.US_OPTION.
-            str(AssetClass.US_OPTION) → "AssetClass.US_OPTION" (useless).
-            getattr(v, "value", str(v)) → "us_option" (what we need).
-            The classifier and state machine always compare against lowercase
-            plain strings, so we normalise here at the boundary.
-            """
             return str(getattr(v, "value", v) or "").lower()
 
-        # qty: Alpaca returns positive for long, negative for short options.
-        # The SDK's PositionSide enum (LONG/SHORT) is on the `side` field.
-        # The classifier uses qty sign directly, so we preserve the raw number.
         qty_raw = getattr(p, "qty", 0) or 0
         side    = _enum_val(getattr(p, "side", ""))
-        # Enforce sign: LONG → positive, SHORT → negative
         try:
             qty_float = float(qty_raw)
         except (TypeError, ValueError):
@@ -2400,15 +2544,6 @@ class ExecutionBrokerABC(ABC):
 
     @abstractmethod
     def get_account_snapshot(self) -> AccountSnapshot:
-        """
-        Return a typed snapshot of all account state in one call.
-
-        Covers: equity, cash, option_buying_power, positions, open_orders.
-
-        CycleSnapshotBuilder calls this once per cycle — no separate
-        get_equity(), get_positions(), get_open_orders() calls needed.
-        All downstream code reads typed AccountSnapshot fields.
-        """
         raise NotImplementedError
 
     @abstractmethod
@@ -2420,136 +2555,22 @@ class ExecutionBrokerABC(ABC):
         raise NotImplementedError
 
 
+class MarketCalendarProviderABC(ABC):
+    """
+    ISP-compliant interface for brokers that can report market hours.
+
+    Kept separate from BrokerABC so backtest brokers, which control time
+    directly and have no concept of market open/close, are not forced to
+    implement it. Only live brokers (e.g. AlpacaBroker) implement this.
+    """
+
+    @abstractmethod
+    def get_market_calendar(self) -> "MarketCalendarABC":  # noqa: F821
+        raise NotImplementedError
+
+
 class BrokerABC(MarketDataProviderABC, ExecutionBrokerABC, ABC):
     """Full broker — composition of market data + execution."""
-
-
-class TradeDatabaseABC(ABC):
-    """
-    Interface for the trade persistence layer.
-
-    Responsibility: store and retrieve trade data. Nothing else.
-
-    leg_role is passed on every record_fill() call:
-      'leap' — this fill opens/closes a long LEAP leg
-      'near' — this fill opens/closes a short NEAR leg
-      ''     — unknown or not applicable
-
-    get_position_roles() is the primary source of truth for the state
-    classifier. The classifier reads this first and falls back to DTE
-    heuristics only for symbols with role=''.
-    """
-
-    @abstractmethod
-    def record_fill(
-        self,
-        *,
-        action:          str,
-        symbol:          str,
-        underlying:      str,
-        qty:             int,
-        fill_price:      float,
-        fill_date:       date,
-        expiry:          Optional[date],
-        strike:          Optional[float],
-        option_right:    Optional[str],
-        cost_basis_usd:  float,
-        leg_role:        str = "",
-        brokerage_fee:   float = 0.0,
-        usd_aud_rate:    Optional[float] = None,
-        notes:           str = "",
-    ) -> int:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_position_roles(self, underlying: str) -> Dict[str, str]:
-        """Return {osi_symbol: leg_role} for open positions where role is known."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def remove_positions(self, symbols: List[str]) -> None:
-        """
-        Delete positions by OSI symbol.
-
-        Called only by PositionReconcilerABC — not by strategies or the orchestrator
-        directly. Keeps the mutation path narrow and testable in isolation.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_db_symbols(self, underlying: str) -> List[str]:
-        """
-        Return all OSI symbols currently in the positions table for this underlying.
-
-        Called only by PositionReconcilerABC to compute the diff against live
-        broker positions. Kept separate from get_position_roles() so the
-        reconciler can see all symbols, including those with role=''.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def record_chain_snapshot(
-        self,
-        *,
-        snapshot_date: date,
-        underlying:    str,
-        contracts:     List[Dict[str, Any]],
-    ) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def record_equity_snapshot(
-        self,
-        *,
-        snapshot_date:       date,
-        equity:              float,
-        cash:                float,
-        option_buying_power: float,
-        open_positions:      int,
-    ) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_fills(
-        self,
-        *,
-        from_date:  Optional[date] = None,
-        to_date:    Optional[date] = None,
-        underlying: Optional[str]  = None,
-        action:     Optional[str]  = None,
-    ) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_equity_curve(
-        self,
-        *,
-        from_date: Optional[date] = None,
-        to_date:   Optional[date] = None,
-    ) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_chain_snapshot(
-        self,
-        *,
-        snapshot_date: date,
-        underlying:    str,
-    ) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-
-class NullTradeDatabase(TradeDatabaseABC):
-    """No-op implementation for tests or when persistence is disabled."""
-    def record_fill(self, **kwargs) -> int:                          return 0
-    def get_position_roles(self, underlying: str) -> Dict[str, str]: return {}
-    def remove_positions(self, symbols: List[str]) -> None:          pass
-    def get_db_symbols(self, underlying: str) -> List[str]:          return []
-    def record_chain_snapshot(self, **kwargs) -> None:               pass
-    def record_equity_snapshot(self, **kwargs) -> None:              pass
-    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:           return []
-    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]:    return []
-    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]:  return []
 
 ============================================================
 FILE: .\src\brokers\registry.py
@@ -3735,7 +3756,7 @@ from typing import Any, Dict, List, Tuple
 from src.brokers.interfaces import BrokerABC
 from src.domain.signals import SignalSnapshot
 from src.domain.types import AssetQuote, OptionChainRequest, Symbol
-from src.orchestration.cycle_snapshot import AccountSnapshot, CycleSnapshot
+from src.orchestration.cycle_snapshot import CycleSnapshot
 from src.utilities.clock import ClockABC, LiveClock
 from src.utilities.logger import setup_logger
 
@@ -3758,6 +3779,11 @@ class CycleSnapshotBuilder:
     being re-fetched for the full snapshot even though they hadn't changed
     since the pre-snapshot 2 seconds earlier. Saving ~2 broker round-trips
     per cycle (~4s on SPY).
+    # this is now dangerous, because the bot runs every 5 minutes, unless we are awaiting an order fill.
+    # What we should do is:
+    # - fetch account + quotes in pre-snapshot as we do now.
+    # - in the post-snapshot, only fetch chains that are needed and not already in the pre-snapshot.
+
     """
 
     broker: BrokerABC
@@ -3765,6 +3791,10 @@ class CycleSnapshotBuilder:
 
     def __post_init__(self) -> None:
         if self.clock is None:
+            # the line below is needed to bypass frozen=True and set a default clock instance. 
+            # it works like this:
+            # - if the caller provides a clock, use it.
+            # - if not, create a LiveClock instance and assign it to self.clock.
             object.__setattr__(self, "clock", LiveClock())
 
     def build_snapshot(
@@ -3780,7 +3810,7 @@ class CycleSnapshotBuilder:
         account = self.broker.get_account_snapshot()
 
         logger.info(
-            "Account snapshot | equity=%.2f option_buying_power=%.2f "
+            "Account snapshot | equity=%.2f buying_power=%.2f "
             "positions=%d open_orders=%d",
             account.equity,
             account.option_buying_power,
@@ -3851,7 +3881,7 @@ FILE: .\src\orchestration\orchestrator.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 from src.brokers.interfaces import BrokerABC
 from src.domain.intents import TradeIntent
@@ -4466,6 +4496,8 @@ class TradeDatabaseABC(ABC):
     """
     Interface for the trade persistence layer.
 
+    Responsibility: store and retrieve trade data. Nothing else.
+
     leg_role is passed on every record_fill() call:
       'leap' — this fill opens/closes a long LEAP leg
       'near' — this fill opens/closes a short NEAR leg
@@ -4500,6 +4532,22 @@ class TradeDatabaseABC(ABC):
     @abstractmethod
     def get_position_roles(self, underlying: str) -> Dict[str, str]:
         """Return {osi_symbol: leg_role} for open positions where role is known."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def remove_positions(self, symbols: List[str]) -> None:
+        """
+        Delete positions by OSI symbol.
+        Called only by PositionReconcilerABC.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_db_symbols(self, underlying: str) -> List[str]:
+        """
+        Return all OSI symbols in the positions table for this underlying.
+        Called only by PositionReconcilerABC.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -4556,13 +4604,15 @@ class TradeDatabaseABC(ABC):
 
 class NullTradeDatabase(TradeDatabaseABC):
     """No-op implementation for tests or when persistence is disabled."""
-    def record_fill(self, **kwargs) -> int:                       return 0
+    def record_fill(self, **kwargs) -> int:                          return 0
     def get_position_roles(self, underlying: str) -> Dict[str, str]: return {}
-    def record_chain_snapshot(self, **kwargs) -> None:            pass
-    def record_equity_snapshot(self, **kwargs) -> None:           pass
-    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:        return []
-    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]: return []
-    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]: return []
+    def remove_positions(self, symbols: List[str]) -> None:          pass
+    def get_db_symbols(self, underlying: str) -> List[str]:          return []
+    def record_chain_snapshot(self, **kwargs) -> None:               pass
+    def record_equity_snapshot(self, **kwargs) -> None:              pass
+    def get_fills(self, **kwargs) -> List[Dict[str, Any]]:           return []
+    def get_equity_curve(self, **kwargs) -> List[Dict[str, Any]]:    return []
+    def get_chain_snapshot(self, **kwargs) -> List[Dict[str, Any]]:  return []
 
 ============================================================
 FILE: .\src\persistence\reconciler.py
